@@ -91,6 +91,34 @@ dsys scenario run NAME_OR_FILE [--transcript FILE] [--fail-fast]
 - Exit 0: every step matched expectation. Exit 6: mismatch, with
   the failing step named on stderr (and in the transcript).
 
+#### 3.4.1 Scenario vs script
+
+A **scenario** is a declarative exercise specification: actors,
+turns, inputs, and expectations (`{actor, input, expect}`). It says
+*what should happen and what counts as passing*. A scenario never
+executes itself; a driver interprets it, mediating every turn
+through the proper channel (`execute --as <role>`) and judging
+outcomes via `referee validate`. Replay is transcript
+re-validation, never behavior re-execution.
+
+A **script** is imperative code: it says *how*, with arbitrary
+power — it can import anything, reach the network, write anywhere.
+`dsys scenario run` executes a script file dumbly
+(`subprocess.run([sys.executable, script])`); nothing about a script
+declares what passing means, and nothing in the runner constrains
+what it does. Shipped scenarios are inference-free by construction,
+not by sandbox — the runner would happily execute a script that
+phones an LLM.
+
+Relation: a scenario may be *realized by* a script, but is never
+*identical to* it. `share/scenarios/01-boot-diagnostic.py` is a
+script carrying the "boot diagnostic" scenario; the scenario is the
+named exercise plus its declared checks. The phase-2 target is
+scenarios as data (YAML declarations interpreted by the driver),
+with scripts demoted to one step-implementation kind among others —
+invoked by the driver, mediated, and never trusted. Agent outputs
+anywhere in this pipeline are parsed, never trusted.
+
 ### 3.5 `state` — state-file utilities
 
 ```
