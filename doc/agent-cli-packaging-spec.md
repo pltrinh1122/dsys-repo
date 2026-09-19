@@ -95,6 +95,52 @@ class Backend(Protocol):
   not CLI changes. Selected by `backend:` in config or
   `--backend`.
 
+### Stress-test note (2026-09-19): the backend surface under attack
+
+Claim: "an inferencing agent is easily configured — bash shell
+invocation, an inferencing API (e.g. Claude Console), or
+prompt-response records with a file interface." Decomposed
+against the installation and the architecture:
+
+- **S1 — FALSIFIED as a mechanism.** `backend:` exists in
+  `etc/config.yaml`, but `cmd_execute` never reads the config
+  (unconditional exit 2) and `backends.py` was never built. The key
+  is a YAML comment, not a mechanism.
+- **S2 — bash backend: easy to build, voids three guarantees.**
+  (a) Role binding becomes decorative: the envelope attests
+  `{role, role_hash, prompt_hash}` as "the run record," but a shell
+  command may silently discard `system:` — attestation fraud, one
+  step beyond "role prompts advisory." (b) The side-effect surface
+  explodes past the declared hermeticity boundary: a shell command
+  can rewrite state files directly, bypassing parsed-never-trusted;
+  validators check shape, not provenance, and the provenance log is
+  unimplemented. (c) Transcript re-validatability narrows: the
+  envelope names the adapter, not its configuration (which command,
+  which model, what temperature).
+- **S3 — API backend: FALSIFIED by the missing secret store.** A
+  key has nowhere to live: `config.yaml` is plain YAML,
+  operator-owned, preserved across reinstalls, and a candidate for
+  the accretion-repo — which is git. No vault integration, env-var
+  convention, or redaction rule is spec'd anywhere.
+- **S4 — file interface: FALSIFIED as "an inferencing agent";**
+  SURVIVES redirected. A file interface is a *transport*, not
+  inference — something outside dsys does the inferring. As the
+  `dialog` transport backend (see `dialog-protocol-spec.md`) it is
+  the most architecturally coherent shape: dsys stays hermetic,
+  the files *are* the transcript; needs atomicity (rename — fine)
+  plus completion signaling and timeout (CLI wall-clock, not
+  architectural).
+- **S5 — the ambient backend.** The de facto inferencing agent
+  today is the orchestrator's subagents: in-session, unconfigured,
+  bound by no role bundle, writing no envelope, keeping no
+  transcript. The specified agent story is fully specified and
+  entirely unexercised; the exercised path has none of its
+  properties.
+
+Untouched by all of the above: zero-inference-in-execution (the
+automaton plane). The damage is confined to the harness plane's
+own checkability — the credibility of envelopes and transcripts.
+
 ## 4. Test-drive harness (why this exists)
 
 A scenario driver (phase 2; sketched here so the CLI surface fits
