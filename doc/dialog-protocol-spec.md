@@ -58,22 +58,33 @@ var/dialog/
 ## 4. Formats
 
 `prompt.json` (dsys → answerer; self-contained so the answerer
-needs no access to the install tree):
+needs no access to the install tree). This is the transport form
+of the `inference_request` record — its shape and constraints are
+defined in §15; the form below is illustrative:
 
 ```json
 {
+  "request_id": "req_9f3a41c7e2b0",
   "turn_id": "dlg_9f3a41c7e2b0",
   "dialog_id": "dlg-thread-7",
   "in_reply_to": null,
+  "request_type": "propose",
   "role": "cos",
   "role_hash": "sha256:…",
-  "prompt_hash": "sha256:…",
   "system": "<full role system prompt text>",
-  "prompt": "<the input>",
-  "timeout_s": 300,
-  "backend": "dialog"
+  "input": {
+    "matter": "<the matter, in the type's schema>",
+    "constraints": ["…"],
+    "kinds": ["DecisionRecord"]
+  },
+  "output_contract": ["DecisionRecord"],
+  "issued_by": "scenario-driver"
 }
 ```
+
+There is no freeform prompt string: all instruction content
+lives inside the request type's input schema (§15). A record
+with an untyped instruction field is malformed.
 
 `response.json` (answerer → dsys; strict schema, see §7):
 
@@ -226,3 +237,128 @@ pending: dlg_9f3a41c7e2b0 (cos, waiting)
    preflight note.
 5. The answerer is never dsys's code. A reference poll-loop
    answerer may be shipped as an example, never as the mechanism.
+
+## 14. Ambient-inferencing mode
+
+The inferencing agent is ambient (in-session, unconfigured — the
+S5 backend), and every turn is both system-specified and
+human-authorized:
+
+1. **dsys issues** an `inference_request` record (§15) as
+   `pending/<turn_id>/prompt.json`. The issuer is a deterministic
+   component (`issued_by`: `scenario-driver`, `flow-scheduler`,
+   or `operator-cli` for a typed ad-hoc request) — never the
+   ambient itself, never chat prose.
+2. **The human authorizes** in chat: "process next inferencing
+   request record issued by dsys." Authorization, not authorship —
+   the human dispositions, never composes freeform instructions.
+3. **The ambient processes**: reads the request record, infers,
+   writes `pending/<turn_id>/response.json` +
+   `pending/<turn_id>/artifacts/*.json`. Every artifact cites
+   `request_ref: <request_id>`; the response cites it too.
+4. **dsys ingests**: validates each artifact against the
+   request's `output_contract` plus the package validators,
+   validates the typed `result` (§15), stages candidate state,
+   runs `referee validate`, and advances the FSM — which may
+   issue the next request.
+
+Properties:
+
+- **Two keys.** Issuance (system) + authorization (human). The
+  ambient can neither invent work (no dsys-issued record →
+  nothing to process) nor start work (no human authorization →
+  the record sits in `pending/`).
+- **Instruction content is auditable.** It was never chat prose:
+  a typed system record with `request_id`, `request_type`, and
+  hashes. The transcript captures the full chain: request →
+  authorization → response → artifacts → validation.
+- **No self-instruction.** The ambient never chains turns
+  autonomously; each turn requires a fresh dsys-issued record
+  and a fresh human authorization.
+- **Disposition stays terminal and human.** On "Y", the ambient
+  transcribes (writes the record), never decides.
+- **The human's freeform channel is authorization-only.** An
+  operator who wants ad-hoc inference composes through the
+  typed request interface (`dsys dialog request --type …`),
+  which dsys validates (§15, R1–R5) before issuing. The ambient
+  only ever processes dsys-issued records.
+
+## 15. `inference_request` record constraints
+
+The request record is what makes ambient inference bounded: dsys
+can only ask for what the enum can express, with the shapes the
+enum declares. An instruction the enum cannot express is not
+issuable — that is the constraint biting.
+
+### 15.1 The closed enum
+
+| `request_type` | input schema | ambient may write (`output_contract` ⊆) | typed `result` in `response.json` |
+|---|---|---|---|
+| `propose` | `{matter: str, constraints: [str], kinds: [record-kind]}` | the listed architecture record kinds | `{proposals: [{kind, file}]}` — pointers to `artifacts/` files |
+| `classify` | `{item_ref: str, taxonomy: [str, …] (≥2), context?: str}` | kinds in `output_contract`, if any | `{item_ref, class: <one of taxonomy>, rationale: str}` |
+| `triage` | `{item_refs: [str, …]}` | `DecisionRecord` (triage mode) | `{dispositions: [{item_ref, disposition: acknowledged\|escalated\|dissolved, response: str}]}` |
+| `assess` | `{subject_ref: str, criteria: [{id: str, text: str}]}` | kinds in `output_contract`, if any | `{findings: [{criterion_id, finding: pass\|fail\|na, note: str}]}` |
+| `challenge` | `{claim: str, context?: str}` | kinds in `output_contract`, if any | `{verdict: survives\|falsified\|decomposed, reasoning: str, breaking_case?: str}` |
+
+- `triage` is distinct from `classify` because its grammar is
+  fixed by the architecture (the triage CTA grammar), not
+  supplied per-request.
+- `challenge` is the dialectic falsification type: verdict +
+  reasoning, with the breaking case required on `falsified`.
+
+### 15.2 Excluded names
+
+- **`decide` is not a request type.** The agent never decides:
+  human disposition is terminal ("propose, never dispose"). A
+  `decide` type would promise what the architecture forbids.
+  The agent-side verb is `propose`; decision is recorded
+  afterward, by the human's disposition.
+- **`evaluate` is not a request type.** `evaluate` is reserved
+  for deterministic expression-language evaluation (the
+  architecture's mechanical evaluator). Inference-side judgment
+  against criteria is `assess`. Sharing the name would let
+  unevidenced judgment wear the authority of mechanical
+  evaluation.
+
+### 15.3 Issuance validators (dsys side, R1–R5)
+
+- **R1** — `request_type` ∈ the §15.1 enum. Unknown type: the
+  record is invalid; dsys must not issue it, the ambient must
+  not process it.
+- **R2** — `input` matches the type's schema exactly.
+- **R3** — `output_contract` is non-empty and ⊆ the type's
+  allowed kinds.
+- **R4** — `role` resolves to a sealed bundle; `role_hash`
+  matches.
+- **R5** — no freeform instruction field. All instruction
+  content lives inside `input`; the record carries exactly the
+  known fields.
+
+### 15.4 Ingest validators (ambient output, I1–I3)
+
+- **I1** — every file in `artifacts/` has a kind ∈
+  `output_contract`, else the turn's artifacts are rejected.
+- **I2** — every artifact cites `request_ref == request_id`.
+- **I3** — `response.json` cites `request_id`; its `result`
+  matches the type's result schema; `refusal: true` → exit 4.
+
+### 15.5 Extension rule
+
+New types require a spec amendment plus issuance and ingest
+validators. The enum is closed by validator (R1), not by
+convention.
+
+### 15.6 Falsifiers
+
+- **F-R1** (sufficiency): falsified by a dsys component needing
+  an inference shape no type covers. Remedy: spec the type —
+  never smuggle it as untyped prose inside `input`.
+- **F-R2** (type discipline): falsified by the ambient using
+  one type to do another's job (e.g. `assess` rendering a
+  claim verdict — that is `challenge`'s job). The result
+  schema won't fit; ingest rejects. Types are honored by
+  shape, not by trust.
+- **F-R3** (exclusion standing): falsified if a future need
+  genuinely requires agent-side `decide` — which would mean
+  repealing "human disposition is terminal," a load-bearing
+  invariant, not a naming choice.
