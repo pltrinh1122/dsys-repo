@@ -242,41 +242,61 @@ pending: dlg_9f3a41c7e2b0 (cos, waiting)
 
 The inferencing agent is ambient (in-session, unconfigured — the
 S5 backend), and every turn is both system-specified and
-human-authorized:
+human-authorized. Authority is write-gated: the ambient never
+publishes; publication is the Operator's act performed through
+the ambient's hands.
 
 1. **dsys issues** an `inference_request` record (§15) as
    `pending/<turn_id>/prompt.json`. The issuer is a deterministic
    component (`issued_by`: `scenario-driver`, `flow-scheduler`,
    or `operator-cli` for a typed ad-hoc request) — never the
    ambient itself, never chat prose.
-2. **The human authorizes** in chat: "process next inferencing
-   request record issued by dsys." Authorization, not authorship —
-   the human dispositions, never composes freeform instructions.
-3. **The ambient processes**: reads the request record, infers,
-   writes `pending/<turn_id>/response.json` +
-   `pending/<turn_id>/artifacts/*.json`. Every artifact cites
-   `request_ref: <request_id>`; the response cites it too.
-4. **dsys ingests**: validates each artifact against the
-   request's `output_contract` plus the package validators,
+2. **The human authorizes processing** in chat: "process next
+   inferencing request record issued by dsys." Authorization,
+   not authorship.
+3. **The ambient infers and stages drafts** — draft content, not
+   records. Nothing is written to `pending/<turn_id>/` yet.
+4. **The human dispositions the draft content** (Y/N/counter) —
+   the write disposition. Only now may records be written.
+5. **The ambient writes** `pending/<turn_id>/response.json` +
+   `pending/<turn_id>/artifacts/*.json`. Every record cites
+   `request_ref: <request_id>` (what requested it) and
+   `disposition_ref: <disposition-id>` (who authorized the
+   write). Because the write itself was disposed, the content
+   carries the Operator's authority.
+6. **dsys ingests**: verifies each `disposition_ref` resolves to
+   a recorded disposition — cite-vs-verify: dsys checks the
+   citation resolves (a shape check); it does not re-adjudicate
+   the Operator's judgment — validates each artifact against
+   the request's `output_contract` plus the package validators,
    validates the typed `result` (§15), stages candidate state,
    runs `referee validate`, and advances the FSM — which may
    issue the next request.
 
 Properties:
 
-- **Two keys.** Issuance (system) + authorization (human). The
-  ambient can neither invent work (no dsys-issued record →
-  nothing to process) nor start work (no human authorization →
-  the record sits in `pending/`).
+- **Three keys.** Issuance (system) + process authorization
+  (human) + write disposition (human). The ambient can invent
+  no work, start no work, and publish no records.
+- **Transcribes, never decides — and never publishes.** On "Y",
+  the ambient writes what was disposed, nothing more.
 - **Instruction content is auditable.** It was never chat prose:
   a typed system record with `request_id`, `request_type`, and
   hashes. The transcript captures the full chain: request →
-  authorization → response → artifacts → validation.
-- **No self-instruction.** The ambient never chains turns
-  autonomously; each turn requires a fresh dsys-issued record
-  and a fresh human authorization.
-- **Disposition stays terminal and human.** On "Y", the ambient
-  transcribes (writes the record), never decides.
+  process authorization → draft → write disposition → records →
+  validation.
+- **No self-instruction.** Each turn requires a fresh
+  dsys-issued record, a fresh process authorization, and a
+  fresh write disposition.
+- **Freshness collapses structurally.** The write disposition
+  authorizes *this content now*; the staleness window between
+  authorization and write is ~zero by construction.
+  (`state_ref` binding still governs what the content *claims
+  about* the state.)
+- **Scope creep dissolves for the per-write case.** Each write
+  is individually disposed — there is nothing to creep.
+  Carried-forward authority survives only for standing
+  dispositions (§16.4b), which keep their scope check.
 - **The human's freeform channel is authorization-only.** An
   operator who wants ad-hoc inference composes through the
   typed request interface (`dsys dialog request --type …`),
@@ -344,9 +364,15 @@ issuable — that is the constraint biting.
 
 - **I1** — every file in `artifacts/` has a kind ∈
   `output_contract`, else the turn's artifacts are rejected.
-- **I2** — every artifact cites `request_ref == request_id`.
-- **I3** — `response.json` cites `request_id`; its `result`
-  matches the type's result schema; `refusal: true` → exit 4.
+- **I2** — every artifact cites `request_ref == request_id`
+  and `disposition_ref` resolving to a recorded disposition
+  (the write disposition, §14). dsys verifies the citation
+  resolves; it does not re-adjudicate the Operator's judgment.
+- **I3** — `response.json` cites `request_id` and the write
+  `disposition_ref`; its `result` matches the type's result
+  schema; `refusal: true` → exit 4. (A refusal reports the
+  authorized processing's outcome, so the process authorization
+  covers its write — no separate write disposition needed.)
 
 ### 15.5 Extension rule
 
@@ -474,6 +500,13 @@ restored human link. Coverage is either:
 - (b) a `set_standing` disposition whose recorded scope
   (domain + principal + initiation kind) provably covers every
   initiation in the plan.
+
+Under write-gated authority (§14), clause (a) is the natural
+case: the write disposition that authorized the plan's records
+is recorded as the DecisionRecord citing the plan's
+`request_id` — the plan arrives at initiation already carrying
+its authority, and the driver verifies the citation. Clause (b)
+is the only carried-forward case and keeps its scope check.
 
 The driver checks coverage before the first initiation. No
 coverage → no initiation, plan parked, reported. Standing
