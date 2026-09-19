@@ -294,7 +294,7 @@ issuable — that is the constraint biting.
 
 | `request_type` | input schema | ambient may write (`output_contract` ⊆) | typed `result` in `response.json` |
 |---|---|---|---|
-| `propose` | `{matter: str, constraints: [str], kinds: [record-kind]}` | the listed architecture record kinds | `{proposals: [{kind, file}]}` — pointers to `artifacts/` files |
+| `propose` | `{matter: str, constraints: [str], kinds: [record-kind]}` | the listed architecture record kinds | `{proposals: [{kind, file}]}` — pointers to `artifacts/` files; plus optional `plan` (§16) |
 | `classify` | `{item_ref: str, taxonomy: [str, …] (≥2), context?: str}` | kinds in `output_contract`, if any | `{item_ref, class: <one of taxonomy>, rationale: str}` |
 | `triage` | `{item_refs: [str, …]}` | `DecisionRecord` (triage mode) | `{dispositions: [{item_ref, disposition: acknowledged\|escalated\|dissolved, response: str}]}` |
 | `assess` | `{subject_ref: str, criteria: [{id: str, text: str}]}` | kinds in `output_contract`, if any | `{findings: [{criterion_id, finding: pass\|fail\|na, note: str}]}` |
@@ -393,3 +393,103 @@ structured result re-enters the machine. `goal_refs` cite goals
 by id/label from whatever goal store backs the installation;
 the spec does not define the store — that binding is declared
 per deployment.
+
+### 15.8 Goal-result persistence (P0)
+
+The `goal` result needs no new entity. It persists as the turn's
+closed transcript (`closed/<turn_id>/`: `prompt.json` +
+`response.json` + `envelope.json`) — the full exchange, citable
+by `request_id`. Follow-on `propose` requests cite it in
+`input.matter` (e.g. `"matter": "goal classification req_…: …"`);
+the driver resolves the citation from the transcript. "dsys
+records goal classification" means: the result is retained as a
+closed turn, addressable by its request id. (Rejected: a
+`GoalClassification` entity — unnecessary ontology for what the
+transcript files already do.)
+
+## 16. Plans and initiation (P4)
+
+The ratified sequence is goal → propose → **dispose** →
+initiate-through-gates. This section specs the last two links:
+the plan's form and the initiation path. DR-1 and the
+step-change discipline are unchanged — they are the gates the
+path routes through.
+
+### 16.1 Plan schema
+
+Planning is proposing a course of action: no new request type.
+`propose`'s typed `result` gains an optional `plan` field — a
+list of initiations:
+
+```json
+"plan": [
+  {"kind": "initiate_harness_run" | "initiate_automaton_run" | "initiate_flow_run",
+   "principal_ref": "dyad leo",
+   "params": { "...": "per-kind initiation parameters" },
+   "rationale": "why this initiation serves the matter"}
+]
+```
+
+I3 validates the plan shape (known kinds, well-formed entries).
+A plan whose shape needs a fourth kind is F-P1: amend the
+schema, never smuggle it.
+
+### 16.2 Principal binding
+
+Validator on the plan (checked before disposition): every
+initiation's `principal_ref` resolves to a dyad-or-human
+principal — agents excluded, per the schema's Principal
+definition. Unresolvable → malformed plan → the turn fails
+before it can be disposed. (Closes P2's "whose slot": the plan
+declares it, the validator checks it.)
+
+### 16.3 The initiation path
+
+After human disposal approves the plan, the driver executes the
+initiations sequentially, each through its real gate:
+
+- **harness run**: strap gates, then the DR-1 slot check for
+  (`principal_ref`, scope). Slot free → initiate; slot taken →
+  I-9 refusal, recorded with the blocking run named. The driver
+  continues to the next item — partial fulfillment, honestly
+  reported, never silently truncated.
+- **automaton run / flow run**: the scheduler's step-change
+  gate. The plan's disposition satisfies the human-in-the-loop;
+  the scheduler still performs its declared duties
+  (idempotency, trigger routing per the flow spec).
+
+Each attempt appends to the run record (the new
+`HarnessRun`/`AutomatonRun`/`FlowRun`, or the refusal). The
+turn's fulfillment report lists per item: stood up, or refused
+and why.
+
+### 16.4 Disposition coverage rule
+
+No initiation without coverage — the mechanical form of the
+restored human link. Coverage is either:
+
+- (a) a fresh disposition `DecisionRecord` citing the plan's
+  `request_id` (mode `ratify` or `authorize` as appropriate),
+  or
+- (b) a `set_standing` disposition whose recorded scope
+  (domain + principal + initiation kind) provably covers every
+  initiation in the plan.
+
+The driver checks coverage before the first initiation. No
+coverage → no initiation, plan parked, reported. Standing
+authorization may displace the human link in time; it may not
+remove it.
+
+### 16.5 Falsifiers
+
+- **F-P1** (schema sufficiency): falsified by a needed
+  initiation shape the plan schema cannot express. Remedy:
+  amend §16.1 — never smuggle it as prose in `rationale`.
+- **F-P2** (gate integrity): falsified by any plan path that
+  initiates without passing DR-1 (harness) or the step-change
+  gate (automaton). Such an initiation is a violation, not a
+  shortcut.
+- **F-P3** (standing-scope creep): falsified by citing a
+  `set_standing` disposition for initiations outside its
+  recorded scope (domain/principal/kind). Coverage is checked
+  against what was recorded, not what is claimed.
