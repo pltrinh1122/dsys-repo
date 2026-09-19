@@ -17,7 +17,7 @@ usage: install.sh [options]
   --from DIR            source tree (default: this script's directory)
   --home DIR            install target (default: \${DSYS_HOME:-\$HOME/.dsys})
   --core DIR            architecture package source
-                        (default: \$HOME/workspace/dyad-architecture/package)
+                        (default: <src>/core/package)
   --help                print this help and exit
 EOF
 }
