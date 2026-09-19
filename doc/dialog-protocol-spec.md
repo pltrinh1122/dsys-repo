@@ -299,6 +299,7 @@ issuable — that is the constraint biting.
 | `triage` | `{item_refs: [str, …]}` | `DecisionRecord` (triage mode) | `{dispositions: [{item_ref, disposition: acknowledged\|escalated\|dissolved, response: str}]}` |
 | `assess` | `{subject_ref: str, criteria: [{id: str, text: str}]}` | kinds in `output_contract`, if any | `{findings: [{criterion_id, finding: pass\|fail\|na, note: str}]}` |
 | `challenge` | `{claim: str, context?: str}` | kinds in `output_contract`, if any | `{verdict: survives\|falsified\|decomposed, reasoning: str, breaking_case?: str}` |
+| `goal` | `{prompt_text: str, goal_refs?: [str] (default: the active goal set), context?: str}` | none — result-only (`"output_contract": []`) | `{intent: str, goal_mapping: [{goal_ref: str, relation: advances\|contradicts\|unrelated, note: str}], needs_clarification: bool, clarification?: str, follow_ons: [request_type…] (advisory)}` |
 
 - `triage` is distinct from `classify` because its grammar is
   fixed by the architecture (the triage CTA grammar), not
@@ -326,13 +327,18 @@ issuable — that is the constraint biting.
   record is invalid; dsys must not issue it, the ambient must
   not process it.
 - **R2** — `input` matches the type's schema exactly.
-- **R3** — `output_contract` is non-empty and ⊆ the type's
-  allowed kinds.
+- **R3** — `output_contract` ⊆ the type's allowed kinds. It may
+  be explicitly empty, meaning result-only: the type's output is
+  the typed `result` alone, and I1 rejects any artifact files for
+  the turn. (`goal` is result-only in v0.)
 - **R4** — `role` resolves to a sealed bundle; `role_hash`
   matches.
 - **R5** — no freeform instruction field. All instruction
   content lives inside `input`; the record carries exactly the
-  known fields.
+  known fields. Note the boundary this draws: a type's
+  freeform-text *subject* (a `challenge` claim, an `assess`
+  subject, a `goal` prompt_text) is data being interpreted, not
+  instruction. The instruction is the typed request itself.
 
 ### 15.4 Ingest validators (ambient output, I1–I3)
 
@@ -362,3 +368,28 @@ convention.
   genuinely requires agent-side `decide` — which would mean
   repealing "human disposition is terminal," a load-bearing
   invariant, not a naming choice.
+
+### 15.7 Startup: the first record
+
+`goal` is the front door: the only type whose subject is raw
+user text, and whose job is converting the untyped outside into
+the typed inside. The startup pattern:
+
+1. dsys's first record is a wait state: awaiting a text prompt
+   from the user. (No inference is issuable until it arrives —
+   there is nothing to interpret.)
+2. On arrival, dsys immediately issues a `goal`-type
+   `inference_request` with the prompt as `input.prompt_text`.
+3. The ambient returns intent + goal mapping + advisory
+   `follow_ons`.
+4. The FSM acts on the result by issuing further typed requests
+   (`propose`, `assess`, `challenge`, …) — issuance remains
+   dsys's; in ambient mode each issuance still requires the
+   human's authorization (§14).
+
+The user's text never becomes an instruction (R5): it is the
+subject of a typed intent-understanding request, and only the
+structured result re-enters the machine. `goal_refs` cite goals
+by id/label from whatever goal store backs the installation;
+the spec does not define the store — that binding is declared
+per deployment.
