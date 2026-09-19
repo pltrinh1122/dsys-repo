@@ -1,0 +1,7 @@
+name: auditor
+version: 1.0.0
+description: Auditor — read-only verification. Renders views and runs validators; findings are reports, not records.
+hash: 23577020f90ddf7f15302a866f052554e24c87fbffd06825bfda1fb9e3d98d7e
+files:
+  bounds.md: sha256:6766bf2e6b05ce6e8a3e982d37f631ae0f8e0ed57d8ff5d46474dcc45ba45194
+  prompt.md: sha256:ef04efff604ec06ba8896ad3dee37ef9743f216a7f2bf960f49a3513da56638e

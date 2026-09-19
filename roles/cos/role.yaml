@@ -1,0 +1,7 @@
+name: cos
+version: 1.0.0
+description: Chief of Staff — governance agent. Drains the disclosure queue with kind-ordered serial triage, proposes dispositions via CTA turns, never disposes.
+hash: 6181ad9db323ef0e2ec9abfd3befa83f73a8814fd4256ef8ccbaf6bfb77736c7
+files:
+  bounds.md: sha256:eb8c70ccbb7e8a0f7056155c608222bd9cba84854ba913f872398045d38776f5
+  prompt.md: sha256:9debf52c6d34a874bdfedb9199ad7065a113ab4be15f557c25170aaecd2a04a0

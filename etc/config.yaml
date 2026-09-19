@@ -1,0 +1,16 @@
+# dsys configuration — flags > this file > built-in defaults.
+#
+# backend: which agent backend `dsys execute` would use on a full install.
+#   Accepted but inert on the base profile (execute refuses there).
+backend: auto
+# timeout_s: per-command timeout in seconds (scenario runs).
+timeout_s: 300
+# format: default output format, text|json (--format overrides).
+format: text
+# roles_dir: role bundles directory, relative to the install home.
+#   Accepted but inert on the base profile (roles refuses there).
+roles_dir: lib/roles
+# core_pin: optional pin of the vendored core tree, "sha256:<hex>".
+#   Empty means unpinned. When set, startup fails unless it matches
+#   manifest.core_tree_hash(home).
+core_pin: ""

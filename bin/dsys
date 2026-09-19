@@ -1,0 +1,19 @@
+#!/bin/sh
+# dsys launcher: resolve the install home, then exec the venv python on cli.py.
+# DSYS_HOME wins; otherwise the home is derived from this script's location.
+# POSIX sh. No network, no prompts.
+if [ -n "${DSYS_HOME:-}" ]; then
+    _home="$DSYS_HOME"
+else
+    _home="$(dirname "$(readlink -f "$0")")/.."
+fi
+_norm="$(cd "$_home" 2>/dev/null && pwd -P)" || _norm=""
+if [ -n "$_norm" ]; then
+    _home="$_norm"
+fi
+export DSYS_HOME="$_home"
+if [ ! -x "$_home/venv/bin/python" ]; then
+    echo "dsys: no venv python at $_home/venv/bin/python -- not an installed dsys tree" >&2
+    exit 1
+fi
+exec "$_home/venv/bin/python" "$_home/lib/dsys/cli.py" "$@"

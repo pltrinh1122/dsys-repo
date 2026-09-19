@@ -1,0 +1,7 @@
+name: operator
+version: 1.0.0
+description: Operator — the terminal human authority. Disposes matters via CTA responses (yes/no/counter); the only party that may dispose.
+hash: 7458f0322b0c6acd8c83c1d68f6d02f2b978aba11bf67f9bbe12581df1ee38f6
+files:
+  bounds.md: sha256:f2824bf72f0ff0e85751a801dc6a81620813bf6b83ff75d995bb864670cb176c
+  prompt.md: sha256:57d84df8e23aa630de89e4de85cf6346bc0d78bde7afc71a0ab2fe56c62a0fea
