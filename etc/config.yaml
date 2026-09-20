@@ -14,3 +14,17 @@ roles_dir: lib/roles
 #   Empty means unpinned. When set, startup fails unless it matches
 #   manifest.core_tree_hash(home).
 core_pin: ""
+# accretion: local git journal of accreted state (installer-spec §13).
+#   The installer initializes it at install time; snapshots bracket
+#   every reinstall (resume by default, --overwrite for a fresh repo).
+#   Uncomment to override.
+#accretion:
+#  # path: where the repo's git dir lives (work-tree = install home).
+#  #   Default: /var/daccretion/<instance> (instance = home basename).
+#  #   Flags: --accretion-path > this file > default.
+#  path: /var/daccretion/dsys-inst
+#  # commit_authority: standing | operator. Default standing: the
+#  #   installer commits snapshots without asking. operator: prompt
+#  #   before each snapshot; refuse on decline or non-terminal stdin.
+#  #   Flags: --accretion-require-authorization > this file > standing.
+#  commit_authority: standing

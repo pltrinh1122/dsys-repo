@@ -142,6 +142,43 @@ boot clean, verification view empty, role bundles present,
 backend probes, `~/.local/bin` on PATH. Each check prints its
 fix hint on failure.
 
+### 3.7 `automaton` — invocation of automaton-plane instances
+
+```
+dsys automaton init --runbook <id> [--ctx JSON]
+                    [--on-step-failure abort|skip|retry:<n>]
+dsys automaton init-flow --flow <id>
+dsys automaton advance --run <id> [--external KIND --payload JSON]
+                       [--max-steps N]
+dsys automaton advance --flow-run <id> [--trigger timer|external
+                       --payload JSON] [--max-steps N]
+dsys automaton replay --run <id>
+```
+
+- Full profile only; base refuses with exit 1 naming the component
+  (same pattern as `session`).
+- These commands address run *instances* (`AutomatonRun`,
+  `FlowRun`), never definitions. `init` binds a run-book definition
+  once; every later command takes a run id. There is no run-book
+  addressee — §8's survivor stands: definitions are referenced,
+  instances are invoked.
+- Step semantics, trigger validation, failure policies, and replay
+  are the executor's contract:
+  `doc/automaton-executor-spec.md` §§4–9. This section specifies
+  only the invocation surface.
+- `init` is idempotent on the content hash of `(runbook_id, cfg)`:
+  re-init returns the existing open run.
+- Triggers are the closed enum; payloads are JSON. No freeform
+  input.
+- Hermetic: no network anywhere in the executor path.
+- Exit codes: 0 ok · 1 usage / config / tool failure / lease busy ·
+  5 replay violations (`replay`).
+- Json envelopes (one envelope on stdout, §1): `init` →
+  `{"run_id","runbook_id","release_version","state":"open",
+  "created":bool}`; `advance` →
+  `{"run_id","state","steps_advanced","events_appended","closed"}`;
+  `replay` → `{"run_id","valid","violations":[]}`.
+
 ## 4. Config file — `~/.dsys/etc/config.yaml`
 
 ```yaml
@@ -203,6 +240,10 @@ dsys referee validate --state state.json --format json
 dsys referee view --state state.json --view open-disclosures
 dsys scenario run scenarios/drain-duty.yaml --transcript runs/t1.jsonl
 dsys doctor --strict
+# Automaton plane: bind a run-book, drive the instance, re-validate
+RUN=$(dsys automaton init --runbook rb-ingest --format json | jq -r .run_id)
+dsys automaton advance --run $RUN --format json
+dsys automaton replay --run $RUN --format json
 ```
 
 ## 7. Falsifiers (pre-registered)
@@ -222,6 +263,11 @@ dsys doctor --strict
   than `execute` + `referee` + transcripts, `state get` and
   `roles show` are convenience, not contract — they may stay
   thin or be cut without touching the test-drive loop.
+- **F-C5.** "`automaton` commands address run-books." False — they
+  address run *instances*. `init` binds the definition once;
+  `advance`/`replay` take run ids. Definitions are referenced,
+  never invoked; §8's "no run-book addressee" survivor is preserved
+  by the definition/instance split, not by CLI refusal.
 
 ## 8. Falsification: "CLI reaches harness nodes (CoS and playbook),
    not run-book nodes" (2026-09-19)

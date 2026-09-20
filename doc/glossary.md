@@ -100,6 +100,18 @@ queue with no open governance run is itself a violation.
 KEEP, gates G1–G6), not a sequence. A procedure you *follow*, not a node you
 command; embodied by the operator role. Sequencing belongs to run-books.
 
+**Custom slash-command** — an operator-invoked command of the ambient
+agent, defined in-repo (e.g. `/pb-decide`, `doc/slash-commands/`),
+supported by agent recognition for the chat window. Not a platform
+hook (event-driven by construction); not a Muse skill
+(agent-invoked by relevance, no user-only mode) — though for
+Claude Code the skill container fits
+(`disable-model-invocation: true`). Runs in the ambient layer
+only: never installed, never on the CLI tree, never invokable by
+the automaton executor. The ambient proposes (enumerates, gates,
+drafts); the operator disposes. Part of the dsys project, not the
+dsys product.
+
 **DecisionRecord** — the record of a playbook run. Writable, citable —
 unlike simulations.
 

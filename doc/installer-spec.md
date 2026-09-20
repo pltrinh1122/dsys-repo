@@ -373,6 +373,10 @@ exactly this.
 well-formed invocation — so profile switching needs no separate
 operation: switching *is* `install` with the other profile.
 base→full→base converges to base; full→base→full converges to full.
+One exception, and it is opt-in: with accretion commit authority set
+to `operator` (§13) and dirty accreted state the operator declines to
+commit, the installer refuses before mutating the tree rather than
+clobber or silently skip. Standing mode (the default) never refuses.
 
 **Acceptance** (`tests/test-install-idempotency.sh`, isolated `--home`s):
 T0a `base,base→base`; T0b `full,full→full`; T1 `base,full,base→base`;
@@ -521,7 +525,104 @@ exercised* (F-DEV-4). Disposition without new authority is theater.
   records matters and outcomes — DecisionRecord, RunnerReceipts,
   referee results — not keystrokes (F-DEV-1).
 
-## 13. Falsifiers (pre-registered)
+## 13. Accretion repo (2026-09-20)
+
+The `accretion-repo` term was ratified 2026-09-19 (a git repository as
+the durable store of a dsys installation's accreted state) but left as
+an unexercised deployment pattern (G6). This section exercises it:
+the installer sets up a **local** accretion repo at install time, so
+accreted state has history and no future install can silently
+override it. Local only — no remote, no push, no sync (session sync
+is a separate, unimplemented build).
+
+**Accreted set.** `etc/` + `var/` minus any `cache` directory — the
+ratified narrowing (2026-09-19: "var/ minus cache"), generalized to
+nested cache dirs (`var/cache`, `var/runner/cache`, …): cache material
+is ephemeral and regenerable by definition. The exclusion is a
+pathspec (`:(exclude,glob)**/cache{,/**}`), quoted literally — shell
+glob expansion of an exclusion pathspec would silently invert it.
+`var/manifest.json` rides along (it is install-authored, but it lives
+under `var/` and its history is worth having).
+
+**Repo shape.** The repo's git dir lives at `<accretion-path>/.git`
+with `core.worktree` set to the install home — a separate git dir,
+never a `.git` inside the install tree (F-A3). The installer passes
+`--git-dir`/`--work-tree` explicitly on every invocation and
+pathspec-scopes every command to the accreted set
+(`etc var :(exclude,glob)**/cache :(exclude,glob)**/cache/**`), so the
+rest of the tree is never staged, never committed, never shown dirty.
+The `--` separator lives in exactly one place (the wrapper): a
+doubled `--` becomes a pathspec for a literal file named `--` and
+fails the add — silently, if the caller swallows stderr.
+
+**Path.** Default `<accretion-root>/{instance}`, accretion root
+`/var/daccretion`, instance = install-home basename —
+e.g. `/var/daccretion/dsys-inst`. Overridable as configuration
+(`accretion.path` in `etc/config.yaml`) or flag (`--accretion-path`);
+precedence flags > config > default, per the config contract.
+Each instance gets its own path; two homes never share a repo.
+
+**Resume vs overwrite.** Default is **resume**: if a repo already
+exists at the accretion path, the install continues its history.
+`--overwrite` sets up a **fresh** accretion repo: the existing repo
+dir is moved aside to `<path>.bak-<utc-ts>/` (never deleted — history
+is not silently destroyed) and a new repo is initialized; the
+current accreted state becomes its first snapshot.
+
+**Snapshot commits.** On resume the installer brackets the tree
+mutation: a pre-install snapshot commit before converge, a
+post-install snapshot commit after the manifest is written. Commit
+messages name the boundary (`dsys accretion: pre-install snapshot
+(installer 1.0.0, profile full)`). Repo-local `user.name` /
+`user.email` are set at init (`dsys-accretion` /
+`dsys-accretion@localhost`) so the installer never depends on the
+operator's global git identity. A commit is skipped when there is
+nothing to commit.
+
+**Commit authority** (ratified 2026-09-20). Default is **standing
+authorization**: the operator's standing disposition covers
+accretion journaling, and the installer commits without asking. The
+preference flag `--accretion-require-authorization` (or
+`accretion.commit_authority: operator` in config) flips to
+**operator authorization**: with dirty accreted state the installer
+prompts (`Commit accretion snapshot before installing? [y/N]`);
+a "no" — or a non-terminal stdin — refuses the install before any
+tree mutation, naming the dirty paths. Standing mode never refuses;
+operator mode refuses rather than clobber or silently skip.
+
+**Never fails the install.** If git is absent from PATH, or the
+accretion path is not writable, the installer warns and continues
+with accretion disabled; the manifest records
+`accretion: {"enabled": false, "reason": ...}`. Accretion is a
+durability backstop, not a prerequisite.
+
+**Manifest & doctor.** `var/manifest.json` gains
+`accretion: {"enabled", "path", "commit_authority"}` (the installer
+carries provenance; it does not verify the repo). `dsys doctor`'s
+manifest check displays `accretion=<path>` or `accretion=off`.
+
+**Iteration DoD** (conditionals, not a sequence):
+- A1: after install, `<path>/.git` is a valid repo,
+  `core.worktree` == install home, and every tracked path is under
+  `etc/` or `var/` and none under a `cache/` directory.
+- A2: fresh install → exactly one commit; resume reinstall →
+  pre/post snapshot commits bracket the mutation; accreted files are
+  byte-identical across the reinstall unless the operator changed
+  them — in which case the change is committed, never lost.
+- A3: `--overwrite` with an existing repo → the old repo exists at
+  `<path>.bak-<ts>/`, the new repo has a fresh history, the install
+  completes, and the backup path is reported on stdout.
+- A4: `--accretion-require-authorization` with dirty accretion and
+  stdin not a terminal → nonzero exit before any tree mutation,
+  stderr names the dirty paths.
+- A5: no git on PATH, or accretion path not writable → install
+  completes, warning on stderr, manifest records
+  `accretion.enabled=false`.
+- A6: `dsys doctor` stays green (12/12) and `pristine` on a home
+  with accretion enabled — the repo is outside the manifest's
+  coverage by construction.
+
+## 14. Falsifiers (pre-registered)
 
 - **F-I1.** "The install is fully offline." False as a blanket claim.
   Precise claim: *deployment* is offline given a local dist (`--from
@@ -621,3 +722,18 @@ exercised* (F-DEV-4). Disposition without new authority is theater.
   mismatch. Trust basis, stated: the checksum is the release's own
   attestation, not an independent one; for fleet use, pin the hash
   out-of-band.
+- **F-A1.** "The accretion repo makes the installer depend on git."
+  False. Git is opportunistic: absent from PATH, or accretion path not
+  writable, the installer warns and continues with accretion disabled
+  (A5). The install never fails for want of a journal.
+- **F-A2.** "Auto-commit violates operator authority." False as a
+  blanket claim. Standing authorization is the operator's own
+  disposition (ratified 2026-09-20) covering accretion journaling;
+  the preference flag `--accretion-require-authorization` restores
+  per-commit operator authorization. And a local journal commit is
+  not publication — publication remains the operator's act; the
+  repo has no remote and the installer never pushes.
+- **F-A3.** "The accretion repo pollutes doctor's pristine check."
+  False. The git dir lives outside the install tree, every git
+  command is pathspec-scoped to the accreted set, and the manifest's
+  file coverage never includes the repo (A6).

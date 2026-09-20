@@ -167,12 +167,17 @@ def run_checks(home: Path, *, strict: bool) -> dict:
                 src_desc = f"release:{src.get('tag', '?')}"
             else:
                 src_desc = str(mode)
+            acc = m.get("accretion") or {}
+            if acc.get("enabled"):
+                acc_desc = f"accretion={acc.get('path', '?')}"
+            else:
+                acc_desc = "accretion=off"
             _check(
                 checks,
                 "manifest",
                 _OK,
                 f"profile={m['profile']} install_path={m['install_path']} "
-                f"source={src_desc}",
+                f"source={src_desc} {acc_desc}",
             )
     except manifest.ManifestError as e:
         _check(checks, "manifest", _FAIL, str(e), hint="rewrite the manifest or reinstall")

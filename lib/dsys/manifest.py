@@ -89,6 +89,7 @@ def write_manifest(
     installer_version: str,
     components: dict,
     source: dict | None = None,
+    accretion: dict | None = None,
 ) -> dict:
     """Build the manifest dict and write it (pretty) to var/manifest.json.
 
@@ -100,6 +101,11 @@ def write_manifest(
     `source` records acquisition provenance: {"mode": "release", "tag",
     "tarball_sha256"} for --release installs, {"mode": "local", "path"}
     for --from installs. It is provenance, not verification.
+
+    `accretion` records the accretion journal: {"enabled", "path",
+    "commit_authority", "mode"} when a repo was established,
+    {"enabled": False, "path", "reason"} when disabled. Provenance of
+    where the journal lives, not a claim about its contents.
     """
     home = Path(home)
     rels = covered_files(home, profile)
@@ -111,6 +117,9 @@ def write_manifest(
         "installed_at": datetime.now(timezone.utc).isoformat(),
         "core_hash": core_tree_hash(home),
         "source": source if isinstance(source, dict) else {"mode": "unknown"},
+        "accretion": accretion
+        if isinstance(accretion, dict)
+        else {"enabled": False, "reason": "not recorded"},
         "components": components,
         "files": {rel: file_sha256(home / rel) for rel in rels},
     }
@@ -179,17 +188,25 @@ def _load_components(path: str) -> dict:
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if args[:1] == ["write"] and len(args) in (6, 7):
+    if args[:1] == ["write"] and len(args) in (6, 7, 8):
         _, home, profile, cli_version, installer_version, components_path = args[:6]
         components = _load_components(components_path)
         source = None
-        if len(args) == 7:
+        accretion = None
+        if len(args) >= 7:
             try:
                 source = json.loads(args[6])
             except json.JSONDecodeError as e:
                 raise ManifestError(f"bad source JSON: {e}")
             if not isinstance(source, dict):
                 raise ManifestError("bad source JSON: not an object")
+        if len(args) == 8:
+            try:
+                accretion = json.loads(args[7])
+            except json.JSONDecodeError as e:
+                raise ManifestError(f"bad accretion JSON: {e}")
+            if not isinstance(accretion, dict):
+                raise ManifestError("bad accretion JSON: not an object")
         m = write_manifest(
             Path(home),
             profile=profile,
@@ -197,6 +214,7 @@ if __name__ == "__main__":
             installer_version=installer_version,
             components=components,
             source=source,
+            accretion=accretion,
         )
         print(
             json.dumps(

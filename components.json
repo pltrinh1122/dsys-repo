@@ -18,7 +18,7 @@
         "bin/dsys",
         "lib/dsys/"
       ],
-      "description": "The dsys command surface: referee, doctor, state, derive, roles, scenario, session.",
+      "description": "The dsys command surface: referee, doctor, state, derive, roles, scenario, session, automaton.",
       "kind": "shipped",
       "name": "cli",
       "profiles": [
@@ -81,7 +81,7 @@
       "description": "Live run-book executor. The automaton plane is validated in golden runs; no executor is built, and the CLI deliberately offers no run-book addressee.",
       "kind": "specified-only",
       "name": "automaton-executor",
-      "spec": "architecture doc (automaton plane); no executor spec yet"
+      "spec": "doc/automaton-executor-spec.md (unratified)"
     },
     {
       "description": "Branch-per-writer sync protocol. Specified; the CLI surface is a refusing stub and the hosted service is a separate build.",
