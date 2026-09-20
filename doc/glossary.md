@@ -4,25 +4,49 @@ Post-falsification ontology (§8–§11 of the CLI interface spec).
 Each term is defined by its relations, starting from **dyad**.
 
 **Dyad** — the root and the enduring unit: exactly two members, agent +
-operator, plus the irreducible relation between them (bond, constitution,
-common ground). Never *operated*, only *participated in*; exercised
-*through* the harness. A dyad constitutes a principal.
+operator, plus the irreducible relation **R** between them (sanctioned
+gloss: *common ground*). Never *operated*, only *participated in*;
+exercised *through* the harness. A dyad constitutes a principal.
+Superset claim (ratified 2026-09-20): the dyad is forever a superset of
+the agent — dyad = {agent, operator} + R strictly contains the agent,
+and no capability curve crosses the containment. The agent's
+evolutionary path is ever-better proposing; principal-hood,
+judgment-as-verdict, and R are not capabilities to be gained but
+normative positions no computation confers. Tripwire: repealing the
+Principal definition (agent excluded) or admitting agent disposition
+repeals this with it — it would be a different architecture.
 
 **Agent** — the dyad's diligence-and-execution member. Acts *within* the
 principal's runs, never as a principal itself. Proposes, detects, gates,
-frames options — never disposes.
+frames options — never disposes. A member of the dyad, never the dyad:
+the dyad strictly contains the agent (see **Dyad**, superset claim),
+and the agent cannot evolve into the dyad — proposing never becomes
+disposing, however capable the proposal engine grows.
 
 **Operator** — the dyad's stakes-and-intent member, the human. Terminal
 disposition authority: the agent detects, the human disposes. The operator
 is the principal's *disposer*, not the principal — the one through whom the
 principal's judgments are exercised.
 
-**Bond** — the covalent relation R between agent and operator. Superadditive
-by definition: 1+1>2. The relational surplus no additive account of the
-dyad can capture.
-
-**Constitution** — the dyad's charter; what governs the pairing. A dyad
-without one is two strangers — the entity refuses them.
+**R** — the dyad's irreducible common ground (sanctioned gloss: *common
+ground*; lexicon decision ratified 2026-09-20 — canonical 'R': "common
+ground" fails L2, reading as decomposable overlap; "constitution" fails
+L1/L3; "bond" fails L1; "shared context" fails L3 on the context-window
+collision). The stateful relation between agent and operator,
+attributable to neither member alone — it lives in the interaction
+history. Constituents: shared lexicon (terms with disposed meanings),
+interaction conventions (the pair's protocol), mutual models (each
+modeled *as* proposer/disposer), the history of judgment (disposed
+Y/N/counters as revealed taste — tunes proposals prospectively,
+sharpens verdicts retrospectively), earned trust (each plays their
+role). Irreducible (between, not within), accretive (earned through
+episodes, never installed), normative (governs what counts as a good
+proposal and a sound disposition *for this dyad*). Partially bankable:
+the banked part (written conventions, DecisionRecords, disposed
+vocabulary) is accountable; the unbanked part (feel, unspoken
+expectation) is real but unauditable — the agent acting on unbanked R
+("what the operator would want") is inference-about-intent, which the
+gates constrain.
 
 **Principal** — "the body a run belongs to (a dyad or a human)." The *for
 whom*: the third term that proposer and disposer both serve. Runs are
@@ -249,6 +273,18 @@ as an inference type; it reopens if agents ever dispose or the
 operator leaves the loop.
 
 ## Retired terms
+
+- **Bond** — retired 2026-09-20, superseded by canonical **R** (lexicon
+  decision: killed as the concept's name on L1 — affective only;
+  denotes trust, not lexicon, models, or judgment history). Surviving
+  content (relational surplus, 1+1>2) folded into R.
+
+- **Constitution** — retired 2026-09-20, superseded by canonical **R**
+  (lexicon decision: killed on L3 — Constitutional AI collision — and
+  L1 — implies writtenness, but R is partially unbanked; a
+  constitution that can't be written down is a contradiction).
+  Surviving content (the normative/governing aspect) folded into R's
+  normative property.
 
 - **AutomatonPlayBook** — collapsed into **Run-book** 2026-09-19. The pair
   was one entity wearing two names: the "FSM orchestrating run-books"

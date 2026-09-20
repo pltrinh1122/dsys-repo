@@ -303,6 +303,69 @@ Properties:
   which dsys validates (§15, R1–R5) before issuing. The ambient
   only ever processes dsys-issued records.
 
+### 14.1 Ambient Originated Sequence
+
+**Definition.** A sequence whose *impetus* comes from the
+agent/operator side rather than from dsys's own scheduler or
+driver — the mirror image of a dsys-originated run, where
+dsys moves first on its own impetus. The pattern:
+
+1. **Trigger (agent side):** raw operator text arrives — via
+   chat to the ambient, or via the operator's CLI line.
+2. **Delivery:** the raw text is filed into dsys — by the
+   ambient as the Operator's hands (`dialog request --type
+   goal` carrying `prompt_text`), or by the operator directly
+   (`operator-cli`). dsys's first record is the wait state;
+   the filed text satisfies it. dsys validates (R1–R5) and
+   issues the `goal`-type `inference_request`. *This issuance
+   is dsys requesting inferencing assistance.*
+3. **Transcription loop:** one full circuit of the §14 turn
+   loop with transcription content — process authorization
+   (human), rendering by `ambient` or `api` (intent + goal
+   mapping + advisory `follow_ons`), write disposition
+   (human), dsys ingest (cite-vs-verify). The raw outside
+   becomes typed inside.
+4. **Handoff:** the structured transcription re-enters the
+   machine; the substantive dsys-originated turn loop begins
+   (`propose` / `assess` / `challenge` / …).
+
+**Transcription, precisely.** Transcription is the *function*
+raw → typed; it always precedes substantive turns. Its
+*performer* varies:
+
+- `human` — self-transcription: the operator hand-composes a
+  fully typed request at the CLI. No inference occurs; dsys
+  validates (R1–R5) and issues. (The F-AO-1 survivor: no LLM
+  need be involved.)
+- `ambient` — in-session LLM (the S5 backend); `api` — LLM
+  via API backend. When the performer is an LLM agent,
+  transcription takes exclusively the dsys-requested form
+  above: the agent renders transcription *only* in response
+  to a dsys-issued record ("the ambient only ever processes
+  dsys-issued records", §14).
+
+**Correction.** §14.1 as first written had the agent filing a
+*typed* request — transcribing unilaterally. Corrected: the
+agent files *raw text* (delivery, step 2); transcription
+proper is the rendered response to dsys's issuance (step 3).
+The same agent wears two hats — hands, then renderer —
+separated by dsys's issuance.
+
+**Term justification.** "Originated" marks impetus — which
+side moved first — not authorship of the transcription.
+Dsys-originated: scheduler/driver moves first; no operator
+text, no transcription needed. Ambient-originated: the
+agent/operator side moved first, so a transcription loop
+precedes the substantive loop. The transcription itself, when
+LLM-performed, is always dsys-requested.
+
+**F-AO-1** (scope, refined): "all Operator interaction is
+transcribed by an LLM-agent" remains falsified as a
+universal — `operator-cli` self-transcription involves no
+LLM. Refined survivor: the transcription *function* is
+universal before substantive turns; the LLM-agent *performer*
+is not.
+
 ## 15. `inference_request` record constraints
 
 The request record is what makes ambient inference bounded: dsys
@@ -412,6 +475,13 @@ the typed inside. The startup pattern:
    (`propose`, `assess`, `challenge`, …) — issuance remains
    dsys's; in ambient mode each issuance still requires the
    human's authorization (§14).
+
+In ambient/api deployments, the "arrival" in step 1 is the
+Ambient Originated Sequence (§14.1): the raw text is delivered
+(by the ambient as hands, or by the operator at the CLI),
+dsys validates and issues the goal request — dsys requesting
+inferencing assistance — and the ambient/api renders the
+transcription in response.
 
 The user's text never becomes an instruction (R5): it is the
 subject of a typed intent-understanding request, and only the
