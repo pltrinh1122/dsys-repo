@@ -396,6 +396,11 @@ def cmd_doctor(args, cfg, home):
     for c in checks:
         status = _DOCTOR_STATUS.get(str(c.get("status", "?")).lower(), "?")
         lines.append(f"{status}  {c.get('name', '?')} {c.get('detail', '')}".rstrip())
+    comp_rows = payload.get("components") or []
+    if comp_rows:
+        lines.append("components:")
+        for r in comp_rows:
+            lines.append(f"  {r.get('name', '?')}: {r.get('status', '?')} ({r.get('detail', '')})")
     if payload.get("pristine"):
         lines.append("pristine")
     else:

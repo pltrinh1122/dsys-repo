@@ -173,8 +173,28 @@ agency only: role-framed invocation (`--as`, `--on`), fleet commands,
 referee, scenarios, state, doctor. No dyad-plane commands exist, because
 the dyad is participated in, not operated.
 
-**dsys-mutation-playbook** — the second playbook (2026-09-19),
-following the pattern of the decision-making **Playbook**: DoD
+**component registry** — the architecture's component set as dist
+metadata (`components.json` at the dist root; 2026-09-20): each
+component declares its kind (`shipped` | `specified-only`), the
+profiles it ships in, and its defining artifacts. The installer
+*carries* it verbatim into `var/manifest.json` — it authors nothing
+and maintains nothing (F-I11); **`dsys doctor`** owns the status,
+evaluating each entry against the live tree: instantiated |
+specified-only | absent | mutated (F-I10). The device that keeps a
+partial architecture from reporting all-green.
+
+**release** (dsys) — a tag on `github.com/pltrinh1122/dsys-repo`
+(`v<dist_version>`) published as a GitHub Release with two attached
+assets: `dsys-<tag>.tar.gz` (a `git archive` of the tag — the tag *is*
+the content manifest) and `dsys-<tag>.tar.gz.sha256` (the release's
+own attestation of the tarball's hash). The installer's `--release`
+source: it acquires the assets, verifies sha256(tarball) against the
+published checksum (or a pinned `--release-sha256`), and records
+`{"mode": "release", "tag", "tarball_sha256"}` in the manifest as
+provenance (F-I12, F-I13). An instance installed this way is literally
+an instantiation of a release version.
+
+**dsys-mutation-playbook** — the second playbook (2026-09-19),following the pattern of the decision-making **Playbook**: DoD
 conditionals, START/STOP/KEEP, own gates (G1–G4 + M1–M4), shared
 DecisionRecord, single disposition machinery. Decides whether and how
 to mutate the installed dsys across the rung ladder configure | role |

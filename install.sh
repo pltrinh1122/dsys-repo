@@ -23,6 +23,11 @@ usage: install.sh [options]
 
   --profile base|full   install profile (default: full)
   --from DIR            source tree (default: this script's directory)
+  --release TAG         acquire release TAG from github.com/pltrinh1122/dsys-repo
+                        (mutually exclusive with --from; network used for
+                        acquisition only — everything after unpack is offline)
+  --release-sha256 HEX  pin the expected tarball hash out-of-band (fleet use);
+                        must agree with the release's published checksum
   --home DIR            install target (default: \${DSYS_HOME:-\$HOME/.dsys})
   --core DIR            architecture package source
                         (default: <src>/core/package)
@@ -32,6 +37,9 @@ EOF
 
 PROFILE="full"
 SRC=""
+FROM_GIVEN=""
+RELEASE=""
+RELEASE_SHA256=""
 INSTALL_HOME=""
 CORE_DIR=""
 
@@ -43,8 +51,16 @@ while [ "$#" -gt 0 ]; do
     --profile=*) PROFILE="${1#--profile=}"; shift ;;
     --from)
       [ "$#" -ge 2 ] || { echo "error: --from needs a value" >&2; exit 1; }
-      SRC="$2"; shift 2 ;;
-    --from=*) SRC="${1#--from=}"; shift ;;
+      SRC="$2"; FROM_GIVEN="1"; shift 2 ;;
+    --from=*) SRC="${1#--from=}"; FROM_GIVEN="1"; shift ;;
+    --release)
+      [ "$#" -ge 2 ] || { echo "error: --release needs a value" >&2; exit 1; }
+      RELEASE="$2"; shift 2 ;;
+    --release=*) RELEASE="${1#--release=}"; shift ;;
+    --release-sha256)
+      [ "$#" -ge 2 ] || { echo "error: --release-sha256 needs a value" >&2; exit 1; }
+      RELEASE_SHA256="$2"; shift 2 ;;
+    --release-sha256=*) RELEASE_SHA256="${1#--release-sha256=}"; shift ;;
     --home)
       [ "$#" -ge 2 ] || { echo "error: --home needs a value" >&2; exit 1; }
       INSTALL_HOME="$2"; shift 2 ;;
@@ -73,8 +89,10 @@ if [ -z "$CORE_DIR" ]; then
 fi
 
 tmpdir=""
+reltmp=""
 cleanup() {
   if [ -n "$tmpdir" ] && [ -d "$tmpdir" ]; then rm -rf "$tmpdir"; fi
+  if [ -n "$reltmp" ] && [ -d "$reltmp" ]; then rm -rf "$reltmp"; fi
 }
 trap cleanup EXIT
 
@@ -82,6 +100,37 @@ fail() { # $1 = step label, $2 = reason
   echo "FAILED [$1]: $2" >&2
   exit 1
 }
+
+if [ -n "$RELEASE" ] && [ -n "$FROM_GIVEN" ]; then
+  echo "error: --release and --from are mutually exclusive" >&2
+  exit 1
+fi
+
+echo "==> [0/7] acquire source"
+if [ -n "$RELEASE" ]; then
+  # Network is used here and only here (F-I1): acquisition may need
+  # network; deployment is offline given the unpacked dist. The
+  # release's own code takes over below -- this tree's release.py is
+  # only the courier.
+  echo "    release $RELEASE from github.com/pltrinh1122/dsys-repo"
+  [ -f "$SRC/lib/dsys/release.py" ] \
+    || fail "0/7 acquire" "no lib/dsys/release.py in invoking tree $SRC"
+  reltmp=$(mktemp -d) || fail "0/7 acquire" "mktemp -d"
+  set -- fetch "$RELEASE" "$reltmp"
+  if [ -n "$RELEASE_SHA256" ]; then set -- "$@" --sha256 "$RELEASE_SHA256"; fi
+  SRC=$(python3 "$SRC/lib/dsys/release.py" "$@") \
+    || fail "0/7 acquire" "release fetch failed"
+  echo "    verified and unpacked to $SRC"
+  tarball_hash=$(sha256sum "$reltmp/dsys-$RELEASE.tar.gz" | cut -d' ' -f1) \
+    || fail "0/7 acquire" "sha256sum tarball"
+  SOURCE_JSON=$(python3 -c \
+    'import json,sys; print(json.dumps({"mode":"release","tag":sys.argv[1],"tarball_sha256":sys.argv[2]}))' \
+    "$RELEASE" "$tarball_hash")
+else
+  SOURCE_JSON=$(python3 -c \
+    'import json,sys; print(json.dumps({"mode":"local","path":sys.argv[1]}))' \
+    "$SRC")
+fi
 
 echo "==> [1/7] preflight (profile=$PROFILE)"
 command -v python3 >/dev/null 2>&1 \
@@ -100,6 +149,8 @@ ls "$SRC"/lib/dsys/*.py >/dev/null 2>&1 \
   || fail "1/7 preflight" "no lib/dsys/manifest.py in --from $SRC"
 [ -f "$SRC/lib/dsys/install_tree.py" ] \
   || fail "1/7 preflight" "no lib/dsys/install_tree.py in --from $SRC"
+[ -f "$SRC/components.json" ] \
+  || fail "1/7 preflight" "no components.json in --from $SRC"
 if [ "$PROFILE" = "full" ]; then
   [ -f "$SRC/lib/dsys/roles.py" ] \
     || fail "1/7 preflight" "no lib/dsys/roles.py in --from $SRC (needed for full profile)"
@@ -143,8 +194,13 @@ else
 fi
 
 echo "==> [4/7] write manifest"
+# components.json is carried VERBATIM into the manifest: the installer
+# authors nothing about components and maintains nothing — it is a
+# courier from dist metadata to the manifest, where `dsys doctor`
+# reads it to report per-component status.
 python3 "$SRC/lib/dsys/manifest.py" write \
   "$INSTALL_HOME" "$PROFILE" "$CLI_VERSION" "$INSTALLER_VERSION" \
+  "$SRC/components.json" "$SOURCE_JSON" \
   || fail "4/7 write manifest" "manifest.py write failed"
 
 echo "==> [5/7] symlink"

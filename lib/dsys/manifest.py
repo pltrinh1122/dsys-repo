@@ -82,9 +82,25 @@ def core_tree_hash(home: Path) -> str:
 
 
 def write_manifest(
-    home: Path, *, profile: str, cli_version: str, installer_version: str
+    home: Path,
+    *,
+    profile: str,
+    cli_version: str,
+    installer_version: str,
+    components: dict,
+    source: dict | None = None,
 ) -> dict:
-    """Build the manifest dict and write it (pretty) to var/manifest.json."""
+    """Build the manifest dict and write it (pretty) to var/manifest.json.
+
+    `components` is the parsed components.json registry, embedded VERBATIM:
+    the installer authors nothing about components and maintains nothing;
+    it carries the dist's declaration into the manifest, where `dsys
+    doctor` reads it to report per-component status.
+
+    `source` records acquisition provenance: {"mode": "release", "tag",
+    "tarball_sha256"} for --release installs, {"mode": "local", "path"}
+    for --from installs. It is provenance, not verification.
+    """
     home = Path(home)
     rels = covered_files(home, profile)
     manifest = {
@@ -94,6 +110,8 @@ def write_manifest(
         "install_path": str(home),
         "installed_at": datetime.now(timezone.utc).isoformat(),
         "core_hash": core_tree_hash(home),
+        "source": source if isinstance(source, dict) else {"mode": "unknown"},
+        "components": components,
         "files": {rel: file_sha256(home / rel) for rel in rels},
     }
     var = home / "var"
@@ -135,15 +153,50 @@ def verify_tree(home: Path) -> dict:
     return {"ok": not diverged and not missing, "diverged": diverged, "missing": missing}
 
 
+def _load_components(path: str) -> dict:
+    """Read and lightly validate the components registry file.
+
+    The registry is carried verbatim; validation here is structural
+    only (a dict with a "components" list of named entries). Doctor
+    interprets entries leniently and never fails on an unknown field.
+    """
+    try:
+        data = json.loads(Path(path).read_text("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        raise ManifestError(f"bad components registry at {path}: {e}")
+    if not isinstance(data, dict) or not isinstance(data.get("components"), list):
+        raise ManifestError(
+            f"bad components registry at {path}: expected a dict with a "
+            f"'components' list"
+        )
+    for entry in data["components"]:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            raise ManifestError(
+                f"bad components registry at {path}: every component needs a name"
+            )
+    return data
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if len(args) == 5 and args[0] == "write":
-        _, home, profile, cli_version, installer_version = args
+    if args[:1] == ["write"] and len(args) in (6, 7):
+        _, home, profile, cli_version, installer_version, components_path = args[:6]
+        components = _load_components(components_path)
+        source = None
+        if len(args) == 7:
+            try:
+                source = json.loads(args[6])
+            except json.JSONDecodeError as e:
+                raise ManifestError(f"bad source JSON: {e}")
+            if not isinstance(source, dict):
+                raise ManifestError("bad source JSON: not an object")
         m = write_manifest(
             Path(home),
             profile=profile,
             cli_version=cli_version,
             installer_version=installer_version,
+            components=components,
+            source=source,
         )
         print(
             json.dumps(
@@ -160,6 +213,7 @@ if __name__ == "__main__":
         print(json.dumps(verify_tree(Path(home))))
     else:
         raise SystemExit(
-            "usage: manifest.py write <home> <profile> <cli_version> <installer_version>"
+            "usage: manifest.py write <home> <profile> <cli_version> "
+            "<installer_version> <components.json> [<source-json>]"
             " | verify <home>"
         )

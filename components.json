@@ -1,0 +1,100 @@
+{
+  "_comment": "Component registry: the architecture's component set, as dist metadata. The installer carries this file VERBATIM into var/manifest.json (it authors nothing, maintains nothing). `dsys doctor` evaluates each component against the live tree and reports per-component status: instantiated | specified-only | absent | mutated. Artifact entries ending in '/' mean 'every manifest-covered file under this prefix'.",
+  "components": [
+    {
+      "artifacts": [
+        "lib/core/package/"
+      ],
+      "description": "The judging package: schema, validators, verification views, golden run. Function is covered separately by doctor's golden_chain check; here 'instantiated' means present and pristine.",
+      "kind": "shipped",
+      "name": "core",
+      "profiles": [
+        "base",
+        "full"
+      ]
+    },
+    {
+      "artifacts": [
+        "bin/dsys",
+        "lib/dsys/"
+      ],
+      "description": "The dsys command surface: referee, doctor, state, derive, roles, scenario, session.",
+      "kind": "shipped",
+      "name": "cli",
+      "profiles": [
+        "base",
+        "full"
+      ]
+    },
+    {
+      "artifacts": [
+        "lib/dsys/runner.py"
+      ],
+      "description": "Derivation executor: takes a DerivationManifest, returns release bytes plus a RunnerReceipt. Zero discretion; refusals are check results, not dispositions.",
+      "kind": "shipped",
+      "name": "runner",
+      "operational_note": {
+        "base": "present; derive refused on base (judge-only)",
+        "full": "operational",
+        "default": "present and pristine"
+      },
+      "profiles": [
+        "base",
+        "full"
+      ]
+    },
+    {
+      "artifacts": [
+        "lib/roles/"
+      ],
+      "description": "Role bundles (cos, operator, auditor), versioned and seal-verified. Full profile only.",
+      "kind": "shipped",
+      "name": "roles",
+      "profiles": [
+        "full"
+      ]
+    },
+    {
+      "artifacts": [
+        "share/scenarios/"
+      ],
+      "description": "Test-drive scenarios: declarative exercise specs, driver-interpreted. Full profile only.",
+      "kind": "shipped",
+      "name": "scenarios",
+      "profiles": [
+        "full"
+      ]
+    },
+    {
+      "description": "Authoring-and-building system producing AutomatonRelease candidates. Specified, not implemented.",
+      "kind": "specified-only",
+      "name": "factory",
+      "spec": "doc/factory-spec.md (unratified)"
+    },
+    {
+      "description": "Third playbook: transcription as DoD conditionals (START/STOP/KEEP, T1-T4). Specified, not implemented.",
+      "kind": "specified-only",
+      "name": "transcription",
+      "spec": "doc/dsys-transcription-playbook-spec.md (unratified)"
+    },
+    {
+      "description": "Live run-book executor. The automaton plane is validated in golden runs; no executor is built, and the CLI deliberately offers no run-book addressee.",
+      "kind": "specified-only",
+      "name": "automaton-executor",
+      "spec": "architecture doc (automaton plane); no executor spec yet"
+    },
+    {
+      "description": "Branch-per-writer sync protocol. Specified; the CLI surface is a refusing stub and the hosted service is a separate build.",
+      "kind": "specified-only",
+      "name": "session-sync",
+      "spec": "doc/session-sync-spec.md (unratified)"
+    },
+    {
+      "description": "File-based prompt-response transport backend for ambient inferencing. Exploratory; not approved for implementation.",
+      "kind": "specified-only",
+      "name": "dialog",
+      "spec": "doc/dialog-protocol-spec.md (exploratory)"
+    }
+  ],
+  "registry_version": "1.0.0"
+}

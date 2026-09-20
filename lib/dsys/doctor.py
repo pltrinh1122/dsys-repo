@@ -6,6 +6,12 @@ caller (bin/dsys) decides. `pristine` is true iff the manifest tree-hashes
 check passes -- that is the only meaning of "unmutated" here; config edits
 etc/config.yaml is operator-owned and never trips the doctor.
 
+The `components` check is the mechanical status of instantiation: the
+installer carries the dist's component registry (components.json)
+verbatim into the manifest -- it authors and maintains nothing (F-I11).
+Doctor owns the status, evaluating each component against the live tree:
+instantiated | specified-only | absent | mutated.
+
 The vendored core (pydantic-dependent) is imported in-process via the
 install-home convention: sys.path.insert(0, "<home>/lib/core") then
 `from package import ...`. The core is never mutated here; it is only
@@ -34,6 +40,91 @@ def _ensure_core_on_path(home: Path) -> None:
     core_dir = str(home / "lib" / "core")
     if core_dir not in sys.path:
         sys.path.insert(0, core_dir)
+
+
+def _component_statuses(home: Path, m: dict | None) -> list:
+    """Evaluate the carried component registry against the live tree.
+
+    Returns rows [{"name", "status", "detail"}] with status in
+    instantiated | specified-only | absent | mutated. Artifact entries
+    ending in '/' match every manifest-covered file under that prefix.
+    Lenient: unknown fields and unknown kinds never raise.
+    """
+    home = Path(home)
+    reg = (m or {}).get("components") or {}
+    entries = reg.get("components") or []
+    profile = (m or {}).get("profile")
+    try:
+        res = manifest.verify_tree(home)
+    except manifest.ManifestError:
+        res = {"diverged": [], "missing": []}
+    bad = set(res.get("diverged", []) or []) | set(res.get("missing", []) or [])
+    covered = set(((m or {}).get("files") or {}).keys())
+
+    def expand(artifacts: list) -> list:
+        out: list = []
+        for a in artifacts:
+            if isinstance(a, str) and a.endswith("/"):
+                out.extend(sorted(r for r in covered if r.startswith(a)))
+            elif isinstance(a, str):
+                out.append(a)
+        return out
+
+    rows: list = []
+    for c in entries:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name", "?"))
+        kind = str(c.get("kind", "shipped"))
+        if kind == "specified-only":
+            rows.append(
+                {
+                    "name": name,
+                    "status": "specified-only",
+                    "detail": str(c.get("spec", "specified, not implemented")),
+                }
+            )
+            continue
+        profiles = c.get("profiles") or []
+        if profile not in profiles:
+            rows.append(
+                {
+                    "name": name,
+                    "status": "absent",
+                    "detail": (
+                        f"not shipped in the {profile} profile "
+                        f"(ships in: {', '.join(profiles)})"
+                    ),
+                }
+            )
+            continue
+        artifacts = expand(c.get("artifacts") or [])
+        missing = [a for a in artifacts if not (home / a).exists()]
+        if missing:
+            rows.append(
+                {
+                    "name": name,
+                    "status": "absent",
+                    "detail": f"missing artifacts: {', '.join(missing)}",
+                    "fault": True,
+                }
+            )
+            continue
+        mutated = [a for a in artifacts if a in bad]
+        if mutated:
+            rows.append(
+                {
+                    "name": name,
+                    "status": "mutated",
+                    "detail": f"diverged from manifest: {', '.join(mutated)}",
+                }
+            )
+            continue
+        detail = c.get("operational_note") or "present and pristine"
+        if isinstance(detail, dict):
+            detail = detail.get(profile) or detail.get("default") or "present and pristine"
+        rows.append({"name": name, "status": "instantiated", "detail": str(detail)})
+    return rows
 
 
 def run_checks(home: Path, *, strict: bool) -> dict:
@@ -70,11 +161,18 @@ def run_checks(home: Path, *, strict: bool) -> dict:
             )
             m = None
         else:
+            src = m.get("source") or {}
+            mode = src.get("mode", "?")
+            if mode == "release":
+                src_desc = f"release:{src.get('tag', '?')}"
+            else:
+                src_desc = str(mode)
             _check(
                 checks,
                 "manifest",
                 _OK,
-                f"profile={m['profile']} install_path={m['install_path']}",
+                f"profile={m['profile']} install_path={m['install_path']} "
+                f"source={src_desc}",
             )
     except manifest.ManifestError as e:
         _check(checks, "manifest", _FAIL, str(e), hint="rewrite the manifest or reinstall")
@@ -304,4 +402,61 @@ def run_checks(home: Path, *, strict: bool) -> dict:
         "no network probes performed — hermetic checks only (F-I4)",
     )
 
-    return {"profile": profile, "pristine": pristine, "checks": checks}
+    # 12. components: mechanical status of instantiation. The installer
+    # carries the dist's component registry verbatim into the manifest;
+    # the installer authors and maintains nothing (F-I11). Doctor owns
+    # the status: each component is evaluated against the live tree and
+    # reported instantiated | specified-only | absent | mutated.
+    comp_rows: list = []
+    reg = (m or {}).get("components")
+    if reg is None:
+        _check(
+            checks,
+            "components",
+            _WARN,
+            "no component registry carried in manifest (pre-registry "
+            "install); reinstall to get per-component status",
+            hint="reinstall from a dist with components.json",
+        )
+    elif not isinstance(reg, dict) or not isinstance(reg.get("components"), list):
+        _check(
+            checks,
+            "components",
+            _WARN,
+            "component registry in manifest is malformed; skipping",
+            hint="reinstall from a dist with a valid components.json",
+        )
+    else:
+        comp_rows = _component_statuses(home, m)
+        counts: dict = {}
+        for r in comp_rows:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        summary = ", ".join(
+            f"{counts[s]} {s}" for s in
+            ("instantiated", "absent", "mutated", "specified-only")
+            if counts.get(s)
+        ) or "no components"
+        faults = [r["name"] for r in comp_rows if r.get("fault")]
+        if faults:
+            _check(
+                checks,
+                "components",
+                _FAIL,
+                f"{len(comp_rows)} evaluated ({summary}); expected artifacts "
+                f"missing: {', '.join(faults)}",
+                hint="reinstall — the tree is incomplete",
+            )
+        else:
+            _check(
+                checks,
+                "components",
+                _OK,
+                f"{len(comp_rows)} evaluated: {summary}",
+            )
+
+    return {
+        "profile": profile,
+        "pristine": pristine,
+        "checks": checks,
+        "components": comp_rows,
+    }

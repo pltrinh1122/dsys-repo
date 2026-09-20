@@ -63,18 +63,34 @@ PATH hint and exits 0 — a missing symlink is not a failed install).
 
 ## 3. Distribution
 
-One artifact per release: `dsys-<version>.tar.gz` containing `bin/`,
-`lib/`, `share/`, plus `INSTALLER_VERSION` and a `dist-manifest.json`
-(hashes of everything in the tarball). The installer verifies the
-tarball against `dist-manifest.json` before touching `~/.dsys`.
+One release = one tag on `github.com/pltrinh1122/dsys-repo`
+(`v<dist_version>`) published as a GitHub Release with two attached
+assets: `dsys-<tag>.tar.gz` (a `git archive` of the tag — the tag *is*
+the content manifest, so no separate per-file list is needed) and
+`dsys-<tag>.tar.gz.sha256` (the tarball's checksum, the release's own
+attestation). The installer verifies the tarball against the checksum
+asset before touching the install home; a mismatch aborts before any
+mutation (F-I13: downloading from github.com is not verification).
 
 Sources, in order of preference:
 
-1. `--from <path>` — local tarball. Fully offline.
-2. `--from <url>` — fetched once with `curl`, hash-verified, then treated
-   as (1). The only network the installer itself ever performs.
-3. No source given — refuses with usage. The installer never guesses a
-   URL; acquisition is the operator's explicit act.
+1. `--release <tag>` — acquire from GitHub Releases: resolve the tag's
+   assets via the API, download tarball + checksum, verify
+   sha256(tarball) against the published checksum (or against a pinned
+   `--release-sha256`, which must agree with the published one —
+   out-of-band pin wins for fleet use), unpack, then install offline
+   from the unpacked tree. Network is used for acquisition only;
+   everything after unpack follows the offline path (F-I1, F-I12).
+2. `--from <path>` — local source tree. Fully offline.
+3. No source given — `--from` defaults to the script's own directory;
+   `--release` requires an explicit tag. The installer never guesses a
+   URL; acquisition is the operator's explicit act, and the release
+   location is fixed convention, not configuration.
+
+The manifest records acquisition provenance under `source`:
+`{"mode": "release", "tag", "tarball_sha256"}` or `{"mode": "local",
+"path"}`. Provenance, not verification — verification happened at
+acquire time.
 
 ## 4. Hermeticity boundary (per command)
 
@@ -102,8 +118,11 @@ provenance, not in checking machinery.
 1. **Preflight.** `python3 >= 3.10`; `curl` only if `--from` is a URL;
    writable home; ~200MB free. Warn (don't fail) if no agent backend is
    on PATH — `stub` keeps install green.
-2. **Acquire + verify.** Resolve the dist, verify `dist-manifest.json`
-   hashes. Any mismatch aborts before mutation.
+2. **Acquire + verify.** `--release <tag>`: resolve the tag's assets
+   via the GitHub Releases API, download tarball + checksum asset,
+   verify sha256(tarball) against the published checksum (or the pinned
+   `--release-sha256`, which must agree). `--from <path>`: use the local
+   tree directly. Any mismatch aborts before mutation.
 3. **Venv.** `python3 -m venv ~/.dsys/venv`; `pip install` from the
    shipped lockfile with hash checking (`--require-hashes`). No network
    here when installing from a local dist (wheels vendored in the
@@ -141,7 +160,9 @@ installer never deletes state silently (F-I5).
 {
   "installer_version": "1.0.0",
   "dist_version": "0.3.0",
-  "source": {"mode": "dist"},
+  "source": {"mode": "release", "tag": "v0.1.0",
+             "tarball_sha256": "…"}  // or {"mode": "local", "path": "…"},
+                                     // or {"mode": "dev", ...} (see §12),
   "install_path": "/home/operator/.dsys",
   "installed_at": "2026-09-19T...",
   "artifacts": {
@@ -168,8 +189,23 @@ machine-readable form. Fleet use: `dsys doctor` on any member machine
 attests whether its tree matches a pinned release — identical
 environments across the fleet, verified rather than assumed.
 
-Release installs record `"source": {"mode": "dist"}`
-(`dist_version` authoritative). `--dev` installs record working-tree
+The manifest also carries the dist's **component registry** verbatim
+under the `components` key: the architecture's component set
+(`components.json` at the dist root), each entry declaring its kind
+(`shipped` | `specified-only`), the profiles it ships in, and its
+defining artifacts. The installer *carries* this registry — it authors
+nothing about components and maintains nothing (F-I11). `dsys doctor`
+owns the status: its `components` check evaluates every entry against
+the live tree and reports per-component **instantiated |
+specified-only | absent | mutated** (F-I10). A partial architecture
+can therefore never report all-green: specified-only components
+(factory, transcription, automaton-executor, session-sync, dialog) are
+visible as specified-only, not silently absent.
+
+Release installs record `"source": {"mode": "release", "tag",
+"tarball_sha256"}` (`tarball_sha256` is the verified hash — provenance,
+not a second verification). `--from` installs record `"source":
+{"mode": "local", "path"}`. `--dev` installs record working-tree
 provenance instead (§12): `"source": {"mode": "dev", "repo": "...",
 "commit": "...", "dirty": false, "diff_hash": "..."}`.
 
@@ -540,3 +576,48 @@ exercised* (F-DEV-4). Disposition without new authority is theater.
   dispositions occur only at matter boundaries (escalation,
   trust-boundary discovery, mis-scoping) — where new authority is
   exercised.
+- **F-I10.** "`dsys doctor` provides a mechanical status of
+  instantiation." False as stated (2026-09-20 falsification). Doctor
+  verifies installation integrity (tree hashes, layout, config) plus
+  core validity (golden chain) — it cannot name which playbooks or
+  factory machinery are real vs spec-only, cannot see sibling
+  instances, cannot detect staleness vs origin, and cannot distinguish
+  idle from exercising. Narrow survivor: doctor *can* report
+  per-component status once the architecture's component set exists as
+  machine-readable dist metadata — which is the component registry
+  (§6). Instantiation is a relation between the component set and the
+  installed tree; doctor sees the tree side, the registry supplies the
+  other. Honest limit: the decision-making playbook is a procedure
+  embodied by the operator — no file presence proves it is being
+  followed. Some instantiation is behavioral, not mechanical.
+- **F-I11.** "The installer should maintain a registry of installed
+  components and provide status." False (2026-09-20 falsification):
+  two jobs assigned to the wrong tool. (a) Staleness: install-time
+  facts decay; status is a runtime predicate — a registry the
+  installer "maintains" is frozen (lies) or updated by something else
+  (not the installer's). (b) Wrong level: the installer is
+  per-instance; the component set, including spec-only components, is
+  per-architecture — the installer cannot register what it never laid
+  down. (c) Redundancy: file→component mapping is dist metadata, not
+  installer knowledge. (d) Mutation desync: declared-mutation means
+  the tree drifts; only the checker observes the drift. Survivor: the
+  installer *carries* the dist's registry verbatim into the manifest;
+  **doctor** maintains and provides status. Installer records
+  provenance; doctor reports current truth.
+- **F-I12.** "`--release` makes the installer an online tool."
+  FALSIFIED as a blanket claim. Network is confined to the acquisition
+  step ([0/7]): resolve the tag's assets, download tarball + checksum,
+  verify, unpack. Everything after unpack — preflight, venv, tree
+  layout, manifest, self-test — runs the identical offline path as
+  `--from <path>`. The surviving precise claim: the installer performs
+  network I/O in at most one step, and that step is named, optional,
+  and explicit (`--release`).
+- **F-I13.** "Downloading a release tarball from github.com verifies
+  it." FALSIFIED. TLS authenticates the server, not the artifact; the
+  auto-generated GitHub source tarball has no published hash to check
+  against. The installer verifies sha256(tarball) against the release's
+  attached checksum asset (or a pinned `--release-sha256`, which must
+  agree with the published checksum) and aborts before any mutation on
+  mismatch. Trust basis, stated: the checksum is the release's own
+  attestation, not an independent one; for fleet use, pin the hash
+  out-of-band.
