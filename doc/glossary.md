@@ -160,6 +160,94 @@ mutation matter states a reason, classified `accepted` (evidenced by
 observations in artifacts/afferent) or `pending` (human disposition,
 unevidenced); mutation without reason is not allowed (I-17, spec §10).
 
+**factory** — the authoring-and-building system (spec 2026-09-20,
+unratified): produces AutomatonRelease candidates from
+operator-prompted ambient authoring. A harness-plane system with a
+deterministic core (build, verify) — the governed "outside" where
+step-changes are authored. Entities: FactoryProject, AuthoringTurn,
+Draft, BuildRun, VerificationResult; dispositions are DecisionRecords
+with playbook=factory; authoring runs are HarnessRuns under a factory
+standing-policy domain (no separate run entity — F-FACT-4).
+
+**Draft** — a candidate artifact, content-addressed, inert by
+construction. Authored (the ambient proposes, the operator disposes),
+never trusted, only checkable. Kinds: runbook | flow | condition |
+config | scenario | policy; tagged compiled | carried | mixed.
+
+**authorship** — the judgmental activity producing drafts: the ambient
+proposes within typed request schemas, the operator disposes;
+publication is the Operator's act through the ambient's hands. The
+factory's judgmental side; derivation is its mechanical side.
+
+**derivation** — pure, mechanical, semantics-preserving
+transformation: compile, seal, package, hash. Crosses no
+representation gap requiring judgment. The factory's BuildRun *is*
+derivation — nothing more.
+
+**implementation** — realization across a representation gap
+*requiring judgment*. The standing example is our own
+markdown→Python workflow: choosing schemas, validators, and refusal
+cases was irreducibly judgmental, no pure function could have done
+it. In factory terms an implementation is a Draft (authored), never
+a BuildRun. "The build implements the spec" is loose talk;
+precisely, the build *derives* the release from the draft.
+
+**BuildRun** — the factory's recorded derivation run: draft hashes +
+toolchain version → release bytes hash. A pure function (I-F2): no
+inference backend, no network, no clock. Not implementation
+(falsified 2026-09-20) — a run is not its product, and a pure
+function cannot implement.
+
+**runner** — the derivation executor (spec 2026-09-20, unratified):
+takes a DerivationManifest and returns release bytes plus a
+RunnerReceipt — purely, deterministically. Build-time; the automaton
+is run-time. Takes no dispositions: zero discretion, executes
+authorized derivations and attests the conditions; its refusals are
+check results, not dispositions. In the trust base by declaration;
+dishonesty mitigated by diversity (independent re-derivation,
+receipts compared), a disposition/standing-policy choice.
+
+**DerivationManifest** — the hermetic input closure the runner
+accepts: content-addressed draft refs (+ hashes), toolchain pin
+(version + hash), derivation parameters. Assembled by the factory
+before submission — closure assembly is part of becoming buildable
+(C-1). The cache key.
+
+**RunnerReceipt** — the runner's own record, cited by BuildRun:
+manifest hash, runner identity, pin verified, hermeticity
+attestation, output bytes hash, double-derive result, pass/fail.
+Separate record, separate accountability (F-RUN-1); one BuildRun may
+cite several (diversity). No timestamps — the architecture has no
+clock.
+
+**DerivationCache** — content-addressed memoization: manifest hash
+→ (output bytes hash, original receipt ref). Hits cite the original
+receipt, never mint attestation (F-RUN-3).
+
+**`--dev` loop** — the dyad's workflow for developing dsys itself
+(software, specs, or both): mutate → install → exercise → verify →
+iterate (installer-spec §12, 2026-09-20). An extension by
+*specification*, not a system: specified `--dev` mode (working-tree
+install, provenance recorded not refused, fast converge, offline),
+iteration DoD conditionals D1–D4, manifest `source` provenance
+fields. No new entities (F-DEV-1); doctor's checking machinery
+mode-agnostic, baseline differs (F-DEV-2); not a run-book —
+dyad-executed, DoD-gated, mechanical segments as scenarios (F-DEV-3);
+disposition economy — one disposition per matter, iterations checked
+not decided, fresh dispositions only at matter boundaries (F-DEV-4).
+
+**no supervisors, only checkers** — architectural principle (named
+2026-09-20, from the `developer` falsification): coordination and
+assurance come from checkable artifacts and gates, never from a
+watching or guiding entity. Gates, not guides; receipts, not
+reports; refusals, not supervision; dispositions, not directives.
+The ambient is never made faithful — unfaithful execution simply
+cannot pass the gates (F-FACT-5: never trusted, only checkable;
+the referee judges afterward and enforces nothing). Tripwires: this
+holds while a single operator disposes and `decide` stays excluded
+as an inference type; it reopens if agents ever dispose or the
+operator leaves the loop.
+
 ## Retired terms
 
 - **AutomatonPlayBook** — collapsed into **Run-book** 2026-09-19. The pair
@@ -169,3 +257,12 @@ unevidenced); mutation without reason is not allowed (I-17, spec §10).
   `AutomatonRun.runbook_id` replaces `playbook_id`. The collapse also
   removes the cross-plane name collision with the decision-making
   **Playbook**, which keeps the name.
+
+- **BuildRun ~ implementation** — falsified 2026-09-20. Category
+  error (BuildRun is a process entity — a recorded run;
+  implementation is an artifact or an activity) compounded by a
+  purity contradiction: BuildRun is *defined* pure and
+  judgment-free (I-F2), while implementation *requires* judgment
+  (realization across a representation gap — our own spec→package
+  history is the standing proof). Survivor: BuildRun is
+  *derivation*; in the factory an implementation is a *Draft*.
