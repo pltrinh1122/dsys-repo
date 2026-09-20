@@ -169,6 +169,26 @@ tmpdir=$(mktemp -d) \
   || fail "6/7 self-test" "dsys state init --seed golden"
 "$INSTALL_HOME/bin/dsys" referee validate --state "$tmpdir/g.json" \
   || fail "6/7 self-test" "dsys referee validate (expected exit 0)"
+if [ "$PROFILE" = "full" ]; then
+  # runner smoke test (installer-spec section 5): carried-identity
+  # fixture — derivation reachable, toolchain pin verifies,
+  # output hash == input hash.
+  printf 'carried-identity-fixture' > "$tmpdir/fixture.bin" \
+    || fail "6/7 self-test" "write derive fixture"
+  fhash=$(sha256sum "$tmpdir/fixture.bin" | cut -d' ' -f1) \
+    || fail "6/7 self-test" "sha256sum derive fixture"
+  cat > "$tmpdir/derivation-manifest.json" <<EOF \
+    || fail "6/7 self-test" "write derivation manifest fixture"
+{"derivation": "identity", "toolchain": {"name": "runner", "version": "$CLI_VERSION"}, "inputs": [{"path": "$tmpdir/fixture.bin", "sha256": "$fhash"}], "params": {}}
+EOF
+  "$INSTALL_HOME/bin/dsys" derive --manifest "$tmpdir/derivation-manifest.json" \
+      --out "$tmpdir/drv" \
+    || fail "6/7 self-test" "dsys derive --manifest (expected exit 0)"
+  ohash=$(sha256sum "$tmpdir/drv/output.bin" | cut -d' ' -f1) \
+    || fail "6/7 self-test" "sha256sum derivation output"
+  [ "$ohash" = "$fhash" ] \
+    || fail "6/7 self-test" "derive smoke test: output hash != input hash"
+fi
 
 echo "==> [7/7] done"
 echo ""

@@ -5,13 +5,14 @@ Startup order: (1) resolve the install home and read var/manifest.json
 (refusing on a missing manifest or a moved tree); (2) parse args;
 (3) load config (flags > config file > DEFAULTS); (4) dispatch.
 
-On the base profile, ``roles``, ``scenario``, ``execute`` and ``session``
-refuse with an unavailable-capability error (exit 1); ``referee``,
-``state`` and ``doctor`` are served by the sibling modules. ``execute``
-and ``session`` are full-profile stubs with their own refusals.
+On the base profile, ``roles``, ``scenario``, ``execute``, ``derive`` and
+``session`` refuse with an unavailable-capability error (exit 1);
+``referee``, ``state`` and ``doctor`` are served by the sibling modules.
+``execute`` and ``session`` are full-profile stubs with their own refusals.
 
 Exit codes: 0 ok / 1 usage|config|unavailable-capability /
-2 backend failure (missing) / 4 agent refusal / 5 validation violations /
+2 backend failure (missing) / 4 agent refusal / 5 validation violations
+(``referee validate``) or derivation failed/refused (``derive``) /
 6 scenario failure.
 """
 
@@ -30,7 +31,7 @@ from paths import resolve_home
 from config import ConfigError, load as load_config
 from envelope import TOOL_VERSION, envelope
 
-BASE_BLOCKED = ("roles", "scenario", "execute", "session")
+BASE_BLOCKED = ("roles", "scenario", "execute", "derive", "session")
 _DOCTOR_STATUS = {"ok": "ok", "warn": "WARN", "fail": "FAIL"}
 
 
@@ -157,6 +158,15 @@ def _build_parser():
     for _sc in ("init", "join", "push", "pull", "status", "divergences"):
         s_sess.add_parser(_sc)
 
+    p_der = sub.add_parser("derive", help="run a derivation (full profile only)")
+    p_der.add_argument("input", nargs="?", default=None, metavar="PATH|URL",
+                       help="derivation input: filesystem path or file:// URL "
+                            "(remote URLs are refused: derive is offline)")
+    p_der.add_argument("--manifest", default=None, metavar="PATH|URL",
+                       help="DerivationManifest JSON as a path or file:// URL")
+    p_der.add_argument("--out", default=None, metavar="DIR",
+                       help="write output.bin + receipt.json here")
+
     return parser
 
 
@@ -200,6 +210,29 @@ def _finish(cmd, profile, result, as_json, quiet):
 
 # --------------------------------------------------------------------------
 # handlers
+
+
+def cmd_derive(args, cfg, home, manifest):
+    runner, err = _import_sibling("runner", "runner")
+    if runner is None:
+        return 1, None, None, None, err
+    try:
+        result = runner.derive_command(
+            input=args.input, manifest_locator=args.manifest,
+            out_dir=args.out, home=home,
+            installed_manifest=manifest, tool_version=TOOL_VERSION)
+    except runner.RunnerRefusal as e:
+        return 1, None, None, None, f"dsys: {e}"
+    except runner.DerivationFailure as e:
+        text = json.dumps(e.receipt, indent=2, sort_keys=True)
+        return 5, text, None, e.receipt, None
+    receipt = result["receipt"]
+    text = json.dumps(receipt, indent=2, sort_keys=True)
+    notes = None
+    if result["cache_hit"]:
+        notes = ("cache hit — original receipt cited, no fresh attestation "
+                 "minted (R-5)")
+    return 0, text, notes, receipt, None
 
 
 def cmd_execute(args, cfg, home):
@@ -450,6 +483,8 @@ def _dispatch(args, cfg, home, manifest, profile, verbose):
         return cmd_doctor(args, cfg, home)
     if cmd == "session":
         return cmd_session(args, cfg, home)
+    if cmd == "derive":
+        return cmd_derive(args, cfg, home, manifest)
     return 1, None, None, None, f"dsys: unknown command {cmd!r}"
 
 
