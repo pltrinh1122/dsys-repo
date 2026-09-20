@@ -25,8 +25,12 @@ Input line: `/eval-sc {matter}`.
    `usage: /eval-sc {/name | <path> | <path>@<commit>} [:: {/name | <path> | <path>@<commit>}]`
 2. Form B iff the matter contains a `::` delimiter.
    TARGET = text before it, trimmed. EXEMPLAR-PTR =
-   text after it, trimmed. Form A: EXEMPLAR-PTR =
-   `/pb-decide`.
+   text after it, trimmed. Form A: the exemplar is the
+   pair — contract `/eval-sc`
+   (`doc/slash-commands/eval-sc.md`) and procedure
+   `doc/eval-sc-implementation.md` (this document).
+   Form B: EXEMPLAR-PTR overrides the contract exemplar
+   only; the procedure exemplar remains this document.
 3. Anything that is not a pointer per the grammar
    (design §1) → refuse back with the grammar, no
    report.
@@ -48,9 +52,9 @@ tree reads — flagged as working-tree). A failed read →
 refuse back (`unresolvable pointer: <pointer>`), no
 report. An explicit exemplar pointer that resolves to
 something not definition-shaped → refuse back, no
-report. Target and exemplar resolving to the same
-document → refuse back (`vacuous self-comparison`),
-no report.
+report. Target resolving to either exemplar document
+(contract or procedure) → refuse back
+(`vacuous self-comparison`), no report.
 
 ## 3. Admission — definition-shape verification **[judgment]**
 
@@ -65,7 +69,8 @@ does not classify.
 
 ## 4. Structural comparison **[mechanical + judgment]**
 
-Map the target's sections onto the exemplar's set —
+Map the target's sections onto the contract exemplar's
+set —
 Kind, Lineage, Trigger, Support, Function/Procedure,
 Output contract, Boundaries, Placement. Presence is
 mechanical; matching a differently-headed section to
@@ -121,7 +126,8 @@ silent.
 ```text
 /eval-sc report
 Target: <pointer> -> <resolved path> @ <commit>
-Exemplar: <pointer> -> <resolved path> @ <commit>
+Exemplar (contract): <pointer> -> <resolved path> @ <commit>
+Exemplar (procedure): doc/eval-sc-implementation.md @ <commit>
 
 1. Synthesis
 Verdict: <conforms | deviates | not evaluable as a slash-command definition>
@@ -276,8 +282,9 @@ stands alone.
   slash-command authoring; extensive execution,
   especially Python-driven, belongs to it, not to the
   slash-command layer.
-- **self-comparison** — target and exemplar resolving
-  to the same document: vacuous, refused back (§2).
+- **self-comparison** — target resolving to either
+  exemplar document (contract or procedure): vacuous,
+  refused back (§2).
 - **single concern** — the target does one thing; a
   bundled multi-concern command fails M5 (§5).
 - **vacuous** — a comparison that cannot inform the

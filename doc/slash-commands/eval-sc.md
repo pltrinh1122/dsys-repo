@@ -28,9 +28,13 @@
   slash-command, not a Muse skill. The binding is performed
   by the ambient agent's recognition, not by platform
   machinery.
-- **Exemplar:** the `/pb-decide` definition
-  (`doc/slash-commands/pb-decide.md`) unless Form B names
-  another. The exemplar is the standard, never the subject.
+- **Exemplar:** the pair — contract: this definition
+  (`doc/slash-commands/eval-sc.md`); procedure:
+  `doc/eval-sc-implementation.md` — unless Form B names
+  another contract exemplar. The exemplar is the
+  standard, never the subject: a target resolving to
+  either exemplar document is refused back as vacuous
+  self-comparison.
 - **Procedure (normative):**
   `doc/eval-sc-implementation.md` — parse, resolve pointers,
   admit (definition-shape verification), structural

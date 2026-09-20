@@ -32,20 +32,32 @@ grammar, no report.
 
 ## 2. The exemplar
 
-The standing exemplar is the `/pb-decide` definition
-(`doc/slash-commands/pb-decide.md`): the founding
-slash-command definition, and the one the family already
-treats as its standing reference — `eval-meta.md`,
-`eval-pb.md`, and `pb-extend.md` each define their
-support/binding as "same standing as `/pb-decide`". The
-choice is therefore grounded in the family's own usage,
-not stipulated.
+The standing exemplar is the pair — contract: the
+`/eval-sc` definition itself
+(`doc/slash-commands/eval-sc.md`); procedure:
+`doc/eval-sc-implementation.md` (the procedure this
+design specifies). The command is self-referential —
+the definition that specifies slash-command
+well-formedness, together with the procedure that
+executes the comparison, is the standard against which
+future slash-command definitions are compared. The
+choice is grounded in the command's own anatomy: the
+definition carries every S1 section (Kind, Lineage,
+Trigger, Support, Function/Procedure, Output contract,
+Boundaries, Placement), so it exemplifies the form it
+specifies; the procedure exemplifies the execution the
+Function/Procedure section binds.
 
 The exemplar is the standard, never the subject:
-`/eval-sc` never evaluates the exemplar. A Form B
-exemplar must itself resolve to a slash-command
-definition; otherwise the requested comparison cannot
-be performed — refused back, no report.
+`/eval-sc` never evaluates the exemplar. A target
+resolving to either exemplar document is refused back
+as vacuous self-comparison (admission gate 3) — so
+`/eval-sc /eval-sc` produces no report. A Form B
+exemplar overrides the contract exemplar only (it must
+itself resolve to a slash-command definition); the
+procedure exemplar remains this procedure. Otherwise
+the requested comparison cannot be performed — refused
+back, no report.
 
 ## 3. Admission (pre-report gates)
 
@@ -208,8 +220,11 @@ fully mechanical — honest about which parts are which.
   itself — authored 2026-09-20 on operator direction
   ("write doc/slash-commands/eval-sc.md"). The design is now
   self-applied: `/eval-sc /eval-sc` conforms on both axes
-  against the exemplar (test-driven 2026-09-20).
-- Family membership ratification (candidate DR-CMD-006)
+  against the exemplar (test-driven 2026-09-20 — against
+  the then-standing `/pb-decide` exemplar; under the
+  self-referential exemplar this invocation is refused
+  back as vacuous self-comparison).
+- Family membership ratification (candidate DR-CMD-007)
   via `/pb-decide`.
 
 ## Glossary
@@ -258,9 +273,11 @@ stands alone — no other document need be opened.
 - **eval-*** — the evaluator command family: `-pb`
   playbooks, `-rb` run-books, `-meta` the open/untyped
   case, `-sc` (proposed) slash-command definitions.
-- **exemplar** — the standard of comparison: the
-  `/pb-decide` definition unless Form B names another
-  (§2). Never the subject of evaluation.
+- **exemplar** — the standard of comparison, a pair:
+  contract `doc/slash-commands/eval-sc.md` and procedure
+  `doc/eval-sc-implementation.md`; Form B names another
+  contract exemplar only (§2). Never the subject of
+  evaluation.
 - **Form A / Form B** — `{pointer}` / `{pointer} ::
   {exemplar-pointer}` (§1).
 - **G6** — gate 6 of the decision-making playbook: the
