@@ -10,8 +10,9 @@
 - **Family:** `eval-*` — evaluators. Suffix marks the target:
   `-sc` slash-command definitions.
 - **Description:** Compare a target slash-command definition
-  against the exemplar definition — structurally (section
-  anatomy, trigger grammar, output contract, boundary form)
+  against the exemplar pair — structurally (section
+  anatomy, trigger grammar, output contract, boundary
+  form, form discipline)
   and semantically (terminology, authority, guidance,
   intent–procedure coherence). Use when the operator invokes
   `/eval-sc` with a pointer to a target definition.
@@ -38,7 +39,7 @@
 - **Procedure (normative):**
   `doc/eval-sc-implementation.md` — parse, resolve pointers,
   admit (definition-shape verification), structural
-  comparison S1–S4, semantic comparison M1–M5, and the
+  structural comparison S1–S5, semantic comparison M1–M5, and the
   three-section report (Synthesis, Structural comparison,
   Semantic comparison). This file binds the command to the
   procedure; it does not restate it.

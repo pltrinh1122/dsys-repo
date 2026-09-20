@@ -88,6 +88,18 @@ cited:
   absent.
 - **S4** boundary form: conforms / deviates: <note> /
   absent.
+- **S5** form discipline: format–layer fit
+  (human-readable prose for the contract layer;
+  TOML/YAML deviate — the uncanny valley, neither
+  human-optimal nor machine-native), quoting
+  discipline (literals the agent must reproduce or
+  match marked as data in code spans; byte-exact
+  regions fenced; no agent-actionable meaning carried
+  by rendering-only syntax), form–role fit
+  (declarative prose for invariants/constraints,
+  imperative for procedure, fenced blocks for exact
+  outputs): conforms / deviates: <note> / N/A:
+  <reason>.
 
 ## 5. Semantic comparison **[judgment]**
 
@@ -274,7 +286,7 @@ stands alone.
   report.
 - **resolution root** — the local dsys-repo checkout
   that pointers resolve against (§2).
-- **S1–S4 / M1–M5** — the structural (§4) and semantic
+- **S1–S5 / M1–M5** — the structural (§4) and semantic
   (§5) dimensions.
 - **sc-author** — proposed, not built: the harness plus
   its corresponding automaton that would provide

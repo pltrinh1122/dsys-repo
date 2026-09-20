@@ -46,7 +46,10 @@ definition carries every S1 section (Kind, Lineage,
 Trigger, Support, Function/Procedure, Output contract,
 Boundaries, Placement), so it exemplifies the form it
 specifies; the procedure exemplifies the execution the
-Function/Procedure section binds.
+Function/Procedure section binds. Together the pair
+exemplifies S5 form discipline: literals quoted as
+data, byte-exact regions fenced, boundaries
+declarative, procedure imperative.
 
 The exemplar is the standard, never the subject:
 `/eval-sc` never evaluates the exemplar. A target
@@ -104,6 +107,24 @@ but roles match — reported with reasons.
   the exemplar's shape: ambient-only execution, the
   read-only / no-decision posture. conforms / deviates /
   absent.
+- **S5 — Form discipline.** The artifact's textual
+  forms fit their roles (falsification survivor,
+  2026-09-20). Format–layer fit: human-readable prose
+  (`.md`) for the contract layer; machine-parseable
+  formats (TOML/YAML) are the uncanny valley — neither
+  human-optimal nor machine-native — and deviate.
+  Quoting discipline: literal strings the agent must
+  reproduce or match (command names, delimiters,
+  grammar tokens) marked as data (code spans);
+  byte-exact regions (usage lines, report templates)
+  fenced; no meaning the agent must act on carried by
+  rendering-only syntax (`#`, `**` are conveniences —
+  the raw text is fully actionable). Form–role fit:
+  declarative prose for invariants/constraints
+  (Boundaries: what must hold, checkable); imperative
+  for procedure (what to do, executable with minimum
+  inference); fenced blocks for exact outputs. conforms
+  / deviates (cited) / N/A (with the reason).
 
 ## 5. Semantic comparison (target ↔ exemplar)
 
@@ -166,7 +187,8 @@ reason). Per-axis verdicts are stated before the
 overall.
 
 **Section 2 — Structural comparison.** Per-dimension
-findings S1–S4: conforms / deviates (cited) / absent,
+findings S1–S5 (S5: N/A with reason rather than
+absent): conforms / deviates (cited) / absent,
 each with the exemplar section cited.
 
 **Section 3 — Semantic comparison.** Per-dimension
@@ -278,6 +300,9 @@ stands alone — no other document need be opened.
   `doc/eval-sc-implementation.md`; Form B names another
   contract exemplar only (§2). Never the subject of
   evaluation.
+- **form discipline** — the S5 structural dimension:
+  format–layer fit, quoting discipline, form–role fit
+  (§4).
 - **Form A / Form B** — `{pointer}` / `{pointer} ::
   {exemplar-pointer}` (§1).
 - **G6** — gate 6 of the decision-making playbook: the
@@ -305,14 +330,15 @@ stands alone — no other document need be opened.
   slash-command layer (§8).
 - **section anatomy** — the S1 mapping of target
   sections onto the exemplar's section set (§4).
-- **self-comparison** — target and exemplar resolving
-  to the same document: vacuous, refused back (§3).
+- **self-comparison** — target resolving to either
+  exemplar document (contract or procedure): vacuous,
+  refused back (§3).
 - **semantic comparison** — report section 3 (§5):
   meaning-against-meaning, dimensions M1–M5.
 - **single concern** — the target does one thing; a
   bundled multi-concern command fails M5 (§5).
 - **structural comparison** — report section 2 (§4):
-  form-against-form, dimensions S1–S4.
+  form-against-form, dimensions S1–S5.
 - **synthesis** — report section 1 (§6): per-axis
   verdicts plus the overall verdict with the
   compressed reasoning chain.
