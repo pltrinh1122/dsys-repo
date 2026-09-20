@@ -2,8 +2,16 @@
 # install.sh — deploy the dsys CLI tree from a source directory.
 #
 # POSIX sh. No root/sudo, no interactive prompts, no network calls.
-# Idempotent: re-running rebuilds the venv and replaces the tree, but
-# never clobbers etc/config.yaml and never deletes var/state or var/log.
+#
+# Idempotency (operational convergence, not byte-identity): install(p) is a
+# pure function of (dist, p, operator-owned material). Re-running with the
+# same profile, or switching profiles, converges the tree regardless of
+# history: lib/dsys/install_tree.py triages every install-owned file not in
+# the profile's owned set — pristine files are removed, mutated/unknown
+# files are quarantined to var/quarantine/<ts>/ with a record (never
+# silently destroyed). etc/config.yaml is never clobbered; var/state and
+# var/log are never deleted. installed_at changes every run and
+# __pycache__ regenerates — both excluded from the equality.
 set -eu
 
 CLI_VERSION="0.1.0"
@@ -75,119 +83,94 @@ fail() { # $1 = step label, $2 = reason
   exit 1
 }
 
-echo "==> [1/8] preflight (profile=$PROFILE)"
+echo "==> [1/7] preflight (profile=$PROFILE)"
 command -v python3 >/dev/null 2>&1 \
-  || fail "1/8 preflight" "python3 not on PATH"
+  || fail "1/7 preflight" "python3 not on PATH"
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
-  || fail "1/8 preflight" "python3 < 3.10"
+  || fail "1/7 preflight" "python3 < 3.10"
 [ -f "$CORE_DIR/schema.py" ] \
-  || fail "1/8 preflight" "no schema.py in --core $CORE_DIR"
+  || fail "1/7 preflight" "no schema.py in --core $CORE_DIR"
 [ -f "$SRC/bin/dsys" ] \
-  || fail "1/8 preflight" "no bin/dsys in --from $SRC"
+  || fail "1/7 preflight" "no bin/dsys in --from $SRC"
 [ -f "$SRC/etc/config.yaml" ] \
-  || fail "1/8 preflight" "no etc/config.yaml in --from $SRC"
+  || fail "1/7 preflight" "no etc/config.yaml in --from $SRC"
 ls "$SRC"/lib/dsys/*.py >/dev/null 2>&1 \
-  || fail "1/8 preflight" "no lib/dsys/*.py in --from $SRC"
+  || fail "1/7 preflight" "no lib/dsys/*.py in --from $SRC"
 [ -f "$SRC/lib/dsys/manifest.py" ] \
-  || fail "1/8 preflight" "no lib/dsys/manifest.py in --from $SRC"
+  || fail "1/7 preflight" "no lib/dsys/manifest.py in --from $SRC"
+[ -f "$SRC/lib/dsys/install_tree.py" ] \
+  || fail "1/7 preflight" "no lib/dsys/install_tree.py in --from $SRC"
 if [ "$PROFILE" = "full" ]; then
   [ -f "$SRC/lib/dsys/roles.py" ] \
-    || fail "1/8 preflight" "no lib/dsys/roles.py in --from $SRC (needed for full profile)"
+    || fail "1/7 preflight" "no lib/dsys/roles.py in --from $SRC (needed for full profile)"
   for r in cos operator auditor; do
     [ -f "$SRC/roles/$r/role.yaml" ] \
-      || fail "1/8 preflight" "no roles/$r/role.yaml in --from $SRC (needed for full profile)"
+      || fail "1/7 preflight" "no roles/$r/role.yaml in --from $SRC (needed for full profile)"
   done
   ls "$SRC"/share/scenarios/*.py >/dev/null 2>&1 \
-    || fail "1/8 preflight" "no share/scenarios/*.py in --from $SRC (needed for full profile)"
+    || fail "1/7 preflight" "no share/scenarios/*.py in --from $SRC (needed for full profile)"
 fi
 
-echo "==> [2/8] create venv"
+echo "==> [2/7] create venv"
 if [ -d "$INSTALL_HOME/venv" ]; then
   rm -rf "$INSTALL_HOME/venv" \
-    || fail "2/8 create venv" "cannot remove existing venv at $INSTALL_HOME/venv"
+    || fail "2/7 create venv" "cannot remove existing venv at $INSTALL_HOME/venv"
 fi
 python3 -m venv --system-site-packages "$INSTALL_HOME/venv" \
-  || fail "2/8 create venv" "python3 -m venv failed"
+  || fail "2/7 create venv" "python3 -m venv failed"
 "$INSTALL_HOME/venv/bin/python" -c 'import pydantic; print("    venv python ok; pydantic", pydantic.VERSION)' \
-  || fail "2/8 create venv" "venv python cannot import pydantic (host must provide it)"
+  || fail "2/7 create venv" "venv python cannot import pydantic (host must provide it)"
 
-echo "==> [3/8] lay down tree"
-mkdir -p "$INSTALL_HOME/bin" "$INSTALL_HOME/lib/dsys" "$INSTALL_HOME/lib/core/package" \
-  "$INSTALL_HOME/etc" "$INSTALL_HOME/var/state" "$INSTALL_HOME/var/log" \
-  "$INSTALL_HOME/var/cache" "$INSTALL_HOME/share/scenarios" \
-  || fail "3/8 lay down tree" "mkdir failed"
-cp "$SRC/bin/dsys" "$INSTALL_HOME/bin/dsys" \
-  || fail "3/8 lay down tree" "cp bin/dsys"
-chmod +x "$INSTALL_HOME/bin/dsys" \
-  || fail "3/8 lay down tree" "chmod bin/dsys"
-cp "$SRC"/lib/dsys/*.py "$INSTALL_HOME/lib/dsys/" \
-  || fail "3/8 lay down tree" "cp lib/dsys/*.py"
-for f in __init__ __main__ schema validators views golden_run; do
-  cp "$CORE_DIR/$f.py" "$INSTALL_HOME/lib/core/package/$f.py" \
-    || fail "3/8 lay down tree" "cp $f.py from --core"
-done
-if [ -f "$INSTALL_HOME/etc/config.yaml" ]; then
-  echo "    etc/config.yaml exists — keeping operator config (never clobbered)"
-else
-  cp "$SRC/etc/config.yaml" "$INSTALL_HOME/etc/config.yaml" \
-    || fail "3/8 lay down tree" "cp etc/config.yaml"
-fi
-
-echo "==> [4/8] profile: $PROFILE"
+echo "==> [3/7] converge tree (profile=$PROFILE)"
 if [ "$PROFILE" = "full" ]; then
   for r in cos operator auditor; do
     python3 "$SRC/lib/dsys/roles.py" seal "$SRC/roles/$r" >/dev/null \
-      || fail "4/8 profile" "seal roles/$r"
+      || fail "3/7 converge tree" "seal roles/$r"
   done
-  rm -rf "$INSTALL_HOME/lib/roles" \
-    || fail "4/8 profile" "cannot clear $INSTALL_HOME/lib/roles"
-  mkdir -p "$INSTALL_HOME/lib/roles" \
-    || fail "4/8 profile" "mkdir lib/roles"
-  for r in cos operator auditor; do
-    cp -r "$SRC/roles/$r" "$INSTALL_HOME/lib/roles/$r" \
-      || fail "4/8 profile" "cp roles/$r"
-  done
-  rm -rf "$INSTALL_HOME/share/scenarios" \
-    || fail "4/8 profile" "cannot clear $INSTALL_HOME/share/scenarios"
-  mkdir -p "$INSTALL_HOME/share/scenarios" \
-    || fail "4/8 profile" "mkdir share/scenarios"
-  cp "$SRC"/share/scenarios/*.py "$INSTALL_HOME/share/scenarios/" \
-    || fail "4/8 profile" "cp share/scenarios/*.py"
+fi
+mkdir -p "$INSTALL_HOME/var/state" "$INSTALL_HOME/var/log" "$INSTALL_HOME/var/cache" \
+  || fail "3/7 converge tree" "mkdir var dirs"
+python3 "$SRC/lib/dsys/install_tree.py" converge \
+  "$INSTALL_HOME" "$PROFILE" "$SRC" "$CORE_DIR" "$INSTALLER_VERSION" \
+  || fail "3/7 converge tree" "install_tree.py converge failed"
+if [ -f "$INSTALL_HOME/etc/config.yaml" ]; then
+  echo "    etc/config.yaml exists — keeping operator config (never clobbered)"
 else
-  # full -> base reinstalls downgrade cleanly
-  rm -rf "$INSTALL_HOME/lib/roles" "$INSTALL_HOME/share/scenarios" \
-    || fail "4/8 profile" "cannot strip full-profile dirs"
+  mkdir -p "$INSTALL_HOME/etc" \
+    || fail "3/7 converge tree" "mkdir etc"
+  cp "$SRC/etc/config.yaml" "$INSTALL_HOME/etc/config.yaml" \
+    || fail "3/7 converge tree" "cp etc/config.yaml"
 fi
 
-echo "==> [5/8] write manifest"
+echo "==> [4/7] write manifest"
 python3 "$SRC/lib/dsys/manifest.py" write \
   "$INSTALL_HOME" "$PROFILE" "$CLI_VERSION" "$INSTALLER_VERSION" \
-  || fail "5/8 write manifest" "manifest.py write failed"
+  || fail "4/7 write manifest" "manifest.py write failed"
 
-echo "==> [6/8] symlink"
+echo "==> [5/7] symlink"
 if [ "$INSTALL_HOME" = "$HOME/.dsys" ] && [ -d "$HOME/.local/bin" ]; then
   ln -sf "$INSTALL_HOME/bin/dsys" "$HOME/.local/bin/dsys" \
-    || fail "6/8 symlink" "ln -sf failed"
+    || fail "5/7 symlink" "ln -sf failed"
   echo "    symlinked ~/.local/bin/dsys -> $INSTALL_HOME/bin/dsys"
 else
   echo "    skipping symlink (home is $INSTALL_HOME); add to PATH:"
   echo "    export PATH=\"$INSTALL_HOME/bin:\$PATH\""
 fi
 
-echo "==> [7/8] self-test"
+echo "==> [6/7] self-test"
 export DSYS_HOME="$INSTALL_HOME"
 "$INSTALL_HOME/bin/dsys" --version \
-  || fail "7/8 self-test" "dsys --version"
+  || fail "6/7 self-test" "dsys --version"
 "$INSTALL_HOME/bin/dsys" doctor \
-  || fail "7/8 self-test" "dsys doctor (expected exit 0)"
+  || fail "6/7 self-test" "dsys doctor (expected exit 0)"
 tmpdir=$(mktemp -d) \
-  || fail "7/8 self-test" "mktemp -d"
+  || fail "6/7 self-test" "mktemp -d"
 "$INSTALL_HOME/bin/dsys" state init --seed golden --out "$tmpdir/g.json" \
-  || fail "7/8 self-test" "dsys state init --seed golden"
+  || fail "6/7 self-test" "dsys state init --seed golden"
 "$INSTALL_HOME/bin/dsys" referee validate --state "$tmpdir/g.json" \
-  || fail "7/8 self-test" "dsys referee validate (expected exit 0)"
+  || fail "6/7 self-test" "dsys referee validate (expected exit 0)"
 
-echo "==> [8/8] done"
+echo "==> [7/7] done"
 echo ""
 echo "dsys installed: $INSTALL_HOME (profile: $PROFILE, cli $CLI_VERSION, installer $INSTALLER_VERSION)"
 echo "note: the venv uses --system-site-packages — pydantic is inherited from"

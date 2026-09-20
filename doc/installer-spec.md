@@ -113,9 +113,11 @@ tree; backend probes are advisory and labeled as such (F-I4).
 8. **Cache.** Copy the dist tarball to `var/cache/` (bounded: keep last
    two) for offline rollback.
 
-**Idempotent.** Re-running upgrades in place: venv rebuilt, tree
-replaced, `etc/config.yaml` and `var/state` untouched, symlink
-verified-not-duplicated.
+**Idempotent.** Re-running upgrades in place converges the tree (§10.5):
+venv rebuilt, tree replaced per the profile's owned set, `etc/config.yaml`
+and `var/state` untouched, symlink verified-not-duplicated. Convergence is
+operational, not byte-identical; profile switching is the same converge
+operation with the other `--profile`.
 
 **Uninstall.** `--uninstall` removes the tree and the symlink; `var/state`
 is *kept* (it is operator data) unless `--purge` is also given. The
@@ -256,9 +258,67 @@ judges is exercised, not a canned file).
 - The manifest records `profile`; `doctor` verifies presence *and*
   absence per profile (a full tree missing roles = violation; a
   base tree missing roles = correct).
-- Upgrade base → full: reinstall with `--profile full`. Idempotent;
-  `etc/config.yaml` and `var/state` untouched.
+- Switching profiles is `install` with the other `--profile` (§10.5):
+  base→full adds `lib/roles` + `share/scenarios`; full→base removes
+  them — pristine files deleted, mutated/unknown files quarantined to
+  `var/quarantine/<ts>/` with a record, never silently destroyed.
+  `etc/config.yaml` and `var/state` untouched in both directions.
 - Moved-tree detection (§7) applies identically to both profiles.
+
+## 10.5 Idempotency & profile switching
+
+**Equality.** "Idempotent" means operational convergence, not
+byte-identity (the byte-identity claim was falsified 2026-09-19:
+`installed_at` is rewritten every run, `__pycache__` regenerates).
+Two install states are equivalent iff: `dsys doctor` exits 0 with
+`pristine`; the normalized manifest (profile + file hashes;
+`installed_at`/`install_path` excluded) is identical; the
+install-owned file sets (`bin/`, `lib/`, `share/`) are identical as
+path→sha256; the command matrix (§10.2) holds; and operator material
+(`etc/config.yaml`, `var/`) is preserved byte-identical.
+
+**OWNED(p).** The dist-provided file set per profile:
+- base: `bin/dsys`, `lib/dsys/*.py`, `lib/core/package/*.py`;
+- full: base + `lib/roles/**` (sealed bundles) + `share/scenarios/*.py`.
+
+**Converge.** `install(p)` (`lib/dsys/install_tree.py::converge`) runs
+from any state — absent, base, full, mutated:
+1. Triage every on-disk file under `bin/`, `lib/`, `share/` not in
+   OWNED(p):
+   - pristine per the previous manifest (hash matches) → delete
+     (reproducible from the dist);
+   - mutated (hash differs) or unknown (never in the manifest) →
+     quarantine to `var/quarantine/<utc-ts>/`, relative paths
+     preserved, with a `record.json` (`quarantined_at`,
+     `from_profile`, `to_profile`, per-file `path`/`sha256`/`reason`).
+     Never silently destroyed (declared-mutation rule).
+2. Lay down OWNED(p) wholesale from the dist (converges stale files too).
+3. `etc/config.yaml` created only if absent, never clobbered;
+   `var/` untouched except quarantine writes.
+4. Venv rebuilt; manifest rewritten; self-test as §10.3.
+
+Files *in* OWNED(p) that were mutated are overwritten, not quarantined:
+"tree replaced" is the specified reinstall semantic, reinstall is
+doctor's own prescribed remedy for a mutated tree, and the mutation
+playbook's patch rung carries an explicit upgrade-fate gate for
+exactly this.
+
+**Cross-install.** `install(p)` is total — it never refuses a
+well-formed invocation — so profile switching needs no separate
+operation: switching *is* `install` with the other profile.
+base→full→base converges to base; full→base→full converges to full.
+
+**Acceptance** (`tests/test-install-idempotency.sh`, isolated `--home`s):
+T0a `base,base→base`; T0b `full,full→full`; T1 `base,full,base→base`;
+T2 `full,base,full→full`; T3 a mutated role bundle survives a
+full→base switch byte-identical inside the quarantine with
+`reason=mutated`; T4 an unknown file survives a same-profile reinstall
+with `reason=unknown`. T1/T2 plant `var/state` + config markers and
+assert byte-identity across the sequence.
+
+G6: `etc/` files beyond `config.yaml` are currently out of the sweep
+(operator territory); stray top-level files are outside the
+installer's domain.
 
 ## 11. Falsifiers (pre-registered)
 
@@ -283,3 +343,10 @@ judges is exercised, not a canned file).
   its commands — `referee`/`doctor`/`state` lose nothing. What it lacks
   is surface (roles, scenarios, execution), and it says so with a clean
   refusal rather than a missing-file traceback.
+- **F-I7.** "Reinstall is byte-identical." False — `installed_at` is
+  rewritten every run and `__pycache__` regenerates. The precise claim
+  is operational convergence (§10.5).
+- **F-I8.** "Per-profile idempotency implies switch idempotency."
+  False — the inference is a non sequitur (falsified 2026-09-20);
+  switching is a distinct operation and needed its own specified
+  semantics — now §10.5.
