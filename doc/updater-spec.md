@@ -19,7 +19,7 @@
 
 ## 1. The flow
 
-`AutomatonFlow` name `release-monitor`, `initial_state_id` `idle`. Eight states, ten transitions. The transition table is total over the flow's trigger alphabet (`timer`, `run_completed`, `run_aborted`); `external` is unused by this flow (documented exclusion, not an oversight — see K3 in §9 for the specified consequence: there is no "check now" path). Every path terminates in `done` or `failed` (I-16 flow-run closure holds by inspection of the table).
+`AutomatonFlow` name `release-monitor`, `initial_state_id` `idle`. Eight states, fourteen transitions. The transition table is total over the flow's trigger alphabet (`timer`, `run_completed`, `run_aborted`); `external` is unused by this flow (documented exclusion, not an oversight — see K3 in §9 for the specified consequence: there is no "check now" path). Every driven path terminates in `done` or `failed` (I-16 flow-run closure holds by inspection of the table); the monitor itself is non-terminating under `notify`/`off` — the watch cycle is the steady state (see below the table).
 
 | # | from | kind | run-book | trigger | guard | to |
 |---|------|------|----------|---------|-------|----|
@@ -100,7 +100,7 @@ class ReleaseMonitorFlow(BaseModel):
     transitions: list[MonitorTransition] = Field(min_length=1)
 ```
 
-The §1 table is the authoritative instance of `ReleaseMonitorFlow` (states §1 rows, transitions §1 #1–13).
+The §1 table is the authoritative instance of `ReleaseMonitorFlow` (states §1 rows, transitions §1 #1–14).
 
 ## 3. Replay story (R1)
 
@@ -121,7 +121,7 @@ The network is *sampled*, never executed-deterministically: `wait` states holdin
 - `notify`: the candidate is recorded and surfaced; the flow returns to `idle` — nothing is driven.
 - `off`: candidates are recorded; nothing is driven, nothing is surfaced beyond the log.
 - The automaton cannot alter its own policy: policy is read-only input to `policy-gate`; no transition writes it. Policy changes are operator step-changes.
-- Every driven upgrade is recorded twice: the promotion bridge (`AutomatonRelease`/`PromotionRecord` — the step-change) and the accretion-repo commit (the tree discipline). Both are preconditions of `done` (transition #11's guard). — K1 (§9) qualifies this: the installer's commit covers install-time state only; the updater's own inter-install state (the event log — the R1 source of truth) has no writer under the current assignment.
+- Every driven upgrade is recorded twice: the promotion bridge (`AutomatonRelease`/`PromotionRecord` — the step-change) and the accretion-repo commit (the tree discipline). Both are preconditions of `done` (transition #12's guard). — K1 (§9) qualifies this: the installer's commit covers install-time state only; the updater's own inter-install state (the event log — the R1 source of truth) has no writer under the current assignment.
 
 ## 5. Hermeticity story (P2)
 
