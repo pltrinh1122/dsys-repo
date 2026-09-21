@@ -5,8 +5,9 @@ Startup order: (1) resolve the install home and read var/manifest.json
 (refusing on a missing manifest or a moved tree); (2) parse args;
 (3) load config (flags > config file > DEFAULTS); (4) dispatch.
 
-On the base profile, ``roles``, ``scenario``, ``execute``, ``derive`` and
-``session`` refuse with an unavailable-capability error (exit 1);
+On the base profile, ``roles``, ``scenario``, ``execute``, ``derive``,
+``session`` and ``automaton`` refuse with an unavailable-capability error
+(exit 1);
 ``referee``, ``state`` and ``doctor`` are served by the sibling modules.
 ``execute`` and ``session`` are full-profile stubs with their own refusals.
 
@@ -31,7 +32,8 @@ from paths import resolve_home
 from config import ConfigError, load as load_config
 from envelope import TOOL_VERSION, envelope
 
-BASE_BLOCKED = ("roles", "scenario", "execute", "derive", "session")
+BASE_BLOCKED = ("roles", "scenario", "execute", "derive", "session",
+                "automaton")
 _DOCTOR_STATUS = {"ok": "ok", "warn": "WARN", "fail": "FAIL"}
 
 
@@ -167,6 +169,23 @@ def _build_parser():
     p_der.add_argument("--out", default=None, metavar="DIR",
                        help="write output.bin + receipt.json here")
 
+    p_auto = sub.add_parser("automaton",
+                            help="automaton-plane invocation (full profile only)")
+    s_auto = p_auto.add_subparsers(dest="automaton_cmd", metavar="<operation>")
+    p_iflow = s_auto.add_parser("init-flow", help="initiate a flow drive")
+    p_iflow.add_argument("--flow", required=True, metavar="ID")
+    p_iflow.add_argument("--accretion-path", default=None, metavar="PATH",
+                         help="override the accretion repo path "
+                         "(default: config accretion.path)")
+    p_adv = s_auto.add_parser("advance", help="advance a flow run")
+    p_adv.add_argument("--flow-run", required=True, metavar="ID")
+    p_adv.add_argument("--trigger", choices=("timer", "external"), default=None)
+    p_adv.add_argument("--payload", default=None, metavar="JSON")
+    p_adv.add_argument("--max-steps", type=int, default=1000, metavar="N")
+    p_rep = s_auto.add_parser("replay",
+                              help="re-validate a flow run's transcript")
+    p_rep.add_argument("--flow-run", required=True, metavar="ID")
+
     return parser
 
 
@@ -244,6 +263,25 @@ def cmd_execute(args, cfg, home):
 def cmd_session(args, cfg, home):
     return (1, None, None, None,
             "dsys session: sync service not implemented in this build")
+
+
+def cmd_automaton(args, cfg, home, manifest):
+    auto, err = _import_sibling("automaton_cli", "automaton surface")
+    if auto is None:
+        return 1, None, None, None, err
+    op = args.automaton_cmd
+    if op == "init-flow":
+        return auto.init_flow(home, manifest, args.flow,
+                              args.accretion_path)
+    if op == "advance":
+        return auto.advance_flow_run(home, manifest, args.flow_run,
+                                     args.trigger, args.payload,
+                                     args.max_steps)
+    if op == "replay":
+        return auto.replay_flow_run(home, manifest, args.flow_run)
+    return (1, None, None, None,
+            "dsys automaton: no operation given "
+            "(init-flow | advance | replay)")
 
 
 def cmd_roles_list(args, cfg, home):
@@ -490,6 +528,8 @@ def _dispatch(args, cfg, home, manifest, profile, verbose):
         return cmd_session(args, cfg, home)
     if cmd == "derive":
         return cmd_derive(args, cfg, home, manifest)
+    if cmd == "automaton":
+        return cmd_automaton(args, cfg, home, manifest)
     return 1, None, None, None, f"dsys: unknown command {cmd!r}"
 
 
