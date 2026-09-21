@@ -7,6 +7,16 @@ lifetime) was refused (not-ready) and returns as a follow-on once
 the production driver is framed. Draft verdict history: framed
 under DR-CMD-045, evaluated the same turn (adopt-with-conditions).
 
+**Spec:** `doc/k1-q3-binding-spec.md` (DRAFT, 2026-09-21) — the
+(a)-half specified: installer mints a repo UUID at install time
+(`dsys.repo-id` in the repo's git config + `accretion_repo.
+identity` in the manifest), the committing tool verifies the
+handle's identity against the manifest before every write
+(D5a extension, fail closed, abort-not-retry), I-25
+identity-binding validator, replay story, five checkable
+acceptances. **Adopted under DR-CMD-047 (2026-09-21); not built —
+the build follows on the operator's separate direction.**
+
 
 **Matter:** *k1-q3-repo-handle* — follow-on matter of K1
 (DR-CMD-039), G6 Q3 of `doc/k1-repair-spec.md`. Framed 2026-09-21
