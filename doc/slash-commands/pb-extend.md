@@ -5,20 +5,31 @@
 - **Renamed** 2026-09-20: `/feature-expansion-playbook` →
   `/pb-extend`, per the `/pb-<verb>` family pattern (DR-CMD-001).
   "Extend" is the verb form of "expansion".
-- **Trigger:** the operator invokes `/pb-extend` in chat,
-  supplying a feature-expansion matter — a proposed
-  requirement, feature, or mutation to dsys itself.
+- **Family:** `pb-*` — playbook commands (DR-CMD-001).
+  Sibling: `/pb-decide` (decision-making playbook).
+- **Description:** stage a feature-expansion matter — scope it,
+  evaluate the adoption conditionals, draft a verdict. The
+  operator disposes.
+- **Trigger:** the operator invokes `/pb-extend {matter}` in chat,
+  supplying a feature-expansion matter as chat text — a proposed
+  requirement, feature, or mutation to dsys itself. Braces denote
+  a required argument: a bare `/pb-extend` with no matter is
+  refused back. Vague matters are refused back for reframing.
 - **Support:** agent recognition, for the chat window. Same
   standing as `/pb-decide`: not a platform hook, not a client
   slash-command, not a Muse skill. The binding is performed by
   the ambient agent's recognition, not by platform machinery.
-- **Procedure:** `doc/feature-expansion-playbook-spec.md`
+- **Procedure (normative):** `doc/pb-extend-implementation.md`
+  (ratified 2026-09-20, DR-CMD-018; authored 2026-09-20 as DRAFT
+  for operator disposition). This file binds the command to the
+  procedure; it does not restate it. The procedure runs the
+  feature-expansion playbook, `doc/feature-expansion-playbook-spec.md`
   (DRAFT, 2026-09-20 — designed per operator direction;
   pending adoption via disposition). Until adopted, the
-  command runs the draft in rehearsal: it stages the matter,
-  evaluates the adoption conditionals, and drafts the verdict.
-  It does not gate, decide, or record — disposition remains
-  the operator's act.
+  command runs the playbook in rehearsal: it stages the
+  matter, evaluates the adoption conditionals, and drafts the
+  verdict. It does not gate, decide, or record — disposition
+  remains the operator's act.
 
 ## Originating matter (sole evidence)
 

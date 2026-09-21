@@ -51,3 +51,9 @@ Every DoD is a file/state check: §8 present/absent per disposition; drafts' sta
 - The /eval-meta coherence check may surface deeper mismatches (unknown) — tagged, not blocking step 1.
 - /eval-rb authoring may surface schema questions (unknown) — tagged, blocked behind step 1 by design.
 - Numbering note (supersedes the projection in DR-CMD-011's G6): this matter takes DR-CMD-012 in disposition order. The still-open `/pb-decide` remediation matter (from the `/eval-sc` report) moves to DR-CMD-013 on ratification; the `/eval-sc` family-membership candidacy moves to DR-CMD-014.
+
+## Completion log
+
+- 2026-09-20: step 1 complete — `/eval-pb` §8 matter disposed (DR-CMD-014), both drafts disposed (DR-CMD-015), contract binding added. Step 3 unblocked.
+- 2026-09-20: step 2 complete — `/eval-meta` coherence check surfaced two material gaps → remediated (DR-CMD-013, union expansion: redirect step + Form B), contract binding added. No new DR for the remediation act.
+- 2026-09-20: step 3 complete — `/eval-rb` implementation + design authored on the ratified `/eval-pb` pattern, contract binding added, drafts disposed (DR-CMD-017). **Sequence complete.**

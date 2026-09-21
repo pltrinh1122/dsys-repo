@@ -6,8 +6,16 @@
   `/decide-pb` → `/pb-decide` (ratified, DR-CMD-001).
   Playbook commands take the `/pb-<verb>` form; `/pb-extend`
   (feature-expansion playbook) anticipated.
-- **Trigger:** the operator invokes `/pb-decide` in chat,
-  supplying a matter.
+- **Family:** `pb-*` — playbook commands (DR-CMD-001).
+  Sibling: `/pb-extend` (feature-expansion playbook).
+- **Description:** run the decision-making playbook on a matter —
+  frame it, enumerate options, gate them, draft verdicts. The
+  operator disposes.
+- **Trigger:** the operator invokes `/pb-decide {matter}` in chat,
+  supplying a matter as chat text. Braces denote a required
+  argument: a bare `/pb-decide` with no matter is refused back.
+  The playbook frames the matter at START; vague matters are
+  refused back for reframing.
 - **Support:** agent recognition, for the chat window. This is
   not a platform hook (event-driven by construction), not a
   client slash-command (client registry is built-in-only as far

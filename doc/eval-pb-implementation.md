@@ -1,6 +1,6 @@
 # Implementation: `/eval-pb` execution procedure
 
-**Status: ratified** — DR-CMD-015, 2026-09-20. Implements the validation routine declared in `doc/slash-commands/eval-pb.md` (Check dimensions as ratified through DR-CMD-009). Design counterpart: `doc/eval-pb-design.md` (ratified DR-CMD-015 — provenance and reasoning live there, per DR-CMD-010).
+**Status: ratified** — DR-CMD-015, 2026-09-20. Implements the validation routine declared in `doc/slash-commands/eval-pb.md` (Check dimensions as ratified through DR-CMD-009). Amended DR-CMD-020 (worked reference named; no dimension changed). Design counterpart: `doc/eval-pb-design.md` (ratified DR-CMD-015 — provenance and reasoning live there, per DR-CMD-010).
 
 ## 0. Execution model
 
@@ -34,6 +34,8 @@ The admission outcome is reported in one line at the top of the report (§6), wi
 ## 4. Per-dimension validation `[judgment]`
 
 For each of the ten check dimensions (§4.1–§4.10), produce one finding: **conforms** / **deviates** (with the normative clause cited) / **undefined-against** (the dimension does not apply to this candidate's kind — stated, never silent). Every finding carries one line of reasoning and at least one citation to the normative definition: `doc/glossary.md` "Playbook (decision-making)", `doc/dyad-architecture-doc.md` §8.2 (§8.3 for records), or a ratified DecisionRecord. Never bare verdicts.
+
+**Worked reference (DR-CMD-020):** `doc/dsys-mutation-playbook-spec.md` — the ratified second playbook (§8.4); `/eval-pb` run 2026-09-21 returned conforms (10/10). The agent may consult it to ground judgment calls (e.g., what G1-precision gates look like in practice). Consultative only: every finding still cites the normative definition per above; the reference is never a substitute standard and adds no comparative axis (DR-CMD-011 stands).
 
 1. **DoD conditionals, not sequences.** Does the candidate drive matters via definition-of-done conditionals (entry trigger + exit condition, condition-triggered, re-entrant — §8.2, I-4), or via ordered steps? Ordered steps → deviates (cited: glossary "not a sequence").
 2. **Explicit admission/kill gates.** Are entry gates and kill/merge gates named, each with its failure routing? Admission without kill, or gates that name no reason on failure → deviates (cited: §8.2 START/STOP).

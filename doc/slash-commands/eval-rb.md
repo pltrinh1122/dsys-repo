@@ -23,6 +23,9 @@
   run-book — cited, not restated: `doc/glossary.md`
   "Run-book", normative in the RunBook entity (`schema.py`)
   and `doc/automaton-executor-spec.md`.
+- **Procedure (normative):** `doc/eval-rb-implementation.md`.
+  This file binds the command to the procedure; it does not
+  restate it.
 
 ## Check dimensions
 

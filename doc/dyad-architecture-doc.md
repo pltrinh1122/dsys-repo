@@ -486,187 +486,33 @@ artifacts (candidate invariant, harness bridge).
 
 ## 8.2 Decision-making playbook (general)
 
-Parameters per decision: the *matter*, the *gate list*, the *exclusion
-rules*, the *disposer* (terminal authority), and the *disposition mode* —
-ratify | authorize | set_standing | overrule | triage — each with its own
-definition of done. Plays are definition-of-done
-conditionals — entry trigger + exit condition — condition-triggered and
-re-entrant, never ordered steps (I-4).
+Canonical text: `doc/decision-making-playbook-spec.md` (consolidated
+2026-09-21; previously the E-spec-only file `playbook-enhancements-spec.md`).
+Summary: plays are definition-of-done conditionals (entry trigger + exit
+condition), condition-triggered and re-entrant, never ordered steps (I-4).
+Parameters per decision: matter, gate list (G1–G6), exclusion rules,
+disposer, disposition mode (ratify | authorize | set_standing | overrule |
+triage, each with its own DoD). START / STOP / KEEP. DecisionRecords (§8.3)
+writable only on disposition. Enhancements E1–E5, E7 (DR-4); E6 killed.
+Implemented: `core/package/{schema,validators,golden_run}.py`; golden run
+37 refusal cases, PASS.
 
-Gates: **G1** well-formed (stated precisely enough to evaluate); **G2**
-legitimate source (evidence from a source trusted for this domain); **G3**
-non-redundant (not already decided, no duplicate of a standing decision);
-**G4** actionable (adopting it changes a commitment, state, or behavior);
-**G5** checkable (verifiable afterward whether the decision held → binding,
-else provisional/advisory); **G6** uncertainty tagged (assumptions, unknowns,
-provisional sources labeled; nothing material unlabeled).
-
-**START — "open candidacy."** *When:* a matter surfaces with no draft.
-Frame the matter as a falsifiable claim (vague matters refused back for
-reframing); enumerate live options including explicit "decide nothing";
-state gates before evaluating; run G1–G4 per option, routing failures to
-STOP. *Done when:* every option carries a gate trail and each survivor has
-a draft verdict — and nothing is admitted or decided.
-
-**STOP — "kill or merge."** *When:* a gate fails, an exclusion fires, an
-option is falsified, a standing decision is challenged or superseded.
-Every kill names its reason: failed gate, exclusion rule, or
-**killed-by-falsification** with the falsifying observation cited — a
-rejection that can't name its reason is refused. Merge branch (G3): fold
-into the canonical decision, record the alias. Falsification branch: demote
-a standing decision exactly to the tier its surviving gates support.
-**Supersession branch** (distinct from falsification): record "superseded
-by Record N"; the original stands as valid history, not as error.
-*Done when:* every non-adopted option is logged killed / merged / deferred
-/ superseded with its reason cited; "decide nothing," if the outcome, is
-recorded explicitly, never silent.
-
-**KEEP — "promote and hold."** *When:* a draft verdict exists. Run G5
-(binding vs provisional/advisory); enforce G6; write the DecisionRecord:
-matter, options with gate trails, **selected option and selector named**
-(selection among survivors is the disposition act), consequences (what the
-decision changes, per G4), uncertainties, timestamp. Submit to the
-disposer: ratify or reject recorded; unratified = draft = not a decision
-(proposer ≠ disposer). *Done when:* the record is complete per above and
-the disposition recorded. Standing rule: a ratified decision holds until
-falsified or superseded; "falsify" re-triggers STOP.
-
-Boundary: where framer and disposer are the same person, step 4 degrades
-to explicitly recorded self-ratification; protection then comes from G5/G6,
-not from separation of roles. Batch disposition (ratify a log with per-row
-veto) is an operational mode, not a weaker gate.
-
-**Disposition modes** (parameter on the disposition gate; a disposition
-reaches only the hat that owns it):
-- **ratify** — resolve a decision matter: select among surviving options.
-  DoD: selected option and selector named on the DecisionRecord; one Y/N
-  CTA per turn.
-- **authorize** — permit a named action, esp. irreversible (leo N6). DoD:
-  the action is named explicitly (`action_ref`); authorization precedes the
-  action — post-hoc approval is not authorization; silence or bundled
-  consent is not authorization; scope-bounded to what is named.
-  Consumption-side: irreversible operations (`try_promote`, I-8) require a
-  cited approved AUTHORIZE-mode disposition — a ratify-mode disposition is
-  refused at the read site, not just the write site. Freshness (E2): the
-  disposition binds the artifact's hash at disposition time
-  (`state_ref`); a stale or unbound authorization refuses exactly like a
-  missing one. Silence (E5): no authorization, no action.
-- **set_standing** — establish persistent policy (e.g. interaction
-  preferences). DoD: the rule stated durably with its domain
-  (`standing_domain`); effective-from recorded; prior policy on the same
-  domain superseded by reference (`supersedes_disposition_id`), never
-  silently overwritten — one supersession chain per domain, exactly one
-  root, no cycles; revocable — the record states how. Silence (E5):
-  keeping the status quo is a decision and must be recorded as explicit
-  sustain.
-- **overrule** — defeat a standing veto/objection. DoD: names the veto
-  (`veto_id`, must exist) and the authority cited (fleet_wins |
-  local_wins); reason recorded; the overruled veto stays logged as
-  overruled, never deleted. Effect-side: a veto with status overruled must
-  cite its backing approved overrule disposition. Absorption (E7): the
-  disposition may name the directive amendment absorbing the veto's
-  reason (`absorbed_into_directive_id`) — the reason survives as a
-  constraint; only the blocking is defeated. Silence (E5): sustain must
-  be recorded.
-- **triage** — dispose of an upward disclosure (conflict/error/uncertainty).
-  DoD: every disclosure gets exactly one outcome — acknowledged |
-  escalated (names the hat) | dismissed with reason; silence is not triage.
-  Checkable via the Disclosure entity: every non-open disclosure cited by
-  exactly one triage disposition, none cited by more than one. A
-  triage-mode record may not select the enumerated "decide nothing"
-  (E5) — that is the smuggling case, refused mechanically.
-
-**Dialectic mode** (parameter, engaged when the matter is truth-apt rather
-than mere choice among options):
-- START requires every option to carry its strongest counter (Proposal-
-  Framing); strawman options are refused at G1 — "well-formed" extends to
-  "steelmanned," and antithesis must be genuine, non-strawman (DFD).
-- STOP's killed-by-falsification must name the **external separator** (IFF2):
-  the falsifying observation must come from outside the proposer's frame.
-  Self-falsification is labeled *rehearsal*, not falsification.
-  Separator designation (E4, I-12): entering dialectic mode requires naming
-  the separator (operator default, or a named external auditor/hat). No
-  designated separator → the run is rehearsal by construction, and its
-  record is quarantined under I-11.
-- Synthesis conditional: when thesis and antithesis both survive gating, a
-  synthesis option is framed and re-enters START before any disposition
-  (re-entrant plays, I-4).
-- DecisionRecord gains the dialectic trail: thesis / antithesis / synthesis /
-  separator, alongside options, gate trails, and consequences.
-- Disposition honors at most one Y/N CTA per turn (DFD); batch mode runs
-  as sequential single-CTA turns, not one bundled vote.
+Playbook inventory (DR-CMD-021, ratified 2026-09-21): the ratified playbooks
+are `doc/decision-making-playbook-spec.md` (Architecture §8.2) and
+`doc/dsys-mutation-playbook-spec.md` (Architecture §8.4). Draft and
+exploratory playbook specs (`doc/feature-expansion-playbook-spec.md`,
+`doc/dsys-transcription-playbook-spec.md`,
+`doc/dialectic-enhancements-spec.md`) live in `doc/`; their standing is
+declared in the files themselves, not here.
 
 ## 8.3 Decision records
 
-**DR-1 — CoS-run coexistence invariant (ratified 2026-09-18).**
-Matter (falsifiable): "The enforced Harness run invariant is honestly
-stated and mechanically checkable." Options: (a) keep the separate-counting
-exception; (b) distinct principal for the CoS run; (c) refine to per
-(principal, authority-scope); (d) defer as provisional; (e, synthesis) adopt
-(c) with authority-scope defined as execution | governance, scopes disjoint
-by construction. Gate trails: (a) G1–G4 pass, antithesis unrebutted (silent
-carve-out, name≠check); (b) G1–G4 pass, conditional on principal being
-per-agent (G6: principal's definition uncertain); (c) G1 conditional on
-defining authority-scope; (d) demoted to fallback (PASS would certify
-unapproved semantics). Dialectic trail: thesis (a); antithesis — the
-exception is architecture-derived, never approved, a different invariant
-wearing the old name; synthesis (e) — the invariant protects against
-*competing uncommitted state*, and governance does not compete with
-execution. Separator: Peter (agent run labeled rehearsal). Selected option:
-(e). Selector: Peter. Consequences: AuthorityScope enum added;
-`is_chief_of_staff` removed (single-home); I-9 reworded with no exception;
-golden run gains a 6th refusal case (second execution run refused).
-Uncertainties: principal's exact definition (operator vs agent) still open —
-(b) revives iff principal proves per-agent. Standing: ratified; holds until
-falsified or superseded.
+Canonical records: `doc/decision-making-playbook-spec.md` §6 (DR-1..DR-4,
+ratified 2026-09-18). Summary: DR-1 CoS-run coexistence invariant; DR-2
+disposition modes as playbook parameter; DR-3 mechanical closures; DR-4
+simulation-derived enhancements E1–E5, E7 (E6 killed).
 
-**DR-2 — disposition modes as playbook parameter (ratified 2026-09-18).**
-Matter (falsifiable): "The decision-making playbook contains all modes of
-Operator disposition." Falsification (4 angles): authorization-of-action ≠
-ratification-of-record (leo N6 irreversible actions); standing dispositions
-(interaction preferences) are persistent, not episodic; hat routing
-(Founding form gate, Steward intake, Bond ratifier) — a disposition reaches
-only the hat that owns it; overrule defeats a veto rather than selecting an
-option. Commit conceded as ratify-mode. Claim falsified; synthesis:
-disposition *mode* becomes a playbook parameter — ratify | authorize |
-set_standing | overrule | triage — each with its own DoD conditionals.
-Selected option: extend (not narrow). Selector: Peter. Consequences:
-DispositionMode enum + mode-gated fields on Disposition; I-2 extended with
-mode-DoD validator; golden run gains 7th refusal case (nameless
-authorization refused). Standing: ratified; holds until falsified or
-superseded.
-
-**DR-3 — mechanical closures for disposition modes (ratified 2026-09-18).**
-Matter: "each disposition mode maps to checkable exit DoD." Stress test:
-ratify ✓ (DR-1 exercised it); authorize leaked at consumption
-(`try_promote` accepted any disposition for irreversible publish);
-set_standing had no standing-record linkage or supersession reference;
-overrule's effect chain dangled (unbacked overruled veto possible); triage
-was unmappable (no Disclosure entity). Synthesis: checks belong at read
-sites, not just write sites. Selected: implement all four closures.
-Selector: Peter. Consequences: Disclosure entity + exactly-one-triage
-validator; `try_promote`/I-8 require approved AUTHORIZE-mode disposition
-(disp1 is now the exemplar); `supersedes_disposition_id` + one-chain-per-
-domain validator; overruled vetoes must cite backing overrule disposition;
-golden run grows to 11 refusal cases. Standing: ratified; holds until
-falsified or superseded.
-
-**DR-4 — simulation-derived playbook enhancements (ratified 2026-09-18).**
-Matter: "which simulation observations become mechanisms." Five
-disposition-mode simulation runs (all modes, no records written)
-surfaced seven candidate enhancements; Peter's verdicts: E1 rehearsal
-quarantine + citation integrity Y, E2 authorization freshness binding Y,
-E3 CTA response grammar Y, E4 separator designation Y, E5 mode silence
-semantics Y, E6 standing-policy migration N (killed by its falsifier —
-migration risks rewriting history; the narrative reference stands), E7
-defeat-with-absorption Y. Selected: implement E1–E5, E7 in spec order.
-Selector: Peter. Consequences: DecisionRecord entity added (the package
-had dispositions but no decision records); I-11, I-12; authorize binds
-artifact hash; CTA responses yes/no/counter; MODE_SILENCE table;
-defeat-with-absorption pattern; golden run grows to 23 refusal cases,
-PASS. Standing: ratified; holds until falsified or superseded.
-
-## 8.4 dsys-mutation-playbook (second playbook)
+## 8.4 Mutation playbook (second playbook)
 
 Ratified 2026-09-19 (decision-making playbook): post-installation, the
 user has maximum flexibility to mutate even dsys's own files, via
@@ -686,5 +532,5 @@ in artifacts/afferent) or `pending` (human disposition, unevidenced) —
 no reason, no mutation (completeness checked, truth declared — declared
 trust). The declared-mutation rule (installer surface): `doctor`
 distinguishes pristine from mutated and reports what diverged; the
-manifest records fork identity. Full spec: `dsys-mutation-playbook-spec.md`.
+manifest records fork identity. Full spec: `doc/dsys-mutation-playbook-spec.md`.
 Golden run: 37 refusal cases (33 + I-17 ×4), PASS, 0 violations.

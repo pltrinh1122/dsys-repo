@@ -22,8 +22,10 @@
   against the Architecture's normative definition of a
   playbook — cited, not restated: `doc/glossary.md` "Playbook
   (decision-making)", normative in
-  `doc/dyad-architecture-doc.md` §8.2, second exemplar
-  `doc/dsys-mutation-playbook-spec.md`.
+  `doc/dyad-architecture-doc.md` §8.2. Worked reference
+  (consultative only): `doc/dsys-mutation-playbook-spec.md`
+  — a ratified instance, never a comparative axis; validation
+  stays definition-anchored per DR-CMD-011 (DR-CMD-020).
 - **Procedure (normative):** `doc/eval-pb-implementation.md`.
   This file binds the command to the procedure; it does not
   restate it.
