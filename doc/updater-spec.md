@@ -152,7 +152,7 @@ Two genuine attempts, both survived:
 - The mermaid diagram for §1 awaits the pydantic→mermaid generator (a future governed expansion matter — not hand-drawn here, to avoid preempting it).
 - Run-book bodies (`release-check`, `release-verify`, `policy-gate`, `release-drive`, `release-verify-installed`) are build work, after the bridge matter decides module placement.
 - `external` trigger is unused by this flow; if a later revision needs operator-injected events (e.g., "upgrade now"), they enter as external payloads through the same event log. K3 (§9) specifies what that revision must add: an `external` edge on `idle` plus a governed initiation path.
-- K2 (§9) leaves open the cross-install adoption question: the drive must explicitly resume the previous installation's accretion repo (not rely on ambient installer defaults), and the unwritable-path edge needs a refusal-or-loud-surface rule for autonomous operation.
+- K2 (§9) repaired per DR-CMD-038 (`doc/k2-repair-spec.md`, built): the drive explicitly resumes the previous installation's accretion repo via `--accretion-path` + `--accretion-required`, and the unwritable-path edge refuses the drive (not warn-and-continue) under autonomous operation.
 
 ## 9. Specified kills — operator testing 2026-09-21
 
@@ -173,6 +173,7 @@ Three claims about the built updater, each tagged `falsify` by the operator. All
 - **Falsifying observation (design edge):** the installer *intends* adoption via default-resume, but the updater never wires to it (the build's installer tool takes no accretion path or resume flag — it relies on ambient defaults). Worse: the unwritable-accretion-path edge (warning + install completes, no accretion) drops history silently — under autonomous `policy=auto` operation with no human watching, "by default" fails in exactly the failure mode.
 - **What survives:** installer default-resume adopts on the happy path (`--release` preserves config/state/log per the idempotency exercise).
 - **Repair direction:** the drive's installer invocation must explicitly pass/resume the accretion path rather than relying on ambient defaults; the unwritable-path edge needs a rule for autonomous operation — refuse the drive (not warn-and-continue), or surface loudly enough that silence cannot mean history loss. Which rule is a disposition.
+- **Repair (adopted DR-CMD-038, built):** `doc/k2-repair-spec.md` — explicit `--accretion-path` wiring from the previous install's effective path (D1); new `--accretion-required` fail-closed installer flag (D2; installer-spec §13 carve-out); refuse-the-drive disposed (D3) — unwritable path refuses via the existing `run_aborted → failed` edge (D4); the updater never passes `--overwrite` (D5); K1 boundary explicit (D6); replay unchanged (D7). Golden-run cases 9–13 discharge the five acceptances.
 
 ### K3 — "updater run supports ambient agent invocation" — KILLED
 

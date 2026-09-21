@@ -596,6 +596,19 @@ with accretion disabled; the manifest records
 `accretion: {"enabled": false, "reason": ...}`. Accretion is a
 durability backstop, not a prerequisite.
 
+**Fail-closed carve-out (K2 repair, DR-CMD-038).** The
+`--accretion-required` flag suspends the rule above for
+updater-driven installs: accretion is required, so any of the
+disable conditions (git absent, path not a directory, path not
+writable, `--no-accretion`) fails the install with a nonzero exit
+naming the reason, before any accreted-state mutation — no manifest
+is written, so no lying manifest. The gate fires at the start of
+the converge step; the venv recreation that precedes it touches no
+accreted state. Interactive installs keep the default: warn and
+continue. The updater's drive always passes `--accretion-required`
+together with an explicit `--accretion-path` (the previous
+installation's effective path), and never passes `--overwrite`.
+
 **Manifest & doctor.** `var/manifest.json` gains
 `accretion: {"enabled", "path", "commit_authority"}` (the installer
 carries provenance; it does not verify the repo). `dsys doctor`'s

@@ -226,6 +226,13 @@ class World:
     doctor_ok: bool = True
     installer_exit_code: int = 0  # nonzero -> the drive fails, loudly
     installer_invocations: list[str] = field(default_factory=list)
+    installer_argvs: list[list[str]] = field(default_factory=list)  # K2 repair
+    # K2 repair: the install-home concept. The drive's installer invocation
+    # explicitly resumes the previous installation's accretion repo (D1).
+    install_home: str = "/home/op/dsys-inst"  # own home (first install)
+    prev_install_home: str | None = None      # previous install's home
+    prev_accretion_path: str | None = None    # its config accretion.path
+    accretion_writable: bool = True           # fixture: can the path be written
     promotions: list[dict] = field(default_factory=list)
     surfaced: list[dict] = field(default_factory=list)  # notify/off observations
 
@@ -306,10 +313,35 @@ def _tool_read_policy(ctx: dict, w: World) -> None:
         raise ToolAborted(f"unknown updater policy: {policy!r}")
 
 
+def _accretion_path(w: World) -> str:
+    # K2 repair D1: the previous install's effective accretion path —
+    # its config override when known, else the default rule over the
+    # previous home's basename. First install (no previous home): derive
+    # from our own home. Always explicit — never ambient defaults.
+    if w.prev_accretion_path:
+        return w.prev_accretion_path
+    home = w.prev_install_home or w.install_home
+    return "/var/daccretion/" + home.strip("/").split("/")[-1]
+
+
 def _tool_invoke_installer(ctx: dict, w: World) -> None:
-    # The composed perform step: install.sh --release <version> (existing).
+    # The composed perform step: install.sh --release <version>
+    # --accretion-path <explicit> --accretion-required (K2 repair).
+    # The drive always passes the explicit path (never --overwrite: D5)
+    # and always fail-closed (D2): an unwritable path refuses the drive
+    # rather than warn-and-continue under autonomous operation (D3).
     version = ctx["remote_version"]
+    acc_path = _accretion_path(w)
+    argv = ["install.sh", "--release", version,
+            "--accretion-path", acc_path, "--accretion-required"]
+    w.installer_argvs.append(argv)
     w.installer_invocations.append(version)
+    if not w.accretion_writable:
+        # The world models the installer faithfully: fail-closed accretion
+        # fails the install before converge — nothing is written, nothing
+        # is adopted, the drive refuses loudly.
+        raise ToolAborted(
+            f"accretion path not writable: {acc_path} (--accretion-required)")
     if w.installer_exit_code != 0:
         # The drive fails; the version does NOT converge (world models the
         # installer faithfully: a failed install changes nothing).

@@ -170,6 +170,73 @@ def run() -> dict:
     refusals.append("installer failure refused the drive: "
                     f"path={path8[-2:]}")
 
+    # K2 repair acceptances (DR-CMD-038).
+    def _acc(argv):  # the --accretion-path value of an invocation
+        return argv[argv.index("--accretion-path") + 1]
+
+    # 9. (A1) unwritable accretion path -> refuse-the-drive: failed; the
+    # attempt carried the explicit path + --accretion-required; no
+    # promotion; version unconverged; never --overwrite.
+    s9 = build_updater_state("fr-a9")
+    w9 = World(feed_version="0.1.1", installed_version="0.1.0",
+               updater_policy="auto", accretion_writable=False)
+    path9 = drive(s9, w9, "fr-a9")
+    assert path9 == ["urm-idle", "urm-checking", "urm-candidate", "urm-gate",
+                     "urm-driving", "urm-failed"], \
+        f"unwritable accretion must refuse the drive: {path9}"
+    assert s9.flow_runs["fr-a9"].state == "aborted"
+    assert len(w9.installer_argvs) == 1, "the attempt happened"
+    assert "--accretion-required" in w9.installer_argvs[0]
+    assert _acc(w9.installer_argvs[0]) == "/var/daccretion/dsys-inst"
+    assert "--overwrite" not in w9.installer_argvs[0]
+    assert w9.promotions == [], "no promotion on a refused drive"
+    assert w9.installed_version == "0.1.0", "refused drive must not converge"
+    refusals.append("unwritable accretion refused the drive: "
+                    f"path={path9[-2:]}")
+
+    # 10. (A2) previous home with config-overridden accretion.path -> the
+    # drive pins THAT path, not the default rule.
+    s10 = build_updater_state("fr-a10")
+    w10 = World(feed_version="0.1.1", installed_version="0.1.0",
+                updater_policy="auto",
+                prev_install_home="/home/op/old-inst",
+                prev_accretion_path="/data/custom-accretion")
+    path10 = drive(s10, w10, "fr-a10")
+    assert path10 == FULL_PATH, f"unexpected path: {path10}"
+    assert _acc(w10.installer_argvs[0]) == "/data/custom-accretion", \
+        "must pin the previous install's effective path"
+    assert "--overwrite" not in w10.installer_argvs[0]
+    refusals.append("config-overridden accretion path pinned: "
+                    + _acc(w10.installer_argvs[0]))
+
+    # 11. (A3) first install (no previous home) -> fresh repo at the path
+    # derived from our own home; the drive proceeds to done.
+    s11 = build_updater_state("fr-a11")
+    w11 = World(feed_version="0.1.1", installed_version="0.1.0",
+                updater_policy="auto", prev_install_home=None)
+    path11 = drive(s11, w11, "fr-a11")
+    assert path11 == FULL_PATH, f"unexpected path: {path11}"
+    assert _acc(w11.installer_argvs[0]) == "/var/daccretion/dsys-inst"
+    assert "--overwrite" not in w11.installer_argvs[0]
+    assert w11.promotions and w11.promotions[0]["version"] == "0.1.1"
+    refusals.append("first install derived a fresh accretion path: "
+                    + _acc(w11.installer_argvs[0]))
+
+    # 12. (A4) contract: no updater invocation ever carries --overwrite.
+    for _w in (w1, w8, w9, w10, w11):
+        for _argv in _w.installer_argvs:
+            assert "--overwrite" not in _argv, "updater must never --overwrite"
+    refusals.append("no invocation carried --overwrite (D5 contract)")
+
+    # 13. (A5) replay of the refused drive (case 9) re-derives — R1 untouched.
+    events9 = _events_of(s9, "fr-a9")
+    trans9 = [t for t in s9.flow_transitions.values()
+              if t.flow_id == FLOW_ID]
+    path_r9 = replay(events9, trans9, IDLE)
+    assert path_hash(path_r9) == path_hash(path9), "replay must re-derive"
+    refusals.append("replay re-derived the refused drive: "
+                    f"{path_hash(path_r9)[:12]} == {path_hash(path9)[:12]}")
+
     return {"violations": violations, "refusals": refusals, "ok": True}
 
 

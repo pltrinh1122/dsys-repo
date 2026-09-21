@@ -50,6 +50,13 @@ usage: install.sh [options]
                         accretion snapshot commit; refuse (before any tree
                         mutation) on decline or non-terminal stdin.
                         Default is standing authorization (auto-commit).
+  --accretion-required  fail-closed accretion (K2 repair): accretion is
+                        required for this install. Suspends the "never
+                        fails the install" rule — if git is absent or the
+                        accretion path is not writable, the install FAILS
+                        (nonzero exit) before any accreted-state mutation
+                        instead of warning and continuing. The updater's
+                        drive always passes this flag.
   --help                print this help and exit
 EOF
 }
@@ -65,6 +72,7 @@ OVERWRITE=""
 ACCRETION_PATH_FLAG=""
 NO_ACCRETION=""
 ACCRETION_REQUIRE_AUTH=""
+ACCRETION_REQUIRED=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -99,6 +107,7 @@ while [ "$#" -gt 0 ]; do
     --accretion-path=*) ACCRETION_PATH_FLAG="${1#--accretion-path=}"; shift ;;
     --no-accretion) NO_ACCRETION="1"; shift ;;
     --accretion-require-authorization) ACCRETION_REQUIRE_AUTH="1"; shift ;;
+    --accretion-required) ACCRETION_REQUIRED="1"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -194,7 +203,13 @@ agit_accreted() { # agit limited to the accreted set: etc + var, minus
   agit "$@" -- etc var ':(exclude,glob)**/cache' ':(exclude,glob)**/cache/**'
 }
 
-accretion_disable() { # $1 = reason; warn and continue without accretion
+accretion_disable() { # $1 = reason; warn and continue without accretion —
+                      # unless --accretion-required (K2 repair), which fails
+                      # the install before any accreted-state mutation.
+  if [ "$ACCRETION_REQUIRED" = "1" ]; then
+    echo "FAILED [accretion]: $1 (--accretion-required: accretion is required for this install)" >&2
+    exit 1
+  fi
   echo "    warning: accretion disabled: $1 (install continues)" >&2
   ACCRETION_ENABLED="0"
   ACCRETION_SKIP_REASON="$1"
