@@ -19,7 +19,7 @@
 
 ## 1. The flow
 
-`AutomatonFlow` name `release-monitor`, `initial_state_id` `idle`. Eight states, fourteen transitions. The transition table is total over the flow's trigger alphabet (`timer`, `run_completed`, `run_aborted`); `external` is unused by this flow (documented exclusion, not an oversight — see K3 in §9 for the specified consequence: there is no "check now" path). Every driven path terminates in `done` or `failed` (I-16 flow-run closure holds by inspection of the table); the monitor itself is non-terminating under `notify`/`off` — the watch cycle is the steady state (see below the table).
+`AutomatonFlow` name `release-monitor`, `initial_state_id` `idle`. Nine states, sixteen transitions (K1, DR-CMD-039: the `committing` task state journals the drive's event log to the accretion repo before termination). The transition table is total over the flow's trigger alphabet (`timer`, `run_completed`, `run_aborted`); `external` is unused by this flow (documented exclusion, not an oversight — see K3 in §9 for the specified consequence: there is no "check now" path). Every driven path terminates in `done` or `failed` (I-16 flow-run closure holds by inspection of the table); the monitor itself is non-terminating under `notify`/`off` — the watch cycle is the steady state (see below the table).
 
 | # | from | kind | run-book | trigger | guard | to |
 |---|------|------|----------|---------|-------|----|
@@ -34,9 +34,11 @@
 | 9 | `gate` | task | `policy-gate` | run_aborted | — | `failed` |
 | 10 | `driving` | task | `release-drive` | run_completed | — | `verifying` |
 | 11 | `driving` | task | `release-drive` | run_aborted | — | `failed` |
-| 12 | `verifying` | task | `release-verify-installed` | run_completed | `payload.doctor_ok and payload.promotion_recorded` | `done` |
+| 12 | `verifying` | task | `release-verify-installed` | run_completed | `payload.doctor_ok and payload.promotion_recorded` | `committing` |
 | 13 | `verifying` | task | `release-verify-installed` | run_completed | `not (payload.doctor_ok and payload.promotion_recorded)` | `failed` |
 | 14 | `verifying` | task | `release-verify-installed` | run_aborted | — | `failed` |
+| 15 | `committing` | task | `accretion-commit` | run_completed | `payload.commit_confirmed` | `done` |
+| 16 | `committing` | task | `accretion-commit` | run_aborted | — | `failed` |
 
 `done`: kind=end, outcome=completed. `failed`: kind=end, outcome=aborted.
 
@@ -121,7 +123,7 @@ The network is *sampled*, never executed-deterministically: `wait` states holdin
 - `notify`: the candidate is recorded and surfaced; the flow returns to `idle` — nothing is driven.
 - `off`: candidates are recorded; nothing is driven, nothing is surfaced beyond the log.
 - The automaton cannot alter its own policy: policy is read-only input to `policy-gate`; no transition writes it. Policy changes are operator step-changes.
-- Every driven upgrade is recorded twice: the promotion bridge (`AutomatonRelease`/`PromotionRecord` — the step-change) and the accretion-repo commit (the tree discipline). Both are preconditions of `done` (transition #12's guard). — K1 (§9) qualifies this: the installer's commit covers install-time state only; the updater's own inter-install state (the event log — the R1 source of truth) has no writer under the current assignment.
+- Every driven upgrade is recorded twice: the promotion bridge (`AutomatonRelease`/`PromotionRecord` — the step-change) and the accretion-repo commit (the tree discipline). Both are preconditions of `done`: transition #12's guard routes `verifying → committing`, and #15's guard requires the commit's confirmation. The installer's commit covers install-time state; the updater's inter-install state (the event log — the R1 source of truth) is journaled by the updater's own writer (K1 repair, adopted DR-CMD-039, built — see §9).
 
 ## 5. Hermeticity story (P2)
 
@@ -140,7 +142,7 @@ Two genuine attempts, both survived:
 
 ## 7. Acceptance (A5 — checkable sequences)
 
-1. Fixture feed with a newer version, `policy=auto` → the run reaches `done`; the event log shows `idle→checking→candidate→gate→driving→verifying→done`; a promotion record and an accretion commit exist.
+1. Fixture feed with a newer version, `policy=auto` → the run reaches `done`; the event log shows `idle→checking→candidate→gate→driving→verifying→committing→done`; a promotion record and an accretion commit exist (the commit covers the pre-terminal frontier; the `committing→done` edge rides the next drive's commit — K1 D4b).
 2. Same fixture, `policy=notify` → one watch cycle `idle→checking→candidate→gate→idle` (the monitor is non-terminating under notify — the cycle is the steady state); `install.sh` is never invoked; the candidate is recorded.
 3. Replay acceptance #1's log with the network disabled → the derived state sequence hashes equal.
 4. Fixture feed with a checksum mismatch → `failed`; no candidacy recorded.
@@ -165,6 +167,7 @@ Three claims about the built updater, each tagged `falsify` by the operator. All
 - **Falsifying observation (spec):** §4 assigned accretion persistence to the installer ("the installer's own doing, not the automaton's") — but the installer's pre/post snapshots commit at install time only. The updater's event log, the R1 source of truth, accrues *between* installs with no writer. A crash between installs loses replay. The assignment is wrong for inter-install state.
 - **What survives:** the installer's pre/post snapshots do cover install-time state; promotion recording is modeled (as a world fact, not a commit).
 - **Repair direction:** the updater needs its own accretion-commit path — write the event log into the instance `var/` (the accreted set) and commit on a defined cadence under standing `commit_authority`, or add a commit step to the drive. Note on R1: the evaluated replay story (§3) assumes a durable log it does not provide — the story stands, the durability premise is unevaluated and currently false.
+- **Repair (adopted DR-CMD-039, built):** `doc/k1-repair-spec.md` — the `committing` task state after completed verification (D2: `driving → verifying → committing → done`); cumulative commits via the watermark (D4); abort-not-retry with the next drive's cumulative commit as the retry (D4a); bounded residual — drive N's terminal edge rides drive N+1's commit (D4b); replay identity is the canonical payload bytes, never the git envelope (D5); git as a hard dependency, fail-closed (D5a); append-only (D6); standing authority commits, operator authority refuses (D3). I-18 commit-completeness, I-19 payload-canonicity, I-20 append-only. Golden-run cases 14–23 discharge the acceptances (A1–A6, D4a/D4b/D5a, crash simulation).
 
 ### K2 — "new installation of updater should by default adopt previous installation's accretion" — KILLED
 
@@ -183,6 +186,7 @@ Three claims about the built updater, each tagged `falsify` by the operator. All
 - **Falsifying observation (rebuttal):** the operator's counter — "invocation from test harness is sufficient; test harness is an actual `Harness` instance" — was itself falsified: `drive()` instantiates no `HarnessRun` (schema.py:481), uses no conditions/turns/strap-gates; it is a bespoke deterministic walker over `AutomatonFlow` entities. And it is called by golden-run test code, not by the ambient agent — no path exists from ambient to driver.
 - **What survives:** the §1 exclusion of `external` stands as designed — the updater's autonomy derives from standing policy (timer-driven), not from ambient invocation. Under the authority model the ambient proposes; it does not initiate automaton runs.
 - **Repair direction:** *if* a "check now" path is ever wanted, it needs two things together — an `external` trigger edge on `idle` in the flow table, and a governed initiation path (propose→disposition, or standing authorization covering ambient-initiated checks). Whether it should exist at all is a disposition; the current answer is no.
+- **Invalid (DR-CMD-040):** the conditional-design matter built on this kill ("a governed check-now path") was found INVALID — its because-Z (operator urgency on out-of-band release knowledge) was stress-tested as misplaced. Terminal: returns only as a new matter. The draft is preserved as prior art. AX1 (invocation always through a Harness) and AX2 (the Automaton driver — not the unittest suites — is a strapped Harness instance) survive as the operator's disposed architectural premises (DR-CMD-043); the "test harness" rebuttal above is superseded by AX2.
 
 *Illustrative sketch of §1 (hand-drawn, not generated — pending the generator):*
 
@@ -200,8 +204,10 @@ stateDiagram-v2
     gate --> failed : aborted
     driving --> verifying : completed
     driving --> failed : aborted
-    verifying --> done : doctor ok\n+ promoted
+    verifying --> committing : doctor ok\n+ promoted
     verifying --> failed : else
+    committing --> done : committed
+    committing --> failed : aborted
     done --> [*]
     failed --> [*]
 ```

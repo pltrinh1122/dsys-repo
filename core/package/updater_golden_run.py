@@ -17,16 +17,41 @@ not by inspection. Two negative cases show the validators bite. A final
 case covers installer failure: the drive must fail loudly, record no
 promotion, and leave the installed version unconverged.
 
+K1 repair acceptances (DR-CMD-039, spec §Acceptance + I-18/19/20):
+  A1. A drive reaching done leaves exactly one commit containing all
+      events since the last commit (I-18), content-hash named (I-19),
+      append-only (I-20); the message names the flow-run id and verifying.
+  A2. A drive aborting in driving/verifying reaches failed with no commit.
+  A3. Crash simulation: the World wiped except the accretion repo — the
+      committed payload alone replays byte-equal (the R1 premise made true).
+  A4. Flow table: 9 states, 16 transitions; totality + determinism pass.
+  A5. committing -> done requires commit_confirmed: an unconfirmed
+      completion is a loud I-15 fault, never done; a skip still confirms.
+  A6. accretion.commit_authority=operator -> run_aborted -> failed; refused,
+      never silently skipped.
+  D4a. Abort, not retry: a failed commit leaves nothing; the next drive's
+      cumulative commit covers the orphaned events.
+  D4b. Bounded residual: drive N's terminal edge rides drive N+1's commit.
+  D5a. git absent -> run_aborted -> failed (hard dependency, fail-closed).
+
 Returns {'violations': [...], 'refusals': [...], 'ok': bool}.
 """
 from __future__ import annotations
 
-from .schema import AutomatonRelease, FlowRun, SystemState
+import json
+
+from .schema import AutomatonRelease, FlowRun, FlowTransitionEvent, SystemState
 from .updater import (
     FLOW_ID,
+    TOOLS,
     World,
+    _RunAborted,
+    _tool_commit_accretion,
     compile_flow,
     drive,
+    i18_commit_completeness,
+    i19_payload_canonicity,
+    i20_append_only,
     path_hash,
     replay,
 )
@@ -34,7 +59,7 @@ from .validators import validate
 
 IDLE, DONE, FAILED = "urm-idle", "urm-done", "urm-failed"
 FULL_PATH = ["urm-idle", "urm-checking", "urm-candidate", "urm-gate",
-             "urm-driving", "urm-verifying", "urm-done"]
+             "urm-driving", "urm-verifying", "urm-committing", "urm-done"]
 
 
 def _add(s, coll, key, ent):
@@ -68,14 +93,41 @@ def _events_of(s: SystemState, run_id: str):
         key=lambda e: e.seq)
 
 
+def _event_dicts(s: SystemState):
+    """The flow log in the dict form the writer embeds in commit payloads."""
+    return [{
+        "seq": e.seq,
+        "from_state_id": e.from_state_id,
+        "to_state_id": e.to_state_id,
+        "trigger": e.trigger,
+        "payload": json.loads(e.payload),
+    } for e in sorted(s.flow_transition_events.values(),
+                      key=lambda e: e.seq)]
+
+
+def _add_run(s: SystemState, run_id: str) -> None:
+    """A second drive sharing one SystemState (cumulative-commit cases)."""
+    _add(s, "flow_runs", run_id,
+         FlowRun(flow_id=FLOW_ID, current_state_id=IDLE, state="running"))
+
+
 def run() -> dict:
     violations: list[str] = []
     refusals: list[str] = []
 
     # 0. R3 discharge: the compiled flow validates clean — mechanically.
+    # K1-A4: 9 states, 16 transitions; totality + determinism over the table.
     s0 = build_updater_state()
     v0 = validate(s0)
     assert v0 == [], f"updater entities must validate clean: {v0}"
+    states0 = [st for st in s0.flow_states.values()
+               if st.flow_id == FLOW_ID]
+    trans0 = [t for t in s0.flow_transitions.values()
+              if t.flow_id == FLOW_ID]
+    assert len(states0) == 9, f"9 states, got {len(states0)}"
+    assert len(trans0) == 16, f"16 transitions, got {len(trans0)}"
+    assert any(st.name == "committing" and st.kind == "task"
+               for st in states0), "committing must be a task state"
 
     # 1. auto + patch bump -> done; promotion recorded.
     s1 = build_updater_state("fr-a1")
@@ -87,6 +139,28 @@ def run() -> dict:
     assert w1.installer_invocations == ["0.1.1"], "installer must run once"
     assert w1.promotions and w1.promotions[0]["version"] == "0.1.1"
     assert validate(s1) == [], f"post-run state must stay clean: {validate(s1)}"
+
+    # K1-A1: the done drive leaves exactly one commit (I-18) containing all
+    # events since the last commit, content-hash named (I-19), append-only
+    # (I-20); the message names the flow-run id and the source state.
+    assert len(w1.accretion_commits) == 1, "exactly one commit"
+    c1 = w1.accretion_commits[0]
+    assert i18_commit_completeness([], w1.accretion_commits,
+                                   _event_dicts(s1)) == []
+    assert i19_payload_canonicity(c1) == []
+    assert i20_append_only(w1.accretion_commits) == []
+    assert c1["message"].startswith("accretion: fr-a1 from verifying "), \
+        f"message must name the run and source state: {c1['message']}"
+    assert "events 1-6" in c1["message"], \
+        f"commit covers the pre-terminal frontier: {c1['message']}"
+    assert c1["first_seq"] == 1 and c1["last_seq"] == 6
+    payload1 = json.loads(c1["payload"])
+    assert payload1["schema"] == "accretion-commit/v1"
+    assert payload1["verification"] == {"doctor_ok": True,
+                                        "promotion_recorded": True}
+    assert payload1["policy_decision"]["decision"] == "drive"
+    assert len(payload1["promotions"]) == 1
+    refusals.append("accretion commit written: " + c1["message"])
 
     # 2. notify -> one watch cycle back to idle; installer never invoked.
     # (The monitor is non-terminating under notify: the steady state IS the
@@ -167,6 +241,8 @@ def run() -> dict:
     assert w8.installer_invocations == ["0.1.1"], "the attempt happened"
     assert w8.promotions == [], "no promotion on a failed drive"
     assert w8.installed_version == "0.1.0", "failed install must not converge"
+    # K1-A2: a drive aborting in driving reaches failed with no commit.
+    assert w8.accretion_commits == [], "incomplete drive must not commit"
     refusals.append("installer failure refused the drive: "
                     f"path={path8[-2:]}")
 
@@ -236,6 +312,176 @@ def run() -> dict:
     assert path_hash(path_r9) == path_hash(path9), "replay must re-derive"
     refusals.append("replay re-derived the refused drive: "
                     f"{path_hash(path_r9)[:12]} == {path_hash(path9)[:12]}")
+
+    # 14. (K1-A2) drive aborting in verifying (doctor fails) -> failed at
+    # verifying; no commit. Acceptance of the D1 narrowing: durability
+    # attaches to completed drives; the incomplete drive's events surface
+    # via the failed terminal state.
+    s14 = build_updater_state("fr-a14")
+    w14 = World(feed_version="0.1.1", installed_version="0.1.0",
+                updater_policy="auto", doctor_ok=False)
+    path14 = drive(s14, w14, "fr-a14")
+    assert path14 == ["urm-idle", "urm-checking", "urm-candidate", "urm-gate",
+                      "urm-driving", "urm-verifying", "urm-failed"], \
+        f"doctor failure must fail at verifying: {path14}"
+    assert s14.flow_runs["fr-a14"].state == "aborted"
+    assert w14.accretion_commits == [], "incomplete drive must not commit"
+    assert w14.promotions == [], "no promotion without doctor_ok"
+    refusals.append("verifying-abort left no commit (D1 narrowing)")
+
+    # 15. (K1-A3) crash simulation: wipe the World except the accretion
+    # repo. The committed payload alone — parsed from the repo, never from
+    # the live state — replays byte-equal (the R1 premise made true).
+    wiped = World()
+    wiped.accretion_commits = w1.accretion_commits  # the repo survives
+    assert i19_payload_canonicity(wiped.accretion_commits[0]) == []
+    payload15 = json.loads(wiped.accretion_commits[0]["payload"])
+    crash_events = [
+        FlowTransitionEvent(
+            id=f"crash-e{e['seq']}", flow_run_id="fr-crash", seq=e["seq"],
+            from_state_id=e["from_state_id"], to_state_id=e["to_state_id"],
+            trigger=e["trigger"], payload=json.dumps(e["payload"]))
+        for e in payload15["events"]]
+    trans1b = [t for t in s1.flow_transitions.values()
+               if t.flow_id == FLOW_ID]
+    path_crash = replay(crash_events, trans1b, IDLE)
+    assert path_crash == path1[:-1], \
+        f"repo payload must replay the pre-terminal path: {path_crash}"
+    refusals.append("crash simulation: repo payload replayed byte-equal")
+
+    # 16. (K1-A5) committing -> done requires commit_confirmed. A tool that
+    # completes without confirming faults loudly on the guard — never done.
+    real_tool = TOOLS["tool-commit-accretion"]
+    TOOLS["tool-commit-accretion"] = lambda ctx, w: ctx.update(
+        {"sabotaged": True})
+    try:
+        s16 = build_updater_state("fr-a16")
+        w16 = World(feed_version="0.1.1", installed_version="0.1.0",
+                    updater_policy="auto")
+        try:
+            drive(s16, w16, "fr-a16")
+            raise AssertionError("sabotaged commit must not reach done")
+        except Exception as e:  # noqa: BLE001 — the fault type is the point
+            assert "commit_confirmed" in str(e), \
+                f"must fault on the unconfirmed guard: {e!r}"
+            refusals.append("unconfirmed commit faulted loudly on the guard, "
+                            "never done")
+    finally:
+        TOOLS["tool-commit-accretion"] = real_tool
+
+    # 17. (K1-A5, skip rule) the writer skipped with nothing new still
+    # confirms — the step completed; the guard is confirmation, not bytes.
+    # The driver's input channel is popped, never emitted.
+    w17 = World()
+    w17.accretion_commits.append({
+        "payload": '{"schema":"accretion-commit/v1"}', "payload_hash": "x",
+        "message": "seed", "first_seq": 1, "last_seq": 99,
+        "promotions_through": 0})
+    ctx17 = {"_commit_input": {"run_id": "fr-x", "source_state": "verifying",
+                              "events": [{"seq": i} for i in range(1, 100)]}}
+    _tool_commit_accretion(ctx17, w17)
+    assert ctx17["commit_confirmed"] is True
+    assert ctx17["commit_skipped"] is True
+    assert len(w17.accretion_commits) == 1, "skip writes nothing"
+    assert "_commit_input" not in ctx17, "input channel never emitted"
+    refusals.append("skip-with-nothing-new confirmed without writing")
+
+    # 18. (K1-A6) accretion.commit_authority=operator -> the commit step
+    # refuses via run_aborted -> failed; no prompt, nothing silently skipped.
+    s18 = build_updater_state("fr-a18")
+    w18 = World(feed_version="0.1.1", installed_version="0.1.0",
+                updater_policy="auto", accretion_commit_authority="operator")
+    path18 = drive(s18, w18, "fr-a18")
+    assert path18[-2:] == ["urm-committing", "urm-failed"], \
+        f"operator authority must refuse at committing: {path18}"
+    assert s18.flow_runs["fr-a18"].state == "aborted"
+    assert w18.accretion_commits == [], "refused commit writes nothing"
+    refusals.append("operator commit authority refused loudly at committing")
+
+    # 19. (K1-D5a) git absent -> run_aborted -> failed: the hard dependency
+    # fails closed; nothing is committed, nothing silently skipped.
+    s19 = build_updater_state("fr-a19")
+    w19 = World(feed_version="0.1.1", installed_version="0.1.0",
+                updater_policy="auto", git_available=False)
+    path19 = drive(s19, w19, "fr-a19")
+    assert path19[-2:] == ["urm-committing", "urm-failed"], \
+        f"absent git must fail the drive: {path19}"
+    assert w19.accretion_commits == []
+    refusals.append("absent git failed the drive closed (D5a)")
+
+    # 20. (K1-D4a) abort, not retry: drive 1's commit fails (git down) and
+    # leaves nothing; drive 2's cumulative commit covers the orphaned
+    # events — the retry. Exactly one commit total.
+    s20 = build_updater_state("fr-a20")
+    w20 = World(feed_version="0.1.1", installed_version="0.1.0",
+                updater_policy="auto", git_available=False)
+    path20a = drive(s20, w20, "fr-a20")
+    assert path20a[-1] == FAILED
+    assert w20.accretion_commits == [], "failed commit leaves nothing"
+    w20.git_available = True
+    w20.feed_version = "0.1.2"
+    _add_run(s20, "fr-a20b")
+    before20 = [dict(c) for c in w20.accretion_commits]
+    path20b = drive(s20, w20, "fr-a20b")
+    assert path20b == FULL_PATH, f"unexpected path: {path20b}"
+    assert len(w20.accretion_commits) == 1, "exactly one commit total"
+    c20 = w20.accretion_commits[0]
+    assert c20["first_seq"] == 1, "cumulative from the first orphaned event"
+    assert i18_commit_completeness(before20, w20.accretion_commits,
+                                   _event_dicts(s20)) == []
+    assert i19_payload_canonicity(c20) == []
+    assert i20_append_only(w20.accretion_commits) == []
+    payload20 = json.loads(c20["payload"])
+    assert len(payload20["promotions"]) == 2, \
+        "the orphaned promotion rides the cumulative commit"
+    refusals.append("aborted commit retried cumulatively by the next drive: "
+                    + c20["message"])
+
+    # 21. (K1-D4b) bounded residual: drive 1's terminal edge rides drive 2's
+    # commit — never the payload, at most the edge.
+    s21 = build_updater_state("fr-a21")
+    w21 = World(feed_version="0.1.1", installed_version="0.1.0",
+                updater_policy="auto")
+    path21a = drive(s21, w21, "fr-a21")
+    assert path21a == FULL_PATH
+    assert w21.accretion_commits[0]["last_seq"] == 6, \
+        "drive 1's commit stops before its terminal edge (event 7)"
+    w21.feed_version = "0.1.2"
+    _add_run(s21, "fr-a21b")
+    before21 = [dict(c) for c in w21.accretion_commits]
+    path21b = drive(s21, w21, "fr-a21b")
+    assert path21b == FULL_PATH
+    c21 = w21.accretion_commits[1]
+    assert (c21["first_seq"], c21["last_seq"]) == (7, 13), \
+        f"drive 2's commit picks up the residual edge: {c21['first_seq']}-" \
+        f"{c21['last_seq']}"
+    assert i18_commit_completeness(before21, w21.accretion_commits,
+                                   _event_dicts(s21)) == []
+    assert i19_payload_canonicity(c21) == []
+    assert i20_append_only(w21.accretion_commits) == []
+    refusals.append("bounded residual: terminal edge rode the next commit: "
+                    + c21["message"])
+
+    # 22. (K1-I-20 negative) a mutated committed payload breaks its
+    # content-hash name — I-20 fires. Append-only is tamper-evident.
+    tampered = [dict(c) for c in w1.accretion_commits]
+    tampered[0] = dict(tampered[0])
+    tampered[0]["payload"] = tampered[0]["payload"].replace(
+        "0.1.1", "9.9.9", 1)
+    bad22 = i20_append_only(tampered)
+    assert any("I-20" in x for x in bad22), \
+        f"I-20 must fire on the mutated payload: {bad22}"
+    refusals.append("I-20 fired on the mutated committed payload")
+
+    # 23. (K1-I-18 negative) a commit gapped from the watermark — I-18 fires.
+    bad23 = i18_commit_completeness(
+        w1.accretion_commits,
+        w1.accretion_commits + [dict(w1.accretion_commits[0],
+                                    first_seq=8, last_seq=10)],
+        _event_dicts(s1))
+    assert any("I-18" in x for x in bad23), \
+        f"I-18 must fire on the gapped commit: {bad23}"
+    refusals.append("I-18 fired on the gapped commit")
 
     return {"violations": violations, "refusals": refusals, "ok": True}
 

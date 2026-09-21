@@ -3,12 +3,12 @@
 Contents:
   - Pydantic v2 source models (DR-CMD-028): MonitorState, MonitorTransition,
     ReleaseMonitorFlow, and the authoritative RELEASE_MONITOR instance
-    (spec §1: 8 states, 14 transitions).
+    (spec §1: 9 states, 16 transitions — K1 added the `committing` state).
   - compile_flow(): the updater's compilation path from source models to
     AutomatonFlow / FlowState / FlowTransition entities, executed by FlowRun
     (DR-CMD-030). The generic bridge remains a future governed matter; this
     function is deliberately shaped so the bridge can generalize it.
-  - The five run-books' tool implementations (zero inference throughout).
+  - The six run-books' tool implementations (zero inference throughout).
   - A minimal deterministic driver + an AST-allowlisted guard evaluator
     (the v1 expression-language decision, scoped to the guards used here).
   - replay(): re-derivation of the state path from the FlowTransitionEvent
@@ -100,6 +100,9 @@ RELEASE_MONITOR = ReleaseMonitorFlow(
         MonitorState(name="verifying", kind="task",
                      runbook_id="rb-release-verify-installed",
                      step_policy="abort"),
+        MonitorState(name="committing", kind="task",
+                     runbook_id="rb-accretion-commit",
+                     step_policy="abort"),  # K1 repair (DR-CMD-039)
         MonitorState(name="done", kind="end", outcome="completed"),
         MonitorState(name="failed", kind="end", outcome="aborted"),
     ],
@@ -132,11 +135,20 @@ RELEASE_MONITOR = ReleaseMonitorFlow(
                           to_state="failed"),
         MonitorTransition(from_state="verifying", trigger="run_completed",
                           guard="payload.doctor_ok and payload.promotion_recorded",
-                          to_state="done"),
+                          to_state="committing"),  # K1: was `done`
         MonitorTransition(from_state="verifying", trigger="run_completed",
                           guard="not (payload.doctor_ok and payload.promotion_recorded)",
                           to_state="failed"),
         MonitorTransition(from_state="verifying", trigger="run_aborted",
+                          to_state="failed"),
+        # K1 repair (DR-CMD-039): the commit is governed — `committing`
+        # captures the complete record (verification outcome known) before
+        # the terminal state. The message never names `done`: terminality
+        # follows from the transition taken out of `committing`.
+        MonitorTransition(from_state="committing", trigger="run_completed",
+                          guard="payload.commit_confirmed",
+                          to_state="done"),
+        MonitorTransition(from_state="committing", trigger="run_aborted",
                           to_state="failed"),
     ],
 )
@@ -175,7 +187,7 @@ def compile_flow(flow: ReleaseMonitorFlow = RELEASE_MONITOR):
 
 
 def _runbook_entities():
-    """The five run-books as RunBook/Step/Tool entities. Steps are strictly
+    """The six run-books as RunBook/Step/Tool entities. Steps are strictly
     sequential; each step is an (allowlisted expr, tool) pair."""
     specs = [
         ("rb-release-check", [("True", "tool-fetch-feed"),
@@ -185,6 +197,7 @@ def _runbook_entities():
         ("rb-release-drive", [("True", "tool-invoke-installer")]),
         ("rb-release-verify-installed", [("True", "tool-run-doctor"),
                                         ("True", "tool-record-promotion")]),
+        ("rb-accretion-commit", [("True", "tool-commit-accretion")]),  # K1
     ]
     runbooks, steps, tools = [], [], []
     seen_tools: set[str] = set()
@@ -235,6 +248,17 @@ class World:
     accretion_writable: bool = True           # fixture: can the path be written
     promotions: list[dict] = field(default_factory=list)
     surfaced: list[dict] = field(default_factory=list)  # notify/off observations
+    # K1 repair (DR-CMD-039): the fixture accretion repo. Each commit is a
+    # dict {payload, payload_hash, message, first_seq, last_seq,
+    # promotions_through}. The fixture models the repo's contract —
+    # append-only, content-hash named — not git's bytes; the writer only
+    # ever appends (D6). The production tool shells out to real git; the
+    # golden run pins the contract the production tool must honor.
+    accretion_commits: list[dict] = field(default_factory=list)
+    git_available: bool = True  # K1 D5a: git is a hard dependency
+    # K1 D3: standing (default — the operator's standing disposition covers
+    # journaling) | operator (autonomous drive cannot prompt: refuse).
+    accretion_commit_authority: str = "standing"
 
 
 def _bump(old: str, new: str) -> str:
@@ -368,6 +392,172 @@ def _tool_record_promotion(ctx: dict, w: World) -> None:
         ctx["promotion_recorded"] = False
 
 
+# ---------------------------------------------------------------------------
+# K1 repair (DR-CMD-039): the updater's accretion writer
+# ---------------------------------------------------------------------------
+
+def canonical_payload(run_id: str, source_state: str, events: list[dict],
+                      promotions: list[dict], decision: dict,
+                      verification: dict) -> str:
+    """Q1 (build detail, pinned by the golden run): the canonical byte form
+    of an accretion commit payload. Sorted keys, compact separators —
+    deterministic bytes from deterministic events (D5). Replay identity is
+    these bytes (D5's payload/envelope distinction): the git envelope —
+    author/committer timestamps, commit hash — is transport, never replay
+    identity."""
+    payload = {
+        "schema": "accretion-commit/v1",
+        "flow_run_id": run_id,
+        "source_state": source_state,
+        "event_range": {"first_seq": events[0]["seq"],
+                        "last_seq": events[-1]["seq"]},
+        "events": events,
+        "promotions": promotions,
+        "policy_decision": decision,
+        "verification": verification,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _tool_commit_accretion(ctx: dict, w: World) -> None:
+    """The accretion writer: commits the cumulative event frontier to the
+    accretion repo (D4 — all events since the last commit, located via the
+    watermark, not just this run's). Pure function of the logged events
+    (D5); git is a hard dependency (D5a); standing authority commits
+    without asking while operator authority refuses (D3); append-only
+    (D6); abort, not retry — the next drive's cumulative commit is the
+    retry (D4a). The driver's `_commit_input` (popped here, never emitted)
+    carries the flow log the writer diffs against the watermark."""
+    if not w.git_available:
+        raise ToolAborted("git not available: the drive's durability "
+                          "guarantee rests on git (D5a) — refusing")
+    if w.accretion_commit_authority == "operator":
+        # Autonomous operation cannot prompt (no terminal): refuse loudly,
+        # never silently skip (D3 — composes with K2's fail-closed
+        # philosophy, DR-CMD-038).
+        raise ToolAborted("accretion.commit_authority=operator: no terminal "
+                          "to prompt on — refusing the commit")
+    if w.accretion_commit_authority != "standing":
+        raise ToolAborted("unknown accretion commit authority: "
+                          f"{w.accretion_commit_authority!r}")
+    inp = ctx.pop("_commit_input", None)
+    if inp is None:
+        raise ToolAborted("committing run-book invoked without the driver's "
+                          "event-log input — modeling fault")
+    if inp.get("kind") == "simulation":
+        # I-22 (DR-CMD-041): simulation transcripts are ontologically
+        # separate from production records. The writer structurally cannot
+        # accept them — separation is not a marking convention the writer
+        # could ignore (D7).
+        raise ToolAborted("I-22: kind=simulation transcripts are not "
+                          "committable to the accretion repo")
+    events = inp["events"]  # the flow log, seq order
+    watermark = (w.accretion_commits[-1]["last_seq"]
+                 if w.accretion_commits else 0)
+    new_events = [e for e in events if e["seq"] > watermark]
+    if not new_events:
+        # D4: a commit is skipped when there is nothing to commit (the
+        # installer's rule). The step completes — confirmed, nothing written.
+        ctx["commit_confirmed"] = True
+        ctx["commit_skipped"] = True
+        return
+    prev_through = (w.accretion_commits[-1]["promotions_through"]
+                    if w.accretion_commits else 0)
+    payload = canonical_payload(
+        inp["run_id"], inp["source_state"], new_events,
+        w.promotions[prev_through:],
+        {"decision": ctx.get("decision"), "reason": ctx.get("reason")},
+        {"doctor_ok": ctx.get("doctor_ok"),
+         "promotion_recorded": ctx.get("promotion_recorded")})
+    payload_hash = hashlib.sha256(payload.encode()).hexdigest()
+    first, last = new_events[0]["seq"], new_events[-1]["seq"]
+    # D4: the message names the flow-run id and the source state —
+    # terminality follows from the transition taken out of `committing`,
+    # so the message never claims a terminal state the drive hasn't reached.
+    message = (f"accretion: {inp['run_id']} from {inp['source_state']} "
+               f"events {first}-{last} payload {payload_hash[:12]}")
+    # D6: append-only — the writer only ever appends; no amend, no rebase.
+    w.accretion_commits.append({
+        "payload": payload,
+        "payload_hash": payload_hash,
+        "message": message,
+        "first_seq": first,
+        "last_seq": last,
+        "promotions_through": len(w.promotions),
+    })
+    ctx["commit_confirmed"] = True
+    ctx["commit_skipped"] = False
+    ctx["payload_hash"] = payload_hash
+    ctx["commit_event_range"] = [first, last]
+
+
+def i18_commit_completeness(commits_before: list[dict],
+                            commits_after: list[dict],
+                            flow_events: list[dict]) -> list[str]:
+    """I-18 (K1, DR-CMD-039): every drive reaching `committing` leaves
+    exactly one commit, covering exactly the events since the last commit
+    (the cumulative frontier — gapless from the previous watermark, and the
+    payload honestly embeds precisely the events it claims). The drive's
+    terminal edge rides the *next* drive's commit (D4b) — it is covered by
+    the frontier check, not by this commit."""
+    v: list[str] = []
+    new = commits_after[len(commits_before):]
+    if len(new) != 1:
+        v.append(f"I-18: drive reaching committing left {len(new)} commits, "
+                 f"expected exactly one")
+        return v
+    c = new[0]
+    prev_last = commits_before[-1]["last_seq"] if commits_before else 0
+    if c["first_seq"] != prev_last + 1:
+        v.append(f"I-18: commit starts at {c['first_seq']}, expected "
+                 f"{prev_last + 1} (gapless from the watermark)")
+    claimed = json.loads(c["payload"])["events"]
+    actual = [e for e in flow_events
+              if prev_last < e["seq"] <= c["last_seq"]]
+    if claimed != actual:
+        v.append("I-18: committed payload does not embed exactly the events "
+                 f"in its claimed range {c['first_seq']}-{c['last_seq']}")
+    if flow_events and c["last_seq"] > max(e["seq"] for e in flow_events):
+        v.append("I-18: commit claims events beyond the flow log")
+    return v
+
+
+def i19_payload_canonicity(commit: dict) -> list[str]:
+    """I-19 (K1): the committed payload is byte-equal to the canonical
+    serialization of the events since the last commit — replay identity is
+    the payload bytes (D5), never the git envelope."""
+    v: list[str] = []
+    payload = json.loads(commit["payload"])
+    if commit["payload"] != canonical_payload(
+            payload["flow_run_id"], payload["source_state"], payload["events"],
+            payload["promotions"], payload["policy_decision"],
+            payload["verification"]):
+        v.append("I-19: committed payload is not the canonical serialization "
+                 "of its claimed inputs")
+    if commit["payload_hash"] != hashlib.sha256(
+            commit["payload"].encode()).hexdigest():
+        v.append("I-19: payload_hash does not name the payload bytes")
+    return v
+
+
+def i20_append_only(commits: list[dict]) -> list[str]:
+    """I-20 (K1): no committed payload is ever mutated — the tamper-evident
+    form of append-only (D6): every stored payload still hashes to its
+    content-hash name, and commit ranges never overlap."""
+    v: list[str] = []
+    for i, c in enumerate(commits):
+        if c["payload_hash"] != hashlib.sha256(
+                c["payload"].encode()).hexdigest():
+            v.append(f"I-20: commit {i} payload mutated (hash mismatch) — "
+                     f"history was rewritten")
+    for a, b in zip(commits, commits[1:]):
+        if b["first_seq"] <= a["last_seq"]:
+            v.append(f"I-20: overlapping commit ranges "
+                     f"{a['first_seq']}-{a['last_seq']} and "
+                     f"{b['first_seq']}-{b['last_seq']}")
+    return v
+
+
 TOOLS: dict[str, Callable[[dict, World], None]] = {
     "tool-fetch-feed": _tool_fetch_feed,
     "tool-compare-versions": _tool_compare_versions,
@@ -376,6 +566,7 @@ TOOLS: dict[str, Callable[[dict, World], None]] = {
     "tool-invoke-installer": _tool_invoke_installer,
     "tool-run-doctor": _tool_run_doctor,
     "tool-record-promotion": _tool_record_promotion,
+    "tool-commit-accretion": _tool_commit_accretion,  # K1 repair (DR-CMD-039)
 }
 
 
@@ -467,7 +658,27 @@ def drive(s: SystemState, world: World, run_id: str = "fr-updater",
                 idempotency_key=f"{run_id}:{st.id}:{ar_n}",
                 parent_flow_run_id=run_id, flow_state_id=st.id)
             try:
-                emitted = _run_runbook(s, st.runbook_id, world, dict(accum))
+                ctx_in = dict(accum)
+                if st.runbook_id == "rb-accretion-commit":
+                    # K1 (D4): the committing run-book's input channel — the
+                    # flow log the writer diffs against the commit watermark.
+                    # Popped by the tool; never lands in the emitted payload.
+                    flow_events = sorted(
+                        (e for e in s.flow_transition_events.values()
+                         if s.flow_runs[e.flow_run_id].flow_id == flow_id),
+                        key=lambda e: e.seq)
+                    ctx_in["_commit_input"] = {
+                        "run_id": run_id,
+                        "source_state": s.flow_states[path[-2]].name,
+                        "events": [{
+                            "seq": e.seq,
+                            "from_state_id": e.from_state_id,
+                            "to_state_id": e.to_state_id,
+                            "trigger": e.trigger,
+                            "payload": json.loads(e.payload),
+                        } for e in flow_events],
+                    }
+                emitted = _run_runbook(s, st.runbook_id, world, ctx_in)
                 trigger = "run_completed"
                 new_ar_state = "completed"
             except _RunAborted as e:

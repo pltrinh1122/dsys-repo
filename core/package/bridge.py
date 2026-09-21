@@ -353,7 +353,7 @@ def entities_hash(e: Entities) -> str:
 # The updater re-expressed as a generic source (spec §7.1)
 # ---------------------------------------------------------------------------
 
-# The five run-books' structure, re-declared as source data. Authority:
+# The six run-books' structure, re-declared as source data. Authority:
 # updater._runbook_entities (updater.py frozen); this duplication is
 # intentional, and the §7.1 hash equality is its drift guard.
 _UPDATER_RUNBOOK_SPECS: list[tuple[str, list[tuple[str, str]]]] = [
@@ -364,12 +364,13 @@ _UPDATER_RUNBOOK_SPECS: list[tuple[str, list[tuple[str, str]]]] = [
     ("rb-release-drive", [("True", "tool-invoke-installer")]),
     ("rb-release-verify-installed", [("True", "tool-run-doctor"),
                                      ("True", "tool-record-promotion")]),
+    ("rb-accretion-commit", [("True", "tool-commit-accretion")]),  # K1
 ]
 
 _UPDATER_TOOL_IDS = [
     "tool-fetch-feed", "tool-compare-versions", "tool-verify-checksum",
     "tool-read-policy", "tool-invoke-installer", "tool-run-doctor",
-    "tool-record-promotion",
+    "tool-record-promotion", "tool-commit-accretion",
 ]
 
 

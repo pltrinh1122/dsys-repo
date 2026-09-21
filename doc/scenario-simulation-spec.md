@@ -1,10 +1,11 @@
 # Scenario-simulation spec
 
-**Status: ADOPTED (DR-CMD-041)** — uncommitted, not built.
+**Status: ADOPTED (DR-CMD-041), BUILT (DR-CMD-044)** — uncommitted, verified.
 Adopted 2026-09-21 on the remediated spec (draft verdict: adopt;
 14/14 conditionals hold; both evaluation conditions remediated
 in-spec — D9 driver-built provisioning, D1 seed-not-confine rule
-+ retroactive briefs).
++ retroactive briefs). Built 2026-09-21 under DR-CMD-044; see
+"Build evidence" below — four golden runs, all PASS.
 
 **Matter:** *scenario simulation* (ambient-authored) — live
 expansion proposal, re-entered at START narrowed 2026-09-21 after
@@ -17,9 +18,8 @@ conditionals unevaluated), is specified here against that
 evaluation's punchlist. The evaluation's two conditions were
 remediated in-spec 2026-09-21 (D9: driver-built provisioning;
 D1: seed-not-confine rule + retroactive briefs) — draft verdict
-on the remediated spec: **adopt**. Disposition, when it comes, takes the next
-DecisionRecord identifier after K1's reserved DR-CMD-039 and the
-pending K3 invalidity record.
+on the remediated spec: **adopt**. Disposition came as DR-CMD-041 (2026-09-21 ~07:44 PDT);
+the build was ratified under DR-CMD-044 (2026-09-21 ~07:55 PDT).
 
 **Claim (S1, narrowed):** dsys should gain ambient-authored
 scenario simulations such that the ambient authors scenario specs
@@ -274,12 +274,67 @@ production transcript changes kind, and I-22 bars ingestion.
    disclosure views.
 4. **Gate:** scenario passing I-23 with no cited disposition
    → hardening refused (I-24); suite unchanged.
-5. **Anti-flood:** briefs rephrasing existing golden-run cases
+5. **Anti-flood:** briefs rephrasing existing suite cases
    → I-23 fails on all → nothing hardened, attention spent
    only on the coverage report.
 6. **Refusal coverage:** a scenario driving the K2 accretion
    refusal path hardens (refusal pairs count) and its golden-run
    case asserts the refusal.
+
+## Build evidence (2026-09-21)
+
+**Implementation.** `core/package/scenario_sim.py`: pydantic models —
+`Brief` (budget, authorship count, retirement), `ScenarioSpec`
+(declarative `ScenarioTurn`s with world/driver/referee actors — data,
+never code, D2), `SimulationTranscript` (`kind: simulation` set at
+construction, D7), `SandboxCopy` (manifest hash + `manifest_source`
+fidelity provenance), `CoverageReport`, `HardenedCase`,
+`ScenarioSuite`. Pipeline functions: `author_scenario` (D1 budget
+consumption; exhausted briefs refuse with `BudgetExhausted`) and
+`retire_brief` (F-S1); `provision_sandbox` (D9 — deterministic,
+manifest-derived, driver-step); `make_scenario_world` with
+`i21_containment` asserted **before construction** (I-21/D6 — no
+OS sandboxing, path discipline only, per the installer-spec's "no
+Docker v1" non-goal); `i22_transcript_separation` and
+`disclose_from_transcript` (I-22/D7 — the single transcript→disclosure
+funnel, which is the only path, so simulation transcripts are absent
+from disclosure views by construction, DR-5); the minimal scenario
+interpreter — `execute_scenario` (world/driver turns),
+`adjudicate` (the referee turn; mismatched expects raise
+`ExpectationFailed`, never silent), `run_scenario` — this is the D3
+strapped-driver turn; the golden run plays the driver, and no new
+execution machinery was built; `covers_new_pair` and
+`coverage_report` (I-23/D4); `harden` with
+`STANDING_HARDENING_CLASSES` (I-24/D5, F-S2).
+
+**Writer-side I-22 enforcement.** `core/package/updater.py`:
+`_tool_commit_accretion` now rejects `kind: simulation` commit inputs
+with `ToolAborted("I-22 ...")` before any repo effect. K1's
+committing path is otherwise untouched.
+
+**Resolved build details (the D4 baseline reading).** "The existing
+suite" in D4/I-23 is the scenario regression suite the pipeline feeds
+(`ScenarioSuite`: seeded + hardened cases) — not the updater's golden
+run, which is a different matter's regression net. This is the reading
+under which A5's anti-flood (a rephrase covers nothing outside the
+hardened case) and A6's refusal coverage (the K2 refusal pair is new
+*to this suite*) are jointly satisfiable. Cross-suite novelty is not
+measured: the scenario suite measures its own coverage. A5's wording
+is converged accordingly ("existing suite cases").
+
+**Golden runs (all 2026-09-21).**
+- `core/package/scenario_sim_golden_run.py` (not a Harness instance —
+  AX2): A1–A6 plus negative cases (empty disposition, unknown standing
+  class, standing-class misfire on a non-refusal terminal, writer-side
+  I-22, funnel refusal, budget exhaustion, bug-finding alternative).
+  **RESULT: PASS** — 7 refusal entries, 0 violations.
+- `core/package/updater_golden_run.py`: **PASS** (`ok: true`) — the
+  I-22 writer patch does not disturb K1's committing path.
+- `core/package/bridge_golden_run.py`: **PASS** (`ok: true`) —
+  compiled-entity hashes unchanged by the writer patch (byte-for-byte
+  drift guard holds).
+- main `core/package/golden_run.py::run()`: **PASS** — 0 violations,
+  37 refusals.
 
 ## X4 deltas (prior-art non-duplication)
 
@@ -296,15 +351,22 @@ production transcript changes kind, and I-22 bars ingestion.
 
 ## G6 — open questions
 
-- **Q1:** Standing-disposition classes: what narrow classes
-  are safe (e.g. "refusal-path scenarios for flows with a
-  published transition table")? Enumerate before first use.
-- **Q2:** Manifest fidelity: who asserts the installation
-  manifest describes the live installation, and how often?
-  (Upstream of D9; cite installer-spec.)
-- **Q3:** Does the coverage criterion generalize beyond flow
-  transition tables — to run-books, harness runs? Or is
-  scenario simulation flow-scoped in v1?
+- **Q1 (answered at build):** Standing-disposition classes are
+  enumerated in `STANDING_HARDENING_CLASSES` before first use —
+  currently exactly one narrow class, `refusal-path` (scenarios
+  terminating in a `run_aborted` refusal pair on a flow with a
+  published transition table, coverage report attached).
+  Per-scenario DecisionRecords remain the default. A standing
+  "harden anything covering" is a rubber stamp and is refused (F-S2).
+- **Q2 (cited, not solved):** Manifest fidelity remains the
+  installer-spec's problem, upstream of D9. The build records
+  fidelity provenance on every sandbox (`SandboxCopy.
+  manifest_source`); the build's fixture stipulates it
+  ("stipulated-fixture"). Production must cite an installer-issued
+  manifest.
+- **Q3 (answered at build):** Coverage is flow-scoped in v1 — pairs
+  are (transition, guard-outcome) over a flow's transition table
+  (`FlowPair`). Generalization to run-books and harness runs is open.
 
 (Former Q1 — the brief seed-vs-confine line — resolved
 2026-09-21 by D1's seed-not-confine rule plus retroactive
