@@ -166,6 +166,7 @@ fi
 ACCRETION_ENABLED="1"
 ACCRETION_SKIP_REASON=""
 ACCRETION_MODE=""   # fresh | resume — set by accretion_setup
+ACCRETION_IDENTITY=""  # repo UUID (K1 Q3(a) D1) — minted by accretion_setup
 
 tmpdir=""
 reltmp=""
@@ -254,6 +255,33 @@ accretion_setup() {
     ACCRETION_MODE="fresh"
     echo "    accretion: initialized fresh repo at $ACCRETION_PATH"
   fi
+  accretion_mint_identity
+}
+
+accretion_mint_identity() {
+  # K1 Q3(a) D1 — the installer mints the repo identity: a UUIDv4 written
+  # to the repo's git config as dsys.repo-id and recorded in the manifest
+  # as accretion_repo.identity. Fresh: mint. Resume: reuse the repo's
+  # existing key (same installation, D4); mint only if the repo predates
+  # the mint. Never fails the install: a mint failure disables accretion
+  # like any other repo failure.
+  [ "$ACCRETION_ENABLED" = "1" ] || return 0
+  _existing=$(agit config dsys.repo-id 2>/dev/null || true)
+  if [ -n "$_existing" ]; then
+    ACCRETION_IDENTITY="$_existing"
+    echo "    accretion: repo identity $_existing ($ACCRETION_MODE, reused)"
+    return 0
+  fi
+  _new=$(python3 -c 'import uuid,sys; sys.stdout.write(str(uuid.uuid4()))' \
+    2>/dev/null || true)
+  if [ -z "$_new" ]; then
+    accretion_disable "repo identity mint failed"
+    return 0
+  fi
+  agit config dsys.repo-id "$_new" 2>/dev/null \
+    || { accretion_disable "repo identity mint failed (git config)"; return 0; }
+  ACCRETION_IDENTITY="$_new"
+  echo "    accretion: repo identity $_new ($ACCRETION_MODE, minted)"
 }
 
 accretion_dirty_paths() { # prints porcelain status of accreted set (may be empty)
@@ -303,6 +331,15 @@ accretion_json() { # prints the manifest's accretion object
   else
     python3 -c 'import json,sys; print(json.dumps({"enabled": False, "path": sys.argv[1], "reason": sys.argv[2]}))' \
       "$ACCRETION_PATH" "$ACCRETION_SKIP_REASON"
+  fi
+}
+
+accretion_repo_json() { # prints the manifest's accretion_repo object (K1 Q3(a) D1)
+  if [ -n "$ACCRETION_IDENTITY" ]; then
+    python3 -c 'import json,sys; print(json.dumps({"identity": sys.argv[1]}))' \
+      "$ACCRETION_IDENTITY"
+  else
+    printf 'null'
   fi
 }
 
@@ -416,9 +453,11 @@ echo "==> [4/7] write manifest"
 # about its contents.
 ACCRETION_JSON=$(accretion_json) \
   || fail "4/7 write manifest" "accretion_json failed"
+ACCRETION_REPO_JSON=$(accretion_repo_json) \
+  || fail "4/7 write manifest" "accretion_repo_json failed"
 python3 "$SRC/lib/dsys/manifest.py" write \
   "$INSTALL_HOME" "$PROFILE" "$CLI_VERSION" "$INSTALLER_VERSION" \
-  "$SRC/components.json" "$SOURCE_JSON" "$ACCRETION_JSON" \
+  "$SRC/components.json" "$SOURCE_JSON" "$ACCRETION_JSON" "$ACCRETION_REPO_JSON" \
   || fail "4/7 write manifest" "manifest.py write failed"
 accretion_snapshot "dsys accretion: post-install snapshot (installer $INSTALLER_VERSION, profile $PROFILE)" \
   || fail "4/7 write manifest" "accretion snapshot refused (commit authority: $ACCRETION_AUTH)"

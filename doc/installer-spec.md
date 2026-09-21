@@ -569,6 +569,22 @@ dir is moved aside to `<path>.bak-<utc-ts>/` (never deleted — history
 is not silently destroyed) and a new repo is initialized; the
 current accreted state becomes its first snapshot.
 
+**Repo identity mint (K1 Q3(a) D1, 2026-09-21).** At install time the
+installer mints the repo identity: a UUIDv4 written to the repo's git
+config as `dsys.repo-id` and recorded in the installation manifest as
+`accretion_repo.identity` (a top-level manifest object,
+`{"identity": "<uuid>"}`; `null` when no identity was minted —
+accretion disabled, or a pre-mint installation). The two records must
+match: the manifest declares the installation's bound identity, the
+repo config holds it, and acquisition (I-27) refuses when they
+disagree. Fresh install: mint a new UUID. Resume: reuse the repo's
+existing `dsys.repo-id` (same installation, D4 lifetime); mint only
+if the repo predates the mint (absent key). `--overwrite` moves the
+old repo aside, so the fresh repo gets a fresh identity — a new
+installation. The mint never fails the install: a mint failure
+disables accretion like any other repo failure, and the manifest
+records `accretion_repo: null`.
+
 **Snapshot commits.** On resume the installer brackets the tree
 mutation: a pre-install snapshot commit before converge, a
 post-install snapshot commit after the manifest is written. Commit

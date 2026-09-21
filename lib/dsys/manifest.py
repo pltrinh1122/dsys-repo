@@ -90,6 +90,7 @@ def write_manifest(
     components: dict,
     source: dict | None = None,
     accretion: dict | None = None,
+    accretion_repo: dict | None = None,
 ) -> dict:
     """Build the manifest dict and write it (pretty) to var/manifest.json.
 
@@ -106,6 +107,12 @@ def write_manifest(
     "commit_authority", "mode"} when a repo was established,
     {"enabled": False, "path", "reason"} when disabled. Provenance of
     where the journal lives, not a claim about its contents.
+
+    `accretion_repo` records the repository identity binding (K1 Q3(a)
+    D1): {"identity": <uuid>} minted by the installer at install time,
+    or None when no identity was minted (accretion disabled, or a
+    pre-mint installation). The identity value matches the repo's
+    `dsys.repo-id` git config key.
     """
     home = Path(home)
     rels = covered_files(home, profile)
@@ -120,6 +127,9 @@ def write_manifest(
         "accretion": accretion
         if isinstance(accretion, dict)
         else {"enabled": False, "reason": "not recorded"},
+        "accretion_repo": accretion_repo
+        if isinstance(accretion_repo, dict)
+        else None,
         "components": components,
         "files": {rel: file_sha256(home / rel) for rel in rels},
     }
@@ -188,11 +198,12 @@ def _load_components(path: str) -> dict:
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if args[:1] == ["write"] and len(args) in (6, 7, 8):
+    if args[:1] == ["write"] and len(args) in (6, 7, 8, 9):
         _, home, profile, cli_version, installer_version, components_path = args[:6]
         components = _load_components(components_path)
         source = None
         accretion = None
+        accretion_repo = None
         if len(args) >= 7:
             try:
                 source = json.loads(args[6])
@@ -200,13 +211,20 @@ if __name__ == "__main__":
                 raise ManifestError(f"bad source JSON: {e}")
             if not isinstance(source, dict):
                 raise ManifestError("bad source JSON: not an object")
-        if len(args) == 8:
+        if len(args) >= 8:
             try:
                 accretion = json.loads(args[7])
             except json.JSONDecodeError as e:
                 raise ManifestError(f"bad accretion JSON: {e}")
             if not isinstance(accretion, dict):
                 raise ManifestError("bad accretion JSON: not an object")
+        if len(args) == 9:
+            try:
+                accretion_repo = json.loads(args[8])
+            except json.JSONDecodeError as e:
+                raise ManifestError(f"bad accretion_repo JSON: {e}")
+            if accretion_repo is not None and not isinstance(accretion_repo, dict):
+                raise ManifestError("bad accretion_repo JSON: not an object")
         m = write_manifest(
             Path(home),
             profile=profile,
@@ -215,6 +233,7 @@ if __name__ == "__main__":
             components=components,
             source=source,
             accretion=accretion,
+            accretion_repo=accretion_repo,
         )
         print(
             json.dumps(
@@ -232,6 +251,7 @@ if __name__ == "__main__":
     else:
         raise SystemExit(
             "usage: manifest.py write <home> <profile> <cli_version> "
-            "<installer_version> <components.json> [<source-json>]"
+            "<installer_version> <components.json> [<source-json> "
+            "[<accretion-json> [<accretion-repo-json>]]]"
             " | verify <home>"
         )
