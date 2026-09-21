@@ -11,6 +11,9 @@ Contents:
   - The six run-books' tool implementations (zero inference throughout).
   - A minimal deterministic driver + an AST-allowlisted guard evaluator
     (the v1 expression-language decision, scoped to the guards used here).
+  - The production-drive contract (DR-CMD-050): the gated entry point
+    production_drive() with the DriveInitiation record and the I-26
+    authorized-initiation predicate (spec D1–D7, R3).
   - replay(): re-derivation of the state path from the FlowTransitionEvent
     log with tools and network disabled (R1).
 
@@ -810,6 +813,122 @@ def _select(trans: list, from_id: str, trigger: str, payload: dict,
             f"I-15 fault in {run_id}: {len(winners)} winners for "
             f"({from_id}, {trigger})")
     return winners[0].to_state_id
+
+
+# ---------------------------------------------------------------------------
+# Production-drive contract (DR-CMD-050, spec D1–D7): the gated entry
+# point for production drives of the updater flow. The contract, not a
+# driver entity (refused, F1/A2); stepping is AX2's strapped Harness,
+# which `drive()` models. This block pins: the named initiator (D1),
+# the principal binding (D3), the K3 tripwire (D4), the drive-resolved
+# manifest identity (D5), the full-profile gate (D6), and the
+# fail-closed aftermath (D7). I-26 is the R3 predicate.
+# ---------------------------------------------------------------------------
+
+class DriveRefused(Exception):
+    """The drive was refused before starting: an I-26 violation or a
+    non-full profile. Refusal is not failure — nothing ran, nothing
+    was written, and the refusal is loud. The CLI maps this to exit 1
+    naming the component (D6)."""
+
+
+@dataclass
+class DriveInitiation:
+    """The initiation record (spec glossary): the drive transcript
+    envelope's record of initiator, principal, and the drive-resolved
+    manifest identity. Checked by I-26.
+
+    origin: "operator-direct" (the human invoked the CLI) |
+            "operator-instructed" (the ambient acted on the operator's
+            explicit instruction — the operator's act through the
+            ambient's hands) | "ambient" (the ambient on its own
+            authority — K3 revived, refused by I-26).
+    """
+    initiator: str = "operator"
+    origin: str = "operator-direct"
+    principal: str = "dyad-or-human"
+    harness_strapped: bool = True
+    profile: str = "full"  # base | full (D6)
+    manifest_identity: str | None = None  # drive-resolved at initiation (D5)
+
+
+def i26_authorized_initiation(init: DriveInitiation) -> list[str]:
+    """I-26 (DR-CMD-050): authorized initiation. A predicate over the
+    initiation record, not a procedure. Violations: the initiator is not
+    the operator principal (D1/D3); the origin is the ambient acting on
+    its own authority (D4 — the K3 tripwire); the principal is not
+    dyad-or-human (agents excluded); the drive was not invoked through
+    a strapped Harness (AX1/AX2, D2)."""
+    v: list[str] = []
+    if init.initiator != "operator":
+        v.append("I-26: initiator is not the operator principal")
+    if init.origin == "ambient":
+        v.append("I-26: ambient-originated initiation (D4: K3 revived)")
+    if init.origin not in ("operator-direct", "operator-instructed",
+                           "ambient"):
+        v.append(f"I-26: unknown initiation origin: {init.origin!r}")
+    if init.principal != "dyad-or-human":
+        v.append("I-26: principal is not dyad-or-human (agents excluded)")
+    if not init.harness_strapped:
+        v.append("I-26: drive not invoked through a strapped "
+                 "Harness (AX1/AX2)")
+    return v
+
+
+def production_drive(s: SystemState, world: World,
+                     initiation: DriveInitiation,
+                     run_id: str = "fr-drive",
+                     max_steps: int = 50,
+                     until: str | None = None) -> dict:
+    """The production-drive contract's gated entry point. Returns the
+    drive record: {initiation, state, path|None, events, surfaced|None}.
+
+    - D6: a non-full profile refuses before anything runs (DriveRefused
+      names the component; the CLI maps it to exit 1).
+    - I-26: violations refuse before anything runs — the drive does not
+      start (the K3 tripwire as a gate, not a comment).
+    - D5: the manifest identity is resolved once, here, at initiation
+      (process side); the committing tool's D3 check is a pure
+      comparison against it (governed side — no file I/O in the tool).
+    - D7: after fail-closed — no retry, no re-initiation. The failure is
+      recorded in the drive record and surfaced; the next drive requires
+      a new initiation (D1).
+    """
+    rec = {
+        "initiator": initiation.initiator,
+        "origin": initiation.origin,
+        "principal": initiation.principal,
+        "harness_strapped": initiation.harness_strapped,
+        "profile": initiation.profile,
+        # D5: the manifest read happens once, at initiation. The fixture
+        # World's manifest_repo_identity is the installation manifest's
+        # accretion_repo.identity, read here — not per write.
+        "manifest_identity": world.manifest_repo_identity,
+    }
+    if initiation.profile != "full":
+        raise DriveRefused(
+            "the production-drive contract requires the full profile "
+            f"(D6): profile={initiation.profile!r} refused")
+    bad = i26_authorized_initiation(initiation)
+    if bad:
+        raise DriveRefused("unauthorized initiation (I-26): "
+                           + "; ".join(bad))
+    events_before = len(s.flow_transition_events)
+    path = drive(s, world, run_id=run_id, max_steps=max_steps, until=until)
+    run = s.flow_runs[run_id]
+    events = len(s.flow_transition_events) - events_before
+    if run.state == "aborted":
+        # D7: the drive failed closed (e.g. the D3 check aborted the
+        # commit). Record it, surface it, do not retry, do not
+        # re-initiate — the wrapper returns; a new drive is a new
+        # initiation.
+        failure = {"kind": "drive_failed", "run_id": run_id,
+                   "terminal": run.current_state_id, "initiation": rec}
+        world.surfaced.append(failure)
+        return {"initiation": rec, "state": "failed", "path": path,
+                "events": events, "surfaced": failure}
+    return {"initiation": rec, "state": "done", "path": path,
+            "events": events, "surfaced": None}
 
 
 # ---------------------------------------------------------------------------
