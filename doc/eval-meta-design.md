@@ -179,3 +179,63 @@ operator direction.
 - GC'd context: accretion excludes cache by construction —
   claims about cached state are ungroundable, not merely
   ungrounded.
+
+## Glossary
+
+Self-containment rule: every acronym and specialized term
+used in this document is defined here. Citations point to
+the official definition; the inline definition stands
+alone — no other document need be opened.
+
+- **accretion-repo** — a git repository serving as the
+  durable store of a dsys installation's accreted state
+  (`etc/` + `var/`, minus cache directories). Canonical
+  label (ratified 2026-09-19; `git-store` is an alias).
+- **check 1..5** — the five pipeline checks: 1
+  falsifiability (§3), 2 claim↔cited-evidence logical
+  coherence (§4), 3 grounding (§5), 4 grounded-vs-cited
+  consistency (§6), 5 grounded-evidence↔claim coherence
+  (§7).
+- **D2–D5** — the four report dimensions (§8): D2
+  claim↔cited-evidence coherence, D3 grounding, D4
+  consistency, D5 grounded-evidence↔claim coherence.
+- **declared-mutation rule** — dsys's own files may be
+  mutated; undisclosed mutation is the failure mode
+  (doctor distinguishes pristine from mutated).
+- **declared trust** — the architecture's trust posture:
+  properties that are author-declared rather than
+  mechanically enforced (e.g. unpinned citations resolving
+  to the latest accreted commit).
+- **DRAFT** — proposed; not evaluated, not disposed.
+- **DR** — DecisionRecord: the architecture's
+  decision-recording entity.
+- **falsifiable** — there exists at least one observable
+  state whose observation would refute the claim (§3).
+- **Form A / Form B** — the two argument forms (§1): bare
+  `{claim}`, or `{claim} :: {citations}`.
+- **G6** — gate 6 of the decision-making playbook
+  (architecture §8.2): the open-questions slot —
+  deferred items, revisit triggers, unconsidered
+  alternatives. A G6 list records known gaps, not
+  oversights.
+- **GC'd** — garbage-collected. Cache directories are
+  excluded from the accreted set by construction, so
+  claims about cached state are ungroundable in
+  principle, not merely ungrounded in this evaluation.
+- **instance** — an installed dsys instantiation. The
+  operator's instance is the default binding (§5).
+- **N/A** — not applicable; always accompanied by the
+  reason, never silent (§8).
+- **refuse back** — explicit refusal with a redirect or a
+  reframing instruction, as opposed to silent
+  wrong-branch handling.
+- **SHA** — content hash identifying a git object (blob,
+  commit).
+- **standing taxonomy** — the falsification posture's
+  finding set: confirmed / refuted / decomposed.
+- **step 0** — scope determination (§2): whether the
+  claim's truth depends on instance state.
+- **synthesis** — report section 1 (§8): verdict plus the
+  compressed reasoning chain.
+- **unevaluable** — finding: an admissible claim with
+  insufficient grounded evidence; gaps named.
