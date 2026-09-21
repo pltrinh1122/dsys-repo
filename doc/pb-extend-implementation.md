@@ -70,7 +70,7 @@ For each applicable adoption conditional, produce one finding: **holds** (eviden
 9. **P4 — installability.** `install.sh` converges the new surface; `doctor` covers it; the operator's idempotency sequences hold.
 
 **Runtime-scope additions:**
-6. **R1 — deterministic replay preserved.** Existing transcripts still validate; new behavior replayable by construction (transcript re-validation, never behavioral re-execution). A runtime matter that cannot state its replay story → killed at START in governed mode (X2); would-kill in rehearsal.
+6. **R1 — deterministic replay preserved.** Existing transcripts still validate; new behavior replayable by construction (transcript re-validation, never behavioral re-execution). A runtime matter whose replay story (R1) fails at KEEP → refused in governed mode (X2); would-refuse in rehearsal. (X2 fires at KEEP, not START — spec §5, remediated 2026-09-21 per DR-CMD-026.)
 7. **R2 — golden run extended.** New golden-run cases cover the expansion, including refusal cases; full chain PASS, 0 violations.
 8. **R3 — validators for new invariants.** Every new invariant gets a validator (I-N); validators are predicates, not procedures.
 9. **R4 — zero inference in execution.** No inference inside automaton execution; inference stays outside with human-in-the-loop, reaching the core only as discrete step-changes.
@@ -78,7 +78,7 @@ For each applicable adoption conditional, produce one finding: **holds** (eviden
 
 Dual-scope matters evaluate both sets independently; the draft verdict is conjunctive (§7).
 
-Domain gates (spec §5): **X1** scope kill (unassignable scope after decomposition attempt → refused back for reframing); **X2** core-risk kill (no replay story → killed at START); **X3** spec-first kill (implementation without spec → refused wherever it appears). In rehearsal, fired gates are reported as would-kill findings with the gate cited.
+Domain gates (spec §5): **X1** scope kill (unassignable scope after decomposition attempt → refused back for reframing); **X2** core-risk kill (replay story fails at KEEP → refused); **X3** spec-first kill (implementation without spec → refused wherever it appears); **X4** duplicate-merge (duplicates a standing mechanism without naming the delta → refused back for narrowing/merging/superseding). In rehearsal, fired gates are reported as would-kill findings with the gate cited.
 
 ## 7. Draft verdict `[judgment]`
 
@@ -113,7 +113,7 @@ Conditionals:
   R3 validators for invariants: <...> — <...>
   R4 zero inference in execution: <...> — <...>
   R5 trust declared: <...> — <...>
-Gates: X1 <clear | fired | would-fire (rehearsal)>; X2 <...>; X3 <...>
+Gates: X1 <clear | fired | would-fire (rehearsal)>; X2 <...>; X3 <...>; X4 <...>
 Draft verdict: <adopt | adopt-with-conditions: <conditions> | refuse> — <one-line reason>
 Disposition: the operator's act (shared machinery; DecisionRecord discriminator `feature-expansion`)
 ```

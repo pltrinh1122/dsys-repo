@@ -1,6 +1,6 @@
 # Implementation: `/eval-sc` execution procedure
 
-**Status: DRAFT** — proposed 2026-09-20. Implements `doc/eval-sc-design.md` (DRAFT). Not evaluated, not disposed.
+**Status: ratified** — DR-CMD-025 (2026-09-21). Implements the validation routine declared in `doc/slash-commands/eval-sc.md`. Design counterpart: `doc/eval-sc-design.md` (ratified, DR-CMD-025).
 
 ## 0. Execution model
 

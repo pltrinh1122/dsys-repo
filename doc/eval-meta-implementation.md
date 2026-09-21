@@ -1,8 +1,6 @@
 # Implementation: `/eval-meta` execution procedure
 
-**Status: DRAFT** — proposed 2026-09-20. Implements
-`doc/eval-meta-design.md` (DRAFT). Not evaluated, not
-disposed.
+**Status: ratified** — DR-CMD-025 (2026-09-21). Implements the evaluation routine declared in `doc/slash-commands/eval-meta.md`. Design counterpart: `doc/eval-meta-design.md` (ratified, DR-CMD-025).
 
 ## 0. Execution model
 

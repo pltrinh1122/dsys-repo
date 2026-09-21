@@ -24,12 +24,11 @@
   for operator disposition). This file binds the command to the
   procedure; it does not restate it. The procedure runs the
   feature-expansion playbook, `doc/feature-expansion-playbook-spec.md`
-  (DRAFT, 2026-09-20 — designed per operator direction;
-  pending adoption via disposition). Until adopted, the
-  command runs the playbook in rehearsal: it stages the
+  (adopted 2026-09-21, DR-CMD-027; remediated per the DR-CMD-026
+  rehearsal). The command runs the playbook governed: it stages the
   matter, evaluates the adoption conditionals, and drafts the
-  verdict. It does not gate, decide, or record — disposition
-  remains the operator's act.
+  verdict; STOP kills are enforced and KEEP verdicts feed the shared
+  disposition machinery — disposition remains the operator's act.
 
 ## Originating matter (sole evidence)
 
@@ -59,10 +58,11 @@ requirement. A chat message is not authority.
 1. The command executes in the ambient layer only. It is never
    installed, never on the dsys CLI tree, never invokable by
    the automaton executor.
-2. Until the procedure is adopted, the command runs it in
-   rehearsal: staging, scoping, conditional evaluation, and
-   draft verdicts only. It does not gate, decide, or record —
-   records are written only on adoption of the procedure.
+2. The procedure is adopted (DR-CMD-027); the command runs it
+   governed: staging, scoping, conditional evaluation, draft
+   verdicts, enforced STOP kills, and KEEP verdicts feeding
+   disposition. It does not decide — records are written only
+   on the operator's disposition.
 3. Proposer ≠ disposer holds throughout: the ambient proposes;
    the operator disposes. The command never records a
    requirement on its own authority.

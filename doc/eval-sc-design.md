@@ -1,8 +1,6 @@
 # Design: `/eval-sc` — slash-command definition comparison against an exemplar
 
-**Status: DRAFT** — proposed 2026-09-20. Not evaluated, not
-disposed. Family membership in `eval-*` is proposed, not
-ratified (candidate DR-CMD-006 belongs to `/pb-decide`).
+**Status: ratified** — DR-CMD-025 (2026-09-21). Member of the `eval-*` validator family (DR-CMD-004/005 lineage).
 
 ## 1. Argument forms
 

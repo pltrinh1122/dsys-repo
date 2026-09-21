@@ -1,9 +1,6 @@
 # Design: `/eval-meta` — claim/evidence evaluation with accretion-repo grounding
 
-**Status: DRAFT** — proposed 2026-09-20. Not evaluated, not
-disposed. The ratified command definition
-(`doc/slash-commands/eval-meta.md`) stands; this design
-expands it on disposition.
+**Status: ratified** — DR-CMD-025 (2026-09-21). Member of the `eval-*` validator family (DR-CMD-004/005 lineage).
 
 ## 1. Argument forms
 

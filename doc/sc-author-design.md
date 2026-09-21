@@ -1,6 +1,6 @@
 # Design: `/sc-author` — slash-command triplet completion
 
-**Status:** active — created 2026-09-20 per operator direction. Design reasoning for the `/sc-author` triplet-completion routine. The normative procedure is `doc/sc-author-implementation.md`; the operator-facing contract is `doc/slash-commands/sc-author.md`. Per the standing principle, provenance and reasoning live here, not in the implementation doc.
+**Status: ratified** — DR-CMD-024 (2026-09-21). Design reasoning for the `/sc-author` triplet-completion routine. The normative procedure is `doc/sc-author-implementation.md`; the operator-facing contract is `doc/slash-commands/sc-author.md`. Per the standing principle, provenance and reasoning live here, not in the implementation doc.
 
 ## 1. What `/sc-author` is
 
@@ -34,7 +34,7 @@ From the contract: ambient layer only — never installed, never on the dsys CLI
 
 Authoring notes (durable):
 
-- 2026-09-20 (creation): built per operator direction ("create new slash command '/sc-author {matter}' that completes the required design, contract and implementation triplet artifacts. the triplet artifacts would need operator disposition before it can be deployed and used."). Created complete — the creation order is the disposition; no DRAFT phase, no DecisionRecord for the creation act (same practice as the remediation acts).
+- 2026-09-20 (creation): built per operator direction ("create new slash command '/sc-author {matter}' that completes the required design, contract and implementation triplet artifacts. the triplet artifacts would need operator disposition before it can be deployed and used."). ~~Created complete — the creation order is the disposition; no DRAFT phase, no DecisionRecord for the creation act (same practice as the remediation acts).~~ [Struck at ratification, DR-CMD-024 (2026-09-21): the creation order was not the disposition — the operator's explicit "ratify" is. The "Status: active" headers stood premature from 2026-09-20 until this record; struck-record kept as history of the agent's framing.]
 - 2026-09-20 (creation): the `sc-*` family declared with `/sc-author` as first member, following DR-CMD-001's namespace-first family argument (`pb-*`, `eval-*` precedents).
 - 2026-09-20 (creation): the rehearsal/governed-style regime question does not arise — `/sc-author`'s own procedure is created active, not draft-gated; only its *output* is DRAFT-for-disposition.
 - 2026-09-20 (creation): name provenance recorded in §4 — the anticipated verification harness (M5, DR-CMD-007 G6) is a distinct future instrument; this command is the authoring one.

@@ -1,6 +1,6 @@
 # Implementation: `/sc-author` execution procedure
 
-**Status:** active — created 2026-09-20 per operator direction. Implements the triplet-completion routine declared in `doc/slash-commands/sc-author.md`. Design counterpart: `doc/sc-author-design.md` (created with this doc; provenance and reasoning live there, per DR-CMD-010).
+**Status: ratified** — DR-CMD-024 (2026-09-21). Implements the triplet-completion routine declared in `doc/slash-commands/sc-author.md`. Design counterpart: `doc/sc-author-design.md` (ratified, DR-CMD-024).
 
 ## 0. Execution model
 
