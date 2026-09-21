@@ -879,7 +879,8 @@ def production_drive(s: SystemState, world: World,
                      initiation: DriveInitiation,
                      run_id: str = "fr-drive",
                      max_steps: int = 50,
-                     until: str | None = None) -> dict:
+                     until: str | None = None,
+                     acquisition: AcquisitionRecord | None = None) -> dict:
     """The production-drive contract's gated entry point. Returns the
     drive record: {initiation, state, path|None, events, surfaced|None}.
 
@@ -887,6 +888,11 @@ def production_drive(s: SystemState, world: World,
       names the component; the CLI maps it to exit 1).
     - I-26: violations refuse before anything runs — the drive does not
       start (the K3 tripwire as a gate, not a comment).
+    - Acquisition (DR-CMD-053 D1/D2/D3): a provided acquisition record
+      is re-checked against I-27 — fail fast before the drive starts.
+      The CLI surface builds the record via acquire_handle (process
+      side); the drive never resolves. The D3 per-write identity check
+      (K1 Q3(a), built) remains the backstop inside the drive.
     - D5: the manifest identity is resolved once, here, at initiation
       (process side); the committing tool's D3 check is a pure
       comparison against it (governed side — no file I/O in the tool).
@@ -913,6 +919,10 @@ def production_drive(s: SystemState, world: World,
     if bad:
         raise DriveRefused("unauthorized initiation (I-26): "
                            + "; ".join(bad))
+    # DR-CMD-053 (D1/D2/D3): the acquisition gate — fail fast at
+    # initiation, before anything runs. The record rides the drive
+    # record (the transcript envelope, R1).
+    _production_drive_acquisition(s, world, acquisition, rec)
     events_before = len(s.flow_transition_events)
     path = drive(s, world, run_id=run_id, max_steps=max_steps, until=until)
     run = s.flow_runs[run_id]
@@ -929,6 +939,136 @@ def production_drive(s: SystemState, world: World,
                 "events": events, "surfaced": failure}
     return {"initiation": rec, "state": "done", "path": path,
             "events": events, "surfaced": None}
+
+
+# ---------------------------------------------------------------------------
+# Acquisition contract (K1 Q3 (b)-half, DR-CMD-053) — resolution, failure
+# modes, lifetime. Settles the drive contract's D5 by specifying *how*:
+# the CLI surface (process side) reads the install config's
+# accretion.path at initiation, opens <path>/.git, verifies the
+# handle's dsys.repo-id against the manifest identity (fail fast —
+# the I-25 predicate applied at resolution), and presents the verified
+# handle to the bearer. The drive (governed side) never resolves.
+# ---------------------------------------------------------------------------
+
+class AcquisitionRefused(Exception):
+    """Acquisition refused before drive start: no resolvable path, a
+    non-git repo, a disabled accretion (no manifest identity), or an
+    identity mismatch at resolution. Refusal is not failure — nothing
+    ran, nothing was written, and the refusal is loud (D3, D7)."""
+
+
+@dataclass
+class AcquisitionRecord:
+    """The acquisition record (spec glossary): the transcript
+    envelope's record of the resolved path, the resolved identity,
+    and the I-27 verdict. Checked by I-27.
+
+    path_source: "flag" (the --accretion-path flag) | "config"
+        (accretion.path in etc/config.yaml) | "default" (the
+        <accretion-root>/{instance} rule) — the config contract's
+        precedence (D1).
+    """
+    path_source: str = "config"  # flag | config | default
+    path: str | None = None      # the resolved accretion path
+    git_available: bool = True   # <path>/.git is a valid git repo
+    manifest_identity: str | None = None   # the manifest-recorded
+    #    accretion_repo.identity (None = accretion disabled)
+    repo_identity: str | None = None       # the handle's dsys.repo-id
+    #    (None = the key is absent)
+    at_initiation: bool = True  # resolution happened at initiation,
+    #    process side, before drive start (D1)
+
+
+def i27_authorized_acquisition(rec: AcquisitionRecord) -> list[str]:
+    """I-27 (DR-CMD-053): authorized acquisition. A predicate over the
+    acquisition record, not a procedure. Violations: the path was not
+    resolved under the config contract's precedence; no path
+    resolvable; the repo is not a git repo (the D5a conjunct); the
+    manifest records no identity (accretion disabled); the handle has
+    no dsys.repo-id; the handle identity does not match the manifest
+    identity (fail fast — the I-25 predicate applied at resolution,
+    D2); resolution did not happen at initiation."""
+    v: list[str] = []
+    if rec.path_source not in ("flag", "config", "default"):
+        v.append(f"I-27: unknown path source: {rec.path_source!r}")
+    if not rec.path:
+        v.append("I-27: no accretion path resolvable under the config "
+                 "contract")
+    if not rec.git_available:
+        v.append("I-27: the handle is not a git repo (the D5a conjunct)")
+    if rec.manifest_identity is None:
+        v.append("I-27: the manifest records no accretion_repo.identity "
+                 "(accretion disabled)")
+    if rec.repo_identity is None:
+        v.append("I-27: the handle has no dsys.repo-id (missing key)")
+    if (rec.manifest_identity is not None and rec.repo_identity is not None
+            and rec.manifest_identity != rec.repo_identity):
+        v.append("I-27: the handle identity does not match the "
+                 "manifest-recorded identity (fail fast, D2)")
+    if not rec.at_initiation:
+        v.append("I-27: resolution did not happen at initiation "
+                 "(process side)")
+    return v
+
+
+def acquire_handle(manifest_identity: str | None,
+                   config_path: str | None = None,
+                   flag_path: str | None = None,
+                   default_path: str = "/var/daccretion/dsys-inst",
+                   git_available: bool = True,
+                   repo_identity: str | None = None) -> AcquisitionRecord:
+    """The acquisition mechanic (process side — the CLI surface's job;
+    enforcement at initiation belongs to the CLI surface, still
+    unimplemented, §3.7). Resolves the accretion path under the config
+    contract's precedence (flag > config > default — D1), opens
+    <path>/.git (modeled by git_available), verifies the handle's
+    dsys.repo-id against the manifest identity (fail fast — D2), and
+    returns the AcquisitionRecord. I-27 violations raise
+    AcquisitionRefused: the drive refuses before starting (D3).
+
+    The lifetime statement (D4) is structural, not procedural: there is
+    no rotation or revocation operation to call — identities are minted
+    at installation (World.__post_init__) and die with the
+    installation. The K3 edge (D5): the inputs are operator-owned
+    config; the mechanic never invents a path."""
+    if flag_path:
+        source, path = "flag", flag_path
+    elif config_path:
+        source, path = "config", config_path
+    else:
+        source, path = "default", default_path
+    rec = AcquisitionRecord(path_source=source, path=path,
+                            git_available=git_available,
+                            manifest_identity=manifest_identity,
+                            repo_identity=repo_identity,
+                            at_initiation=True)
+    bad = i27_authorized_acquisition(rec)
+    if bad:
+        raise AcquisitionRefused("acquisition refused (I-27): "
+                                 + "; ".join(bad))
+    return rec
+
+
+def _production_drive_acquisition(s: SystemState, world: World,
+                                  acquisition: "AcquisitionRecord | None",
+                                  rec: dict) -> None:
+    """The acquisition gate inside production_drive (D1/D2/D3): a
+    provided acquisition record is re-checked against I-27 — a drive
+    found post-hoc to violate I-27 is invalid — and recorded in the
+    drive record (the transcript envelope, R1). AcquisitionRefused is
+    fail-fast: the drive refuses before starting."""
+    if acquisition is None:
+        return
+    bad = i27_authorized_acquisition(acquisition)
+    if bad:
+        raise AcquisitionRefused("acquisition refused at initiation "
+                                 "(I-27): " + "; ".join(bad))
+    rec["acquisition"] = {
+        "path_source": acquisition.path_source,
+        "path": acquisition.path,
+        "resolved_identity": acquisition.repo_identity,
+    }
 
 
 # ---------------------------------------------------------------------------
