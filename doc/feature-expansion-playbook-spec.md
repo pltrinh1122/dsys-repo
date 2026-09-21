@@ -3,7 +3,14 @@
 **Status:** adopted 2026-09-21 (DR-CMD-027) — designed 2026-09-20
 per operator direction ("design `/pb-extend`"); remediated
 2026-09-21 per the DR-CMD-026 rehearsal (five-item fix list,
-§12). Applied governed via `/pb-extend` (see §10 Bootstrap).
+§12); amended 2026-09-21 per operator direction ("pattern
+covered in general"): conditional-matter type (§1, S1–S3, §6,
+§7); amended 2026-09-21 per operator direction (motivation):
+S5 motivation-stated, because-Z claim form, §7 motivation-fit
+lens; amended 2026-09-21 per operator direction (Z bites hardest):
+S5 load-bearing (the because-Z is the claim's identity), §7
+misplaced-Z invalid terminal (distinct from killed; returns only
+as a new matter). Applied governed via `/pb-extend` (see §10 Bootstrap).
 Invoked in chat via `/pb-extend`; bound at
 `doc/slash-commands/pb-extend.md`.
 
@@ -25,6 +32,21 @@ dsys" — proposed only, never evaluated, never disposed.)
 An expansion is not a mutation of an existing rung (that's the
 mutation playbook's domain) and not a general decision (that's
 `/pb-decide`). It is an *addition* to what dsys is.
+
+### Conditional matters
+
+A **conditional expansion** is an expansion whose existence is
+undisposed — the operator has not disposed it into existence, or the
+standing disposition is negative — but whose governed *shape* is worth
+designing now. The typical source is a falsification's repair
+direction ("*if* X is ever wanted, it needs Y"). The claim takes the
+conditional form: "*if* disposed, dsys should gain X such that Y, because Z."
+The matter designs the map, not the road: every conditional below
+runs against the hypothetical, and adopting the design is never
+adopting the expansion. A conditional matter whose Z is misplaced
+is invalid in full — the map is of a road to nowhere. The existential disposition stays with the
+operator, separate from the matter, before and after. (First
+instance: K3, the governed check-now path, 2026-09-21.)
 
 ## 2. Scope differentiation
 
@@ -71,16 +93,41 @@ Entry conditionals (all hold before the matter opens):
   vibe. The such-that clause should anticipate A5 — name the
   checkable procedure or acceptance signal, not just the
   capability. Vague matters are refused back for reframing.
+  *Conditional matters:* the claim takes the conditional form
+  ("*if* disposed, dsys should gain X such that Y"); the
+  such-that clause is checkable against the hypothetical.
 - **S2 — scope assigned.** Package or runtime, by the
   discriminating test. Dual-scope matters decomposed per §2.
+  *Conditional matters:* the discriminating test runs on the
+  hypothetical change. Scope assignment governs the design;
+  conjunctive adoption applies to the design, never to a build.
 - **S3 — proposer named.** Proposer ≠ disposer; the ambient
   never proposes on its own authority for its own expansions.
+  *Conditional matters:* no proposer is required. Instead the
+  **source of the conditional** is named (a kill's repair
+  direction, an operator-directed design, or equivalent), and the
+  existential disposition is recorded as open or
+  standing-negative. The ambient may draft the conditional design
+  at the operator's direction; drafting is not proposing.
 - **S4 — prior art cited.** The existing spec section (or
   "none" declared), the seed matter if relevant, related
   falsifications.
+- **S5 — motivation stated.** The world problem or capability
+  gap, as a concrete scenario: who is failed by the current
+  system, and how. One to two sentences, held to S1's anti-vibe
+  bar — "it would be nice" or "the operator wants it" is not a
+  gap. A matter without a statable gap is refused back for
+  reframing, same as a vague claim. With S5, the S1 claim reads
+  in full: "dsys should gain X such that Y, because Z" —
+  conditional matters: "*if* disposed, dsys should gain X such
+  that Y, because Z." S5 is load-bearing, not one gate among
+  five: the because-Z is the matter's foundation. The claim's
+  identity includes its Z — a new Z is a new matter, not a
+  reframing. A matter whose Z is later found misplaced is invalid
+  in full; see §7.
 
 **DoD (START complete):** claim framed, scope assigned,
-proposer named, prior art cited. Nothing evaluated yet.
+proposer named, prior art cited, motivation stated. Nothing evaluated yet.
 
 ## 4. Adoption conditionals
 
@@ -182,6 +229,11 @@ G5/G6 operate at KEEP (§7).
   hermeticity broken) → kill; may re-enter START with new
   evidence. A kill is not a verdict on the idea's worth —
   killed matters may return reframed.
+- *Conditional matters:* STOP kills the design, not the idea.
+  The existential disposition is the operator's and is
+  unaffected by the kill; a killed conditional design may return
+  reframed, and the standing-negative (or open) existential is
+  unchanged.
 
 ## 7. KEEP — deliver the adoption verdict
 
@@ -198,6 +250,29 @@ unevaluated), each citing its evidence; overall draft verdict:
   unevaluated conditionals — reframe and re-enter START) or
   `killed` (a conditional fails or an X-gate fires —
   substantive).
+
+**Motivation-fit.** KEEP checks one relation that is not a
+conditional: does the evaluated design serve the stated Z (S5)?
+Two tiers:
+
+- *Fit failure* — the Z is real but the design does not serve
+  it. Refused back as `not-ready`: reframe the design or restate
+  the motivation. The conditionals verify the mechanism; fit
+  verifies the point.
+- *Misplaced Z* — the gap does not exist, or the request is
+  solution-first with a post-hoc Z. The **complete request is
+  invalid**: terminal, and distinct from `killed`. A killed
+  matter may return reframed (§6); an invalid matter returns
+  only as a **new** matter — new S1–S5, new lineage — because the
+  because-Z is part of the claim's identity. The DecisionRecord
+  records the invalidity and the evidence, so the future matter
+  can cite it as prior art.
+
+The Z makes a world-claim, and world-claims are checkable: KEEP
+judges misplacement on cited evidence (the Z asserts operators
+have no recourse; the recourse is exhibited). The operator may
+also find misplacement at disposition — that is `reject`, with
+the reason recorded.
 
 **The verdict is a recommendation, not an adoption.**
 Disposition is the operator's act, through the shared
@@ -227,6 +302,26 @@ The draft never rejects; the operator never refuses — the
 draft recommends, the operator disposes. (Per E5, the
 operator's silence is NO_DECISION: an unratified adopt verdict
 leaves the matter open; it does not reject it.)
+
+**Conditional-matter verdicts.** KEEP evaluates the *design*
+against the conditionals exactly as for a live matter, but the
+verdicts attach to the design, never to the expansion:
+
+- **adopt-the-design** — the governed shape is sound; the road
+  stays undisposed.
+- **adopt-the-design-with-conditions** — as above, with
+  remediable evidence gaps stated as checkable and finite.
+- **refuse** — the design fails; the natural terminal is
+  **refuse-with-a-map**: the expansion is refused *and* the
+  governed shape is recorded for a future disposition.
+
+Invariant: **adopting the design is never adopting the
+expansion.** A DecisionRecord on a conditional matter records the
+map and the still-open (or standing-negative) existential
+disposition; it authorizes no build. If the operator later
+disposes the existential affirmatively, the expansion re-enters
+as a live matter at START — the recorded design is prior art
+(S4), not a pre-adoption.
 
 G5 binds the DecisionRecord; G6 tags uncertainties.
 
