@@ -43,8 +43,9 @@ executes the comparison, is the standard against which
 future slash-command definitions are compared. The
 choice is grounded in the command's own anatomy: the
 definition carries every S1 section (Kind, Lineage,
-Trigger, Support, Function/Procedure, Output contract,
-Boundaries, Placement), so it exemplifies the form it
+Family, Description, Trigger, Support, Exemplar,
+Function/Procedure, Output contract, Boundaries,
+Placement), so it exemplifies the form it
 specifies; the procedure exemplifies the execution the
 Function/Procedure section binds. Together the pair
 exemplifies S5 form discipline: literals quoted as
@@ -90,8 +91,9 @@ but roles match — reported with reasons.
 
 - **S1 — Section anatomy.** Map the target's sections
   onto the exemplar's section set: Kind, Lineage,
-  Trigger, Support, Function/Procedure, Output contract,
-  Boundaries, Placement. Per section: **conforms**
+  Family, Description, Trigger, Support, Exemplar,
+  Function/Procedure, Output contract, Boundaries,
+  Placement. Per section: **conforms**
   (present, same role) / **deviates** (present but
   different role or scope — cited) / **absent**. Extra
   target sections are listed, never penalized.

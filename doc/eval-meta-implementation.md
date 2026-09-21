@@ -8,8 +8,8 @@ disposed.
 
 `/eval-meta` is executed by the ambient agent in the
 invoking chat session. "Execution" means the agent
-performs this procedure: parse, scope, the five checks,
-and the two-section report. Steps marked **[mechanical]**
+performs this procedure: parse, branch redirect and scope
+(step 0), the five checks, and the two-section report. Steps marked **[mechanical]**
 are exact commands. Steps marked **[judgment]** require
 the agent's reasoning, reported with reasons, never bare
 verdicts. The agent never writes to the accretion repo,
@@ -28,10 +28,41 @@ Input line: `/eval-meta {matter}`.
 3. CLAIM = text before the delimiter, trimmed.
    CITATIONS = the list after it, one per line or
    comma-separated, trimmed.
+4. Matter-form resolution (mechanical): the contract admits
+   inline text, a repo path, or a named artifact. Apply to
+   CLAIM (Form A: the matter; Form B: the text before the
+   delimiter), in this order:
+   - repo file (optionally `@<commit>`) → read via the
+     working tree, or `git show` at the named commit;
+   - DecisionRecord identifier (`DR-*`) → its record under
+     `doc/decision-records/`;
+   - `/name` → its contract under `doc/slash-commands/`.
+   The document's content becomes the claim. Otherwise the
+   text is inline: the claim as stated. Text that is
+   path-shaped (contains `/` or ends in `.md`),
+   identifier-shaped (`DR-*`), or name-shaped (starts with
+   `/`) but resolves to nothing → refuse back, no report:
+   `Refused back: cannot resolve matter <original>.`
 
-## 2. Step 0 — scope determination **[judgment]**
+## 2. Step 0 — branch redirect and scope determination **[judgment]**
 
-Ask: does the claim's truth depend on instance state
+Branch redirect first — shape is checked before scope. If the
+claim is playbook-shaped (decision machinery: framing, options,
+gates, disposition — the comparability threshold of
+`doc/eval-pb-implementation.md` §3, cited not restated) →
+refuse back, no report. Exact text:
+
+> Refused back: playbook-shaped matter — redirect to `/eval-pb`.
+
+If the claim is run-book-shaped (sequential procedure —
+glossary "Run-book", cited not restated) → refuse back, no
+report. Exact text:
+
+> Refused back: run-book-shaped matter — redirect to `/eval-rb`.
+
+Explicit refusal, never silent wrong-branch evaluation.
+
+Then scope: ask: does the claim's truth depend on instance state
 (installed tree, accreted history, runtime behavior)?
 State the answer with one reason.
 
@@ -256,6 +287,6 @@ alone.
   earlier dimension stopped the pipeline.
 - **refuse back** — explicit refusal with usage,
   reframing instruction, or redirect — never silent.
-- **step 0** — scope determination (§2).
+- **step 0** — branch redirect and scope determination (§2).
 - **unevaluable** — finding: admissible claim,
   insufficient grounded evidence; gaps named.

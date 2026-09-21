@@ -2,8 +2,9 @@
 
 - **Kind:** custom slash-command (operator-invoked routine of the
   ambient agent).
-- **Renamed** 2026-09-20: `/pb-eval` → `/meta-eval` (ratified,
-  DR-CMD-002); **renamed** 2026-09-20: `/meta-eval` →
+- **Lineage:** authored 2026-09-20 on operator direction as
+  `/pb-eval`; **renamed** 2026-09-20: `/pb-eval` → `/meta-eval`
+  (ratified, DR-CMD-002); **renamed** 2026-09-20: `/meta-eval` →
   `/eval-meta` (ratified, DR-CMD-005). Playbook/run-book
   validation split off to `/eval-pb` and `/eval-rb`
   (DR-CMD-003, renamed DR-CMD-004). This command is the
@@ -15,10 +16,17 @@
   falsifiable claims, no type declared — the falsification
   posture, which stands outside the claim, including claims
   *about* validations).
+- **Description:** structured evaluation of a matter as a
+  falsifiable claim — adversarial test in the standing
+  falsification posture; findings reported as confirmed /
+  refuted / decomposed.
 - **Trigger:** the operator invokes `/eval-meta {matter}` in chat.
+  Form B — `/eval-meta {claim} :: {citations}`: the claim with
+  cited evidence (one citation per line or comma-separated).
   Braces denote a required argument: a bare `/eval-meta` with no
   matter is refused back. The matter may be inline text, a repo
-  path, or a named artifact.
+  path, or a named artifact. Example:
+  `/eval-meta {install is idempotent}`.
 - **Support:** agent recognition, for the chat window. Same
   standing as `/pb-decide`: not a platform hook, not a client
   slash-command, not a Muse skill.
@@ -30,6 +38,14 @@
   Evaluation is not decision: `/eval-meta` never ratifies,
   never disposes, never writes DecisionRecords. If the matter
   calls for a decision, the operator invokes `/pb-decide`.
+- **Procedure (normative):** `doc/eval-meta-implementation.md`.
+  This file binds the command to the procedure; it does not
+  restate it.
+- **Output contract:** the two-section report (Synthesis +
+  Dimension assessment), delivered in chat. Verdicts:
+  confirmed / refuted / decomposed / unevaluable. Findings
+  are reported, never repaired — repair is a mutation matter
+  for `/pb-decide`.
 
 ## Redirect
 

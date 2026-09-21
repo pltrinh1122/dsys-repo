@@ -24,6 +24,9 @@
   (decision-making)", normative in
   `doc/dyad-architecture-doc.md` §8.2, second exemplar
   `doc/dsys-mutation-playbook-spec.md`.
+- **Procedure (normative):** `doc/eval-pb-implementation.md`.
+  This file binds the command to the procedure; it does not
+  restate it.
 
 ## Check dimensions
 
@@ -35,6 +38,18 @@
 - Records writable only on disposition.
 - Plane discipline: a procedure you follow, not a node you
   command — sequencing belongs to run-books.
+- Exercise declared: the candidate cites at least one
+  executed run (transcript or record ref) exercising the
+  admit and kill paths. Presence checked, never
+  quality-judged — quality is disposition's job (G5).
+- Trigger declared: states when the playbook applies and
+  the non-trigger cases where it does not.
+- Output format specified: the record/report shape the
+  playbook produces is defined (template or schema
+  cited), not left to per-run invention.
+- Gates at G1 precision: admission/kill gates stated
+  precisely enough to fail — a gate no matter could
+  fail is decoration.
 
 ## Admission
 
