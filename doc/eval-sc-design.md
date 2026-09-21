@@ -246,8 +246,14 @@ fully mechanical — honest about which parts are which.
   the then-standing `/pb-decide` exemplar; under the
   self-referential exemplar this invocation is refused
   back as vacuous self-comparison).
-- Family membership ratification (candidate DR-CMD-007)
+- Family membership ratification (candidate DR-CMD-009)
   via `/pb-decide`.
+- Machine-readable header (deferred): a future `sc-author`
+  harness with mechanical verification will need a
+  parseable metadata header on slash-command definitions
+  (name, family, version, status — shape TBD with the
+  harness). Until the harness is specified, prose headers
+  stand.
 
 ## Glossary
 

@@ -51,7 +51,7 @@
 - Numbering note: DR-CMD-006 had been named as the
   candidate number for `/eval-sc` family-membership
   ratification (`doc/eval-sc-design.md` G6); that
-  candidacy moves to DR-CMD-007.
+  candidacy moves to DR-CMD-009.
 
 ## Uncertainties (G6)
 

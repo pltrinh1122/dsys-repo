@@ -10,13 +10,21 @@ disposed.
 invoking chat session. "Execution" means the agent
 performs this procedure: parse, resolve, admit, the two
 comparisons, and the three-section report. Steps marked
-**[mechanical]** are exact operations. Steps marked
-**[judgment]** require the agent's reasoning, reported
-with reasons, never bare verdicts. The agent never
+`[mechanical]` are exact operations. Steps marked
+`[judgment]` require the agent's reasoning, reported
+with reasons, never bare verdicts. Steps marked
+`[mechanical + judgment]` combine both regimes: what is
+exact is performed exactly; what requires matching or
+classification requires reasoning, stated in one line.
+A section marked `[mechanical format, judgment
+content]` has a mechanical format — its template is
+followed exactly — and judgment content — every
+finding carries reasons and citations, never bare
+verdicts. The agent never
 writes to the compared definitions, the repo, or any
 record store during execution.
 
-## 1. Parse the invocation **[mechanical]**
+## 1. Parse the invocation `[mechanical]`
 
 Input line: `/eval-sc {matter}`.
 
@@ -35,7 +43,7 @@ Input line: `/eval-sc {matter}`.
    (design §1) → refuse back with the grammar, no
    report.
 
-## 2. Resolve pointers **[mechanical]**
+## 2. Resolve pointers `[mechanical]`
 
 Resolution root: the local dsys-repo checkout (the
 working tree the ambient agent operates in).
@@ -56,18 +64,19 @@ report. Target resolving to either exemplar document
 (contract or procedure) → refuse back
 (`vacuous self-comparison`), no report.
 
-## 3. Admission — definition-shape verification **[judgment]**
+## 3. Admission — definition-shape verification `[judgment]`
 
 Does the target provide instructions/guidance for
 agent execution? Markers: a named command, a trigger,
 a procedure or function the agent is to perform.
 A spec, a transcript, or a general claim is not
 definition-shaped → refuse back with redirect
-(`/eval-meta` for general matters), no report. The
-agent verifies the operator's branch declaration; it
-does not classify.
+(`/eval-pb` for playbook matters, `/eval-rb` for
+run-book matters, `/eval-meta` for general matters),
+no report. The agent verifies the operator's branch
+declaration; it does not classify.
 
-## 4. Structural comparison **[mechanical + judgment]**
+## 4. Structural comparison `[mechanical + judgment]`
 
 Map the target's sections onto the contract exemplar's
 set —
@@ -101,7 +110,7 @@ cited:
   outputs): conforms / deviates: <note> / N/A:
   <reason>.
 
-## 5. Semantic comparison **[judgment]**
+## 5. Semantic comparison `[judgment]`
 
 Meaning against meaning, each dimension with reasons
 and citations to the exact target/exemplar lines:
@@ -133,7 +142,7 @@ Findings: conforms / deviates: <cite> / N/A: <reason>.
 No short-circuit between the axes; N/A is never
 silent.
 
-## 6. Report **[mechanical format, judgment content]**
+## 6. Report `[mechanical format, judgment content]`
 
 ```text
 /eval-sc report
@@ -168,7 +177,15 @@ M4 - intent-procedure coherence: <conforms | deviates: <cite> | N/A: <reason>>
 M5 - single-concern human verifiability: <conforms | deviates: <cite> | N/A: <reason>>
 ```
 
+Before delivering, verify: three sections present;
+every S/M finding carries a verdict; every
+"deviates" carries a citation; no bare verdicts;
+neither axis short-circuited. A failed check is
+repaired in the report, never waived.
+
 ## 7. Worked example
+
+### Historical — pre-pair exemplar (2026-09-20)
 
 Test-drive 2026-09-20 (this procedure, executed for
 real — §8). Invocation:
@@ -232,6 +249,69 @@ M4 - intent-procedure coherence: conforms (stage/scope/evaluate-draft/
   recommend deliverable by the drafted procedure; rehearsal status explicit)
 ```
 
+### Current — pair exemplar (2026-09-20)
+
+Test-drive 2026-09-20 (this procedure, executed for
+real — §8). Invocation:
+
+```text
+/eval-sc /eval-pb
+```
+
+Resolution: target → `doc/slash-commands/eval-pb.md`
+@ working tree (0fb3091, clean); exemplar contract →
+`doc/slash-commands/eval-sc.md` @ working tree
+(0fb3091, modified); exemplar procedure →
+`doc/eval-sc-implementation.md` @ working tree
+(0fb3091, modified). Admission: definition-shaped
+(named command, trigger, validation function); not
+self-comparison.
+
+Report:
+
+```text
+/eval-sc report
+Target: /eval-pb -> doc/slash-commands/eval-pb.md @ 0fb3091 (working tree, clean)
+Exemplar (contract): /eval-sc -> doc/slash-commands/eval-sc.md @ 0fb3091 (working tree, modified)
+Exemplar (procedure): doc/eval-sc-implementation.md @ 0fb3091 (working tree, modified)
+
+1. Synthesis
+Verdict: conforms
+Structural axis: conforms (S1–S5). Semantic axis: conforms (M1–M5).
+The target reproduces the exemplar's anatomy role for role —
+named command, lineage, trigger with required-argument grammar,
+agent-recognition support, declared function, output contract,
+ambient-only boundaries, repo placement — and holds the family's
+authority posture (proposer≠disposer; validation≠decision;
+findings advisory; disposition belongs to /pb-decide). Its
+redirect table (/eval-rb, /eval-meta) matches the family's
+pattern. Extra sections (Family, Check dimensions, Admission)
+listed, not penalized.
+
+2. Structural comparison
+S1 - section anatomy:
+  - Kind: conforms (identical: operator-invoked routine of the ambient agent)
+  - Lineage: conforms (Derived/Renamed bullets fill the lineage role)
+  - Trigger: conforms (/eval-pb {matter}; braces required; bare refused; invocation is the branch declaration)
+  - Support: conforms (agent recognition, chat window; same standing as /pb-decide)
+  - Function/Procedure: conforms (semantic validation declared; normative definition cited not restated; check dimensions inline)
+  - Output contract: conforms (per-dimension findings cited + overall verdict; reported never repaired)
+  - Boundaries: conforms (ambient-only; read-never-rewrite; evaluation≠decision)
+  - Placement: conforms (dsys-repo doc/slash-commands/; project not product)
+  - (extra sections: Family, Check dimensions, Admission)
+S2 - trigger/argument grammar: conforms (operator invocation in chat; matter character declared: "a procedure claiming the playbook form")
+S3 - output contract: conforms (per-dimension conforms/deviates/undefined-against + overall verdict, each citing the normative clause)
+S4 - boundary form: conforms (ambient-only; no install/CLI/automaton; findings advisory)
+S5 - form discipline: conforms (prose contract layer; literals code-spanned; no rendering-only meaning; declarative throughout)
+
+3. Semantic comparison
+M1 - terminological coherence: conforms (matter, disposition, ambient, operator, branch declaration per family usage; "binding" mildly unclear, not contradictory)
+M2 - authority coherence: conforms (validation≠decision; never ratifies/disposes/writes DecisionRecords; files only on operator direction)
+M3 - guidance non-contradiction: conforms (same trigger/support form; redirect table coherent with the family pattern)
+M4 - intent-procedure coherence: conforms (six check dimensions + admission rule ground every promised output)
+M5 - single-concern human verifiability: conforms (one concern, ~60 lines, six-bullet dimensions; no extensive execution)
+```
+
 ## 8. Test-drive record
 
 2026-09-20: the worked example in §7 was executed for
@@ -246,6 +326,20 @@ refusal paths were exercised in this run; the
 unresolvable-pointer and self-comparison refusals are
 specified (§2) but not yet test-driven — recorded as a
 gap, not a finding.
+
+2026-09-20: second test-drive, executed for real by the
+ambient agent in-chat: parse (Form A —
+`/eval-sc /eval-pb`), pointer resolution (target
+`doc/slash-commands/eval-pb.md` clean at 0fb3091;
+exemplar pair as modified working-tree bytes at
+0fb3091), admission (definition-shaped; not
+self-comparison), S1–S5 mapped against the pair
+exemplar, M1–M5 assessed with line citations,
+three-section report produced under the pair-exemplar
+header, pre-delivery checklist passed. Verdict:
+conforms on both axes. Recorded as the current worked
+example in §7; the earlier example is retained as
+history (pre-pair exemplar).
 
 ## Glossary
 
