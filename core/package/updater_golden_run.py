@@ -34,6 +34,18 @@ K1 repair acceptances (DR-CMD-039, spec §Acceptance + I-18/19/20):
   D4b. Bounded residual: drive N's terminal edge rides drive N+1's commit.
   D5a. git absent -> run_aborted -> failed (hard dependency, fail-closed).
 
+K1 Q3a acceptances (DR-CMD-047, spec §Acceptances + I-25):
+  A1. Matching identity (fixture installation mints both sides
+      consistently, D1) -> the drive commits; the payload is
+      byte-identical (R1).
+  A2. Wrong identity (dsys.repo-id != manifest) -> run_aborted ->
+      failed; refused, never silently skipped.
+  A3. Missing key on either side (no dsys.repo-id; manifest records
+      no identity) -> run_aborted -> failed.
+  A4. Not-a-repo -> run_aborted -> failed (the D5a case, unchanged).
+  R3. I-25 fires on mismatch, on each missing key, and on the D5a
+      conjunct; clean on the bound triple.
+
 Returns {'violations': [...], 'refusals': [...], 'ok': bool}.
 """
 from __future__ import annotations
@@ -52,6 +64,8 @@ from .updater import (
     i18_commit_completeness,
     i19_payload_canonicity,
     i20_append_only,
+    i25_identity_binding,
+    mint_repo_identity,
     path_hash,
     replay,
 )
@@ -482,6 +496,83 @@ def run() -> dict:
     assert any("I-18" in x for x in bad23), \
         f"I-18 must fire on the gapped commit: {bad23}"
     refusals.append("I-18 fired on the gapped commit")
+
+    # 24. (K1 Q3a-A1) matching identity -> the drive commits. The
+    # fixture installation mints both sides consistently (D1); the
+    # I-25 predicate is clean; the committing tool writes.
+    s24 = build_updater_state("fr-a24")
+    w24 = World(feed_version="0.1.1", installed_version="0.1.0",
+                updater_policy="auto")
+    assert w24.manifest_repo_identity is not None
+    assert w24.accretion_repo_id == w24.manifest_repo_identity, \
+        "the fixture installation mints both sides consistently (D1)"
+    assert i25_identity_binding(w24.manifest_repo_identity,
+                                w24.accretion_repo_id,
+                                w24.git_available) == []
+    path24 = drive(s24, w24, "fr-a24")
+    assert path24 == FULL_PATH, f"unexpected path: {path24}"
+    assert len(w24.accretion_commits) == 1, "matching identity commits"
+    assert i19_payload_canonicity(w24.accretion_commits[0]) == [], \
+        "the identity check leaves the payload byte-identical (R1)"
+    refusals.append("matching repo identity: the drive committed (D3)")
+
+    # 25. (K1 Q3a-A2) wrong identity -> run_aborted -> failed: the
+    # handle resolves to a repo that is not this installation's —
+    # fail closed, nothing committed, nothing silently skipped.
+    s25 = build_updater_state("fr-a25")
+    w25 = World(feed_version="0.1.1", installed_version="0.1.0",
+                updater_policy="auto")
+    w25.accretion_repo_id = "00000000-0000-0000-0000-000000000000"
+    path25 = drive(s25, w25, "fr-a25")
+    assert path25[-2:] == ["urm-committing", "urm-failed"], \
+        f"wrong identity must fail the drive: {path25}"
+    assert s25.flow_runs["fr-a25"].state == "aborted"
+    assert w25.accretion_commits == [], "refused commit writes nothing"
+    refusals.append("wrong repo identity failed the drive closed (D3)")
+
+    # 26. (K1 Q3a-A3) missing dsys.repo-id -> run_aborted -> failed:
+    # the missing key is a binding failure, not a default-allow.
+    s26 = build_updater_state("fr-a26")
+    w26 = World(feed_version="0.1.1", installed_version="0.1.0",
+                updater_policy="auto")
+    w26.accretion_repo_id = None
+    path26 = drive(s26, w26, "fr-a26")
+    assert path26[-2:] == ["urm-committing", "urm-failed"], \
+        f"missing repo key must fail the drive: {path26}"
+    assert w26.accretion_commits == [], "refused commit writes nothing"
+    refusals.append("missing dsys.repo-id failed the drive closed (D3)")
+
+    # 27. (K1 Q3a-A3) manifest records no identity -> run_aborted ->
+    # failed: the minter's record is absent, so there is nothing to
+    # verify against — fail closed.
+    s27 = build_updater_state("fr-a27")
+    w27 = World(feed_version="0.1.1", installed_version="0.1.0",
+                updater_policy="auto")
+    w27.manifest_repo_identity = None
+    path27 = drive(s27, w27, "fr-a27")
+    assert path27[-2:] == ["urm-committing", "urm-failed"], \
+        f"missing manifest identity must fail the drive: {path27}"
+    assert w27.accretion_commits == [], "refused commit writes nothing"
+    refusals.append("missing manifest identity failed the drive closed")
+
+    # 28. (K1 Q3a-R3) I-25 fires on every violation shape and is clean
+    # on the bound triple — the predicate, not the procedure.
+    good_id = mint_repo_identity()
+    assert i25_identity_binding(good_id, good_id, True) == []
+    bad28a = i25_identity_binding(good_id, mint_repo_identity(), True)
+    assert any("I-25" in x and "match" in x for x in bad28a), \
+        f"I-25 must fire on mismatch: {bad28a}"
+    bad28b = i25_identity_binding(good_id, None, True)
+    assert any("I-25" in x and "dsys.repo-id" in x for x in bad28b), \
+        f"I-25 must fire on the missing repo key: {bad28b}"
+    bad28c = i25_identity_binding(None, good_id, True)
+    assert any("I-25" in x and "manifest" in x for x in bad28c), \
+        f"I-25 must fire on the missing manifest identity: {bad28c}"
+    bad28d = i25_identity_binding(good_id, good_id, False)
+    assert any("I-25" in x and "D5a" in x for x in bad28d), \
+        f"I-25 must fire on the D5a conjunct: {bad28d}"
+    refusals.append("I-25 fired on mismatch, missing keys, and the "
+                    "D5a conjunct; clean on the bound triple")
 
     return {"violations": violations, "refusals": refusals, "ok": True}
 

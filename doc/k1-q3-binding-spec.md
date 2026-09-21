@@ -1,7 +1,10 @@
 # K1 Q3(a) spec: the repository-handle identity binding
 
-**Status: ADOPTED (DR-CMD-047)** — disposed 2026-09-21.
-Not built: the build follows on the operator's separate direction.
+**Status: ADOPTED (DR-CMD-047), BUILT 2026-09-21** — verified,
+uncommitted. Adopted 2026-09-21 (all DR-CMD-046 spec-stage
+conditions met in-spec). Built 2026-09-21 on the operator's direct
+"Yes, build it" — the separate direction DR-CMD-047 required; see
+"Build evidence" below — four golden runs, all PASS.
 
 **Matter:** *k1-q3-repo-handle*, (a)-half only: minting +
 provenance + the identity check as a contract. The (b)-half
@@ -133,3 +136,44 @@ identity itself never enters the committed payload.
 - **Accretion repo:** the git repo holding the installation's
   accretion records — the system's memory of its own updates
   (K1 D6: append-only).
+
+## Build evidence (2026-09-21)
+
+**Implementation.** `core/package/updater.py`: `World` gains
+`manifest_repo_identity` (the installation manifest's
+`accretion_repo.identity`, D1) and `accretion_repo_id` (the
+handle's `dsys.repo-id`, D2); `None` = the key is absent on that
+side. `__post_init__` mints both consistently — the fixture's
+World is an installed system, and the fixture performs the mint
+on the installer's behalf via `mint_repo_identity()` (UUIDv4);
+an explicit one-sided construction is a deliberate (possibly
+broken) scenario and is left untouched.
+`_tool_commit_accretion` gains the pre-write identity check
+immediately after the D5a check (D3): I-25 violations raise
+`ToolAborted` — fail closed, abort-not-retry (D4a),
+`run_aborted → failed`, nothing committed. `i25_identity_binding`
+(R3) is the predicate over (manifest, handle): missing key on
+either side, mismatch, and the D5a conjunct are violations.
+
+**Install-root plumbing (build-detail).** The fixture's World
+carries the manifest-recorded identity directly — the tool reads
+it from the World as it would read the installed environment.
+The production tool obtains the manifest identity from the real
+manifest at the install root and the handle identity from
+`git config dsys.repo-id`; the contract pinned here is
+verify-before-write / fail-closed, not file paths. The
+installer-side mint remains a contract for the installer-spec
+(D5).
+
+**Golden runs — all PASS.**
+- Updater (`updater_golden_run.py`): cases 24–28. Matching
+  identity → the drive commits, payload byte-identical (R1 —
+  `i19_payload_canonicity` clean). Wrong identity, missing
+  `dsys.repo-id`, missing manifest identity → `committing →
+  failed`, nothing committed. I-25 unit checks: fires on
+  mismatch, on each missing key, and on the D5a conjunct; clean
+  on the bound triple.
+- Bridge: PASS (compiled-entity hashes unchanged).
+- Main package: PASS, 0 violations.
+- Scenario simulation: PASS — the I-22 simulation-refusal case
+  is unaffected (minted identity lets it reach the I-22 check).

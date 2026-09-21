@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -256,9 +257,37 @@ class World:
     # golden run pins the contract the production tool must honor.
     accretion_commits: list[dict] = field(default_factory=list)
     git_available: bool = True  # K1 D5a: git is a hard dependency
+    # K1 Q3a (DR-CMD-047): the identity binding. The installation
+    # manifest records accretion_repo.identity (the minter's record,
+    # D1); the repo's git config carries dsys.repo-id (the handle's
+    # identity, D2). None = the key is absent on that side. The
+    # fixture's World is an installed system, so __post_init__ mints
+    # both sides consistently; a golden-run case breaks one side to
+    # exercise the refusal.
+    manifest_repo_identity: str | None = None
+    accretion_repo_id: str | None = None
     # K1 D3: standing (default — the operator's standing disposition covers
     # journaling) | operator (autonomous drive cannot prompt: refuse).
     accretion_commit_authority: str = "standing"
+
+    def __post_init__(self):
+        # K1 Q3a D1: installation mints the repo identity once and
+        # records it in both places. The default World is an installed
+        # system; an explicit one-sided construction is a deliberate
+        # (possibly broken) scenario and is left untouched.
+        if (self.manifest_repo_identity is None
+                and self.accretion_repo_id is None):
+            minted = mint_repo_identity()
+            self.manifest_repo_identity = minted
+            self.accretion_repo_id = minted
+
+
+def mint_repo_identity() -> str:
+    """K1 Q3a D1: the installer mints the repo UUID (UUIDv4). The
+    golden-run fixture performs the mint on the installer's behalf —
+    the contract (field, format, write-both-places) is what is pinned;
+    the installer-spec implements the real mint."""
+    return str(uuid.uuid4())
 
 
 def _bump(old: str, new: str) -> str:
@@ -431,6 +460,17 @@ def _tool_commit_accretion(ctx: dict, w: World) -> None:
     if not w.git_available:
         raise ToolAborted("git not available: the drive's durability "
                           "guarantee rests on git (D5a) — refusing")
+    # D3 (K1 Q3a, DR-CMD-047): the identity check extends D5a. Before
+    # every write, the handle's repo identity (dsys.repo-id) must equal
+    # the manifest-recorded accretion_repo.identity; mismatch — or a
+    # missing key on either side — fails closed: abort, not retry
+    # (D4a), no commit, run_aborted -> failed.
+    bad_binding = i25_identity_binding(w.manifest_repo_identity,
+                                       w.accretion_repo_id,
+                                       w.git_available)
+    if bad_binding:
+        raise ToolAborted("identity binding failed (D3): "
+                          + "; ".join(bad_binding))
     if w.accretion_commit_authority == "operator":
         # Autonomous operation cannot prompt (no terminal): refuse loudly,
         # never silently skip (D3 — composes with K2's fail-closed
@@ -555,6 +595,29 @@ def i20_append_only(commits: list[dict]) -> list[str]:
             v.append(f"I-20: overlapping commit ranges "
                      f"{a['first_seq']}-{a['last_seq']} and "
                      f"{b['first_seq']}-{b['last_seq']}")
+    return v
+
+
+def i25_identity_binding(manifest_identity: str | None,
+                         repo_identity: str | None,
+                         git_available: bool) -> list[str]:
+    """I-25 (K1 Q3a, DR-CMD-047): the committing tool writes only to a
+    handle whose repo identity (dsys.repo-id) equals the
+    manifest-recorded accretion_repo.identity. A predicate over
+    (manifest, handle), not a procedure. Violations: identity missing
+    on either side; mismatch; the D5a conjunct (the handle is not a
+    git repo)."""
+    v: list[str] = []
+    if not git_available:
+        v.append("I-25: handle is not a git repo (D5a conjunct)")
+    if manifest_identity is None:
+        v.append("I-25: manifest records no accretion_repo.identity")
+    if repo_identity is None:
+        v.append("I-25: handle has no dsys.repo-id (missing key)")
+    if (manifest_identity is not None and repo_identity is not None
+            and manifest_identity != repo_identity):
+        v.append("I-25: handle identity does not match the "
+                 "manifest-recorded identity")
     return v
 
 

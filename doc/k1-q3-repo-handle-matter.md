@@ -14,8 +14,11 @@ identity` in the manifest), the committing tool verifies the
 handle's identity against the manifest before every write
 (D5a extension, fail closed, abort-not-retry), I-25
 identity-binding validator, replay story, five checkable
-acceptances. **Adopted under DR-CMD-047 (2026-09-21); not built —
-the build follows on the operator's separate direction.**
+acceptances. **Adopted under DR-CMD-047 (2026-09-21); BUILT the
+same day on the operator's "Yes, build it"** — the committing
+tool's pre-write identity check (D3), I-25, golden-run cases
+24–28; updater + bridge + main + scenario-sim golden runs all
+PASS. See the spec's "Build evidence".
 
 
 **Matter:** *k1-q3-repo-handle* — follow-on matter of K1
