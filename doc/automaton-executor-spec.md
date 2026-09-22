@@ -1,6 +1,7 @@
 # Automaton Executor Spec — the runtime that steps the automaton plane
 
-Status: specified 2026-09-20, **not implemented** — awaiting Peter's approval.
+Status: specified 2026-09-20; **adopted 2026-09-21** (DR-CMD-054, with
+conditions C1–C6) — implementation authorized.
 Parents: `automaton-flow-spec.md` §6 (executor duties), component registry
 (`automaton-executor`: "no executor spec yet" — this is that spec).
 
@@ -15,7 +16,11 @@ There is no daemon mode, no loop, no "waiting for inputs" — the loop, if
 any, belongs to the wrapper (cron/script, outside the architecture), which
 owns the schedule. The executor owns *trigger validation*.
 
-This is the "advances" in "dsys issues, ingests, advances."
+This is the "advances" in "dsys issues, ingests, advances" — and it is
+AX2's deterministic walker: "the deterministic walker that advances
+automaton flows (in production and in testing)." The wrapper is the
+scheduler, outside the architecture; the executor is the walker, inside
+it.
 
 ## 2. What it is not (rejected alternatives)
 
@@ -70,10 +75,11 @@ dsys automaton replay --run <id>
 - `init` creates an `AutomatonRun` (`state=open`) and appends
   `run_created` (seq 0) carrying the immutable cfg: `runbook_id`,
   pinned `release_version`, failure policy (default `abort`), initial
-  ctx. Init is **idempotent**: the idempotency key is the content hash of
-  `(runbook_id, canonical cfg)` — re-init with identical cfg returns the
-  existing open run instead of duplicating. (Deterministic idempotency
-  keys, per the `AutomatonRun` contract.)
+  ctx. Init is **idempotent (I-30)**: the idempotency key is the content
+  hash of `(runbook_id, canonical cfg)` — re-init with identical cfg
+  returns the existing open run instead of duplicating; if no open run
+  carries the key (none, or only closed runs), a new run is created.
+  (Deterministic idempotency keys, per the `AutomatonRun` contract.)
 - `init-flow` creates a `FlowRun` at the flow's `initial_state_id`
   (`state=running`).
 - `advance` steps to **quiescence**: no more applicable steps /
@@ -90,17 +96,26 @@ event log plus `replay` — may be sufficient. If the log proves
 insufficient, the pre-designed shape is: run-level only (a flow "step"
 is ambiguous), `step` on a quiescent run appends nothing.
 
-**Quiescence is sticky.** If the last event is `run_completed`,
+**Quiescence is sticky (I-29).** If the last event is `run_completed`,
 `run_aborted`, or `step_parked` and no input arrived after it,
 `advance` is a no-op — repeated invocation appends no duplicate
-parked/terminal events.
+parked/terminal events. I-29: no event is appended after a terminal
+(`run_completed`/`run_aborted`) or `step_parked` event without
+intervening input (`--external` / `--trigger` / a new invocation's
+validated trigger).
 
 **Driving discipline** (convention, not mechanism). Production flows
 are wrapper-driven (cron) through `advance`; an operator-invoked
 `advance` is intervention. The executor cannot tell the two apart —
 the distinction lives in who invokes — and production must never
 depend on hand-driving: hand-driven progress inherits the
-operator-attention liveness hazard.
+operator-attention liveness hazard. Wrapper *establishment* is
+governed by the production drive contract's **D4 K3 tripwire**: any
+initiation path the ambient can program or trigger — including a
+wrapper, cron, or scheduler the ambient writes or configures — is K3
+revived and terminally invalid. The tripwire governs initiation; the
+wrapper here only *drives* via `advance`, which is not initiation
+(C5, DR-CMD-054).
 
 Exit codes reuse the CLI contract: `0` ok; `1` usage / config / tool
 failure / lease busy; `5` replay violations. JSON envelope on stdout:
@@ -128,6 +143,16 @@ A false guard is **not** a failure — it is "not yet." Failure is only
 what the policy machinery handles. Run `state` is constrained to
 `open | completed | aborted` (the schema's `state: str`, narrowed here).
 
+**What counts as "tool fails" (C1).** The tool contract (§8) requires
+`run(ctx)` to return `{"ok": bool, "result": <json>, "ctx_delta":
+<json>}`. Any deviation — an exception, a non-dict return, a missing
+`"ok"` key, or a non-JSON `ctx_delta` — is a *tool failure*: the
+declared failure policy applies exactly as for `"ok": false`, and the
+log records a normalized `step_failed` (the malformed bytes are not
+folded into ctx). A tool that returns `"ok": true` with a well-formed
+delta has succeeded, whatever the delta claims — a deterministically
+lying tool is declared trust (§9).
+
 ## 6. Failure policies
 
 - **Standalone run:** declared at `init` via `--on-step-failure`
@@ -137,8 +162,8 @@ what the policy machinery handles. Run `state` is constrained to
 - **Flow child run:** the task `FlowState`'s `step_policy` governs
   (ratified O2); the init-time flag is ignored for flow children and
   must not be set for them.
-- **Transcript re-validation** (flow-spec §4): a `step_failed` not
-  followed by its policy's consequence is a violation (policy=`abort`
+- **Transcript re-validation** (flow-spec §4; **I-28**): a `step_failed`
+  not followed by its policy's consequence is a violation (policy=`abort`
   but the run continued; `retry:3` but a fourth attempt appears).
   Silent swallowing becomes log-visible deviation.
 - **Compensation** is a modeling matter, not executor magic: the
@@ -164,14 +189,19 @@ what the policy machinery handles. Run `state` is constrained to
   (flow-spec §6), `parent_flow_run_id` / `flow_state_id` set, then
   advance it per §5. On child `completed`/`aborted`, feed
   `run_completed`/`run_aborted` back as the next trigger (these two
-  triggers are executor-minted, never CLI-supplied).
+  triggers are executor-minted, never CLI-supplied). The trigger
+  **payload is the child's folded ctx** — the run's accumulated
+  knowledge, re-derived from its recorded log (deterministic; replay
+  never reinvokes tools). Transition guards read their fields from
+  `payload` (e.g. `payload.remote_version != payload.installed_version`)
+  and from `run.status`; a guard over an absent key is falsy (§14.1).
 - On entering an `end` state: close the flow run (`done` on
   `outcome=completed`, `aborted` on `outcome=aborted`) per I-16.
 - Append every transition as a `FlowTransitionEvent` (gapless `seq`).
 
 ## 8. Tool contract
 
-- Tools live in the dist: `lib/automaton/tools/`, mapped by tool name
+- Tools live in the dist: `lib/dsys/tools/`, mapped by tool name
   (the `Tool` entity's `name`). Signature:
   `run(ctx: dict) -> {"ok": bool, "result": <json>, "ctx_delta": <json>}`.
 - **Deterministic** (declared; F-E2) and **idempotent** (required;
@@ -195,6 +225,9 @@ behavior replay"):
 - every `step_failed` followed by its declared policy's consequence (§6);
 - closure consistent: `run_completed` only after the last step's
   `step_completed`; `run_aborted` only via the abort policy.
+- a trailing `step_started` with no outcome event is **valid**, not a
+  violation: it is crash recovery pending (F-E3) — the next `advance`
+  re-invokes the tool (C2).
 
 Exit `0` = transcript valid; `5` = violations (referee's code). Replay
 checks the *record*; it cannot detect a tool that lied deterministically
@@ -203,9 +236,11 @@ checks the *record*; it cannot detect a tool that lied deterministically
 ## 10. Concurrency
 
 One rule: **single writer per run per invocation**, enforced
-ephemerally. The executor takes an OS file lock on the state file for
-the duration of `advance`; a second concurrent invoker fails fast with
-exit 1 (`automaton-lease-busy`). No lease records — the lease model was
+ephemerally. Runs live at `var/runs/<run_id>.json` under the install
+home (the flow-drive surface's established layout, C4); the executor
+takes an OS file lock on the state file for the duration of `advance`;
+a second concurrent invoker fails fast with exit 1
+(`automaton-lease-busy`). No lease records — the lease model was
 superseded (session-sync); the lock is held only while stepping.
 
 ## 11. What the executor never does
@@ -271,18 +306,70 @@ superseded (session-sync); the lock is held only while stepping.
 
 ## 14. Implementation checklist (on approval)
 
-1. `lib/automaton/executor.py`: fold, guard eval (allowlisted AST,
+As built (DR-CMD-054): the executor lives in the `dsys` package tree,
+not a separate `automaton` tree — `lib/dsys/executor.py`,
+`lib/dsys/tools/`, `lib/dsys/executor_cli.py` (run-level CLI),
+`lib/dsys/runbooks/` (fixture run-books); the flow-drive CLI remains
+`lib/dsys/automaton_cli.py`.
+
+1. `lib/dsys/executor.py`: fold, guard eval (allowlisted AST,
    compiled once), step loop, flow driver, trigger validation.
-2. `lib/automaton/tools/`: registry + reference tools.
+2. `lib/dsys/tools/`: registry + reference tools.
 3. CLI: `automaton init|init-flow|advance|replay` (full profile;
    base refuses); JSON envelopes; exit codes per §4.
 4. Validators: narrow `AutomatonRun.state` to `open|completed|aborted`;
    transcript re-validation checks (§6, §9) as referee-callable
-   functions.
+   functions; I-28/I-29/I-30 as named validators (C3).
 5. Golden run: fixture run advanced by the executor in a scenario;
    refusal cases (bad policy value, guardless ambiguity at runtime,
    max-steps trip, lease busy).
 6. component registry: `spec` → this file (done in this change).
 7. README + architecture doc (automaton-plane section) + glossary
-   (automaton-executor, quiescence, wrapper).
+   (automaton-executor, quiescence, wrapper — see §15).
 8. Re-verify (`python3 -m package`), rebuild ZIPs.
+
+### 14.1 As-built semantic deltas (recorded, not bridged silently)
+
+- **Absent scope keys read as `None` (falsy), not an error.** §5's
+  parking use case ("a later `--external` may change ctx and unpark
+  it") requires a guard over a not-yet-provided key to be *false*,
+  not a definition fault. Python comparison semantics apply
+  (`None != 'x'` is true). A guard that raises a genuine *type* error
+  (e.g. adding a string) is still a definition fault → `step_failed`.
+- **`step_started` precedes tool lookup.** Every attempt has the
+  uniform `started → outcome` shape, so an unknown tool at advance
+  time is a normal `step_failed` ("unknown tool …") and I-28's
+  adjacency holds for it like any other failure.
+- **Disclosure outbox** is `<home>/var/disclosures/` (`dl-NNNNNN.json`;
+  fields `id seq kind text status flow_id flow_run_id state_id
+  trigger`; `seq` write-path-minted, monotonic, no clock). The `text`
+  is the fixed four-line template (flow id, run id, state, trigger).
+- **Replay exit 5 carries its violations** on stderr (and in the JSON
+  envelope's `error`), not just in `data.violations`.
+
+## 15. Glossary
+
+- **automaton-executor**: the runtime that steps the automaton plane —
+  a step function (each invocation loads state, advances to quiescence,
+  appends events, exits), not a daemon, scheduler, agent, or installer.
+  AX2's deterministic walker.
+- **quiescence**: the state of a run with no more mechanically
+  determined work: no applicable steps/transitions, a parked step, or
+  an end state. Quiescence is sticky (I-29).
+- **wrapper**: the cron/script, outside the architecture, that owns the
+  schedule and invokes `advance`. It drives; it never initiates (D4 K3
+  tripwire governs wrapper establishment).
+- **step_parked**: the event appended when a step's guard evaluates
+  false — "not yet," not failure. A parked run waits; `--external`
+  input may change ctx and unpark it.
+- **idempotency key**: the content hash of `(runbook_id, canonical
+  cfg)` for run `init` (I-30); `f"{flow_run_id}:{state_id}:{entry_seq}"`
+  for flow child-run spawn.
+- **automaton-exception**: the fixed-template `Disclosure`
+  (`kind="automaton-exception"`: flow id, run id, state, trigger — no
+  prose) the executor mints on an unhandled trigger (§7), routed to
+  the DR-5 drain. Signaling, not promotion (F-F4).
+- **trigger** (closed enum): `timer` | `external` |
+  `run_completed` | `run_aborted`. The first two are CLI-supplied and
+  executor-validated (§3); the last two are executor-minted, never
+  CLI-supplied (§7).

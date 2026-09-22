@@ -1,0 +1,11 @@
+{
+  "runbook_id": "fx-guardfalse",
+  "release_version": "1.0.0",
+  "steps": [
+    {
+      "seq": 0,
+      "tool": "noop",
+      "expr": "ctx.never"
+    }
+  ]
+}

@@ -120,6 +120,23 @@ every human judgment codified beforehand as configuration; deterministic
 replay mandatory. The anti-harness: where the harness is prompts and
 judgment, the automaton is consequence.
 
+**automaton-executor** — the runtime that steps the automaton plane
+(DR-CMD-054, built: `lib/dsys/executor.py`): a step function — each
+invocation loads state, advances to quiescence, appends events, exits.
+Not a daemon, scheduler, agent, or installer. AX2's deterministic
+walker. CLI: `dsys automaton init|init-flow|advance|replay` (full
+profile only); spec `doc/automaton-executor-spec.md`.
+
+**quiescence** — the state of a run with no more mechanically determined
+work: no applicable steps/transitions, a parked step, or an end state.
+Quiescence is sticky (I-29): once parked with no new input, an advance
+appends nothing.
+
+**wrapper** — the cron/script, outside the architecture, that owns the
+schedule and invokes `automaton advance`. It drives; it never initiates
+(the D4 K3 tripwire governs wrapper establishment: any initiation path
+the ambient can program or trigger is K3 revived, terminally invalid).
+
 **Run-book** — the automaton plane's executable unit: strictly sequential
 steps (each an AST-allowlisted expression, compiled once) invoking tools,
 pinned to a shipped release by `release_version`. An `AutomatonRun` runs a

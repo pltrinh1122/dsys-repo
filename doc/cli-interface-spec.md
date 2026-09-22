@@ -153,6 +153,7 @@ dsys automaton advance --run <id> [--external KIND --payload JSON]
 dsys automaton advance --flow-run <id> [--trigger timer|external
                        --payload JSON] [--max-steps N]
 dsys automaton replay --run <id>
+dsys automaton replay --flow-run <id>
 ```
 
 - Full profile only; base refuses with exit 1 naming the component

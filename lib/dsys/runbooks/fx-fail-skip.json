@@ -1,0 +1,11 @@
+{
+  "runbook_id": "fx-fail-skip",
+  "release_version": "1.0.0",
+  "steps": [
+    {
+      "seq": 0,
+      "tool": "fail_always",
+      "expr": "True"
+    }
+  ]
+}

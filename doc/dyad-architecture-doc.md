@@ -218,6 +218,13 @@ Application → PromotionRecord → AutomatonRelease → RunBook.
   I-14 flow totality (every non-end state routes every fate — the mechanical
   form of "exceptions are managed"), I-15 transition determinism, I-16
   flow-run closure bar (a done/aborted run sits in an end state).
+- **automaton-executor** (DR-CMD-054, built: `lib/dsys/executor.py`) — the
+  plane's deterministic walker (AX2): steps run-books (AST-allowlisted
+  guards; `abort | skip | retry:<n>`; parked quiescence; crash-recovery
+  re-invocation), drives flows (child runs, `run_completed`/`run_aborted`
+  triggers, fixed-template `automaton-exception` disclosures on unhandled
+  triggers), and re-validates transcripts without reinvoking tools
+  (I-28/I-29/I-30). Spec: `doc/automaton-executor-spec.md`.
 
 ## 3. Process schema — lifecycles
 

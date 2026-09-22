@@ -23,7 +23,8 @@ checks verify.
 install.sh                     # the installer
 README.md                      # this file
 bin/dsys                       # entry wrapper (expects $DSYS_HOME/venv/bin/python)
-lib/dsys/*.py                  # CLI modules (state, referee, doctor, roles, manifest)
+lib/dsys/*.py                  # CLI modules (state, referee, doctor, roles, manifest,
+                               # automaton flow-drive + executor)
 etc/config.yaml                # default config; never clobbered on reinstall
 roles/{cos,operator,auditor}/  # role bundles: role.yaml, prompt.md, bounds.md
                                # sealed in place (full profile only)

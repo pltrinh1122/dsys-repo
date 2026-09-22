@@ -1,0 +1,16 @@
+{
+  "runbook_id": "fx-pass",
+  "release_version": "1.0.0",
+  "steps": [
+    {
+      "seq": 0,
+      "tool": "noop",
+      "expr": "ctx.go"
+    },
+    {
+      "seq": 1,
+      "tool": "noop",
+      "expr": "True"
+    }
+  ]
+}

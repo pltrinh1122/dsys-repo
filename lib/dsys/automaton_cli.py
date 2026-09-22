@@ -9,10 +9,14 @@ run exists, so a refused initiation writes nothing.
 
 This module is the invocation surface only. Step semantics, trigger
 validation, failure policies, and replay semantics are the executor's
-contract (doc/automaton-executor-spec.md §§4–9); the drive execution
-vehicle (production tool implementations) is not built, so ``advance``
-gates, re-validates post-hoc, and refuses rather than faking a run
-(the cmd_execute / cmd_session precedent).
+contract (doc/automaton-executor-spec.md §§4–9); ``advance`` drives the
+flow run through the executor (lib/dsys/executor.py §7) — spawning child
+AutomatonRuns, routing triggers, minting automaton-exception disclosures
+on unhandled triggers. The production tool implementations behind the
+release-monitor flow's run-books are not built: when a task state's
+run-book names a tool with no implementation, the executor records the
+missing tool loudly as the step's failure (the child aborts via its
+policy) — refusing to fake the work, per the cmd_execute precedent.
 
 Run records live at <home>/var/runs/<run_id>.json: the initiation record,
 the acquisition record, and the append-only event log the executor will
@@ -286,40 +290,104 @@ def _revalidate(home: Path, run, manifest: dict, U):
     return None
 
 
+def _executor_modules():
+    """Import the executor and its run-level CLI surface (siblings)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import executor as X  # noqa: E402
+    import executor_cli as XC  # noqa: E402
+    return X, XC
+
+
+def _flow_def(U):
+    """Compile the updater flow into the driver's flow dict (§7)."""
+    aflow, states, transitions, _rb, _steps, _tools = U.compile_flow()
+    return {
+        "flow_id": aflow.id,
+        "initial_state_id": aflow.initial_state_id,
+        "states": {
+            s.id: {"kind": s.kind, "runbook_id": s.runbook_id,
+                   "step_policy": s.step_policy, "outcome": s.outcome}
+            for s in states
+        },
+        "transitions": [
+            {"from_state_id": t.from_state_id, "trigger": t.trigger,
+             "guard": t.guard, "to_state_id": t.to_state_id, "id": t.id}
+            for t in transitions
+        ],
+    }
+
+
 def advance_flow_run(home: Path, manifest: dict, flow_run_id: str,
                      trigger: str | None, payload: str | None,
                      max_steps: int):
     U = _updater(home)
+    X, XC = _executor_modules()
     run, err = _load_run(home, flow_run_id)
     if err is not None:
         return 1, None, None, None, err
-    if run.get("state") in ("done", "aborted"):
-        data = {"run_id": flow_run_id, "state": run.get("state"),
-                "steps_advanced": 0, "events_appended": 0, "closed": True}
-        return 0, None, "run already closed — no-op", data, None
+    # Post-hoc I-26/I-27 before the closed-run no-op: a run whose
+    # binding went invalid reports the invalidation rather than hiding
+    # behind "already closed".
     invalid = _revalidate(home, run, manifest, U)
     if invalid is not None:
         return 1, None, None, None, \
             f"dsys automaton advance: {invalid}"
+    if run.get("state") in ("done", "aborted"):
+        data = {"run_id": flow_run_id, "state": run.get("state"),
+                "steps_advanced": 0, "events_appended": 0, "closed": True}
+        return 0, None, "run already closed — no-op", data, None
     if trigger not in (None, "timer", "external"):
         return (1, None, None, None,
                 f"dsys automaton advance: bad trigger {trigger!r} "
                 "(timer|external)")
+    payload_dict = None
     if payload is not None:
         try:
-            json.loads(payload)
+            payload_dict = json.loads(payload)
         except json.JSONDecodeError as e:
             return (1, None, None, None,
                     f"dsys automaton advance: --payload is not JSON: {e}")
+        if not isinstance(payload_dict, dict):
+            return (1, None, None, None,
+                    "dsys automaton advance: --payload must be a JSON object")
     if not isinstance(max_steps, int) or max_steps < 1:
         return (1, None, None, None,
                 "dsys automaton advance: --max-steps must be a positive integer")
-    # The drive execution vehicle — production tool implementations and the
-    # executor's step semantics (automaton-executor-spec §§5–8) — is not
-    # built. Refusing rather than faking a run (the cmd_execute precedent).
-    return (1, None, None, None,
-            "dsys automaton advance: drive execution is not implemented in "
-            "this build — refusing rather than faking a run")
+    try:
+        tools = X.load_tools(XC._TOOLS_DIR)
+    except ValueError as e:
+        return 1, None, None, None, f"dsys automaton advance: {e}"
+    resolve = XC.make_runbook_resolver(U)
+    flow = _flow_def(U)
+    path = _runs_dir(home) / f"{flow_run_id}.json"
+    try:
+        with X.locked(path) as f:
+            frun = X.read_locked(f)
+            if frun.get("state") in ("done", "aborted"):
+                data = {"run_id": flow_run_id,
+                        "state": frun.get("state"),
+                        "steps_advanced": 0, "events_appended": 0,
+                        "closed": True}
+                return 0, None, "run already closed — no-op", data, None
+            try:
+                summary = X.advance_flow(
+                    frun, flow, resolve, tools, home,
+                    trigger=trigger, payload=payload_dict,
+                    max_steps=max_steps)
+            except X.FlowDefinitionError as e:
+                return (1, None, None, None,
+                        f"dsys automaton advance: flow definition fault: {e}")
+            X.write_locked(f, frun)
+    except X.LeaseBusy as e:
+        return 1, None, None, None, f"dsys automaton advance: {e}"
+    notes = None
+    if summary["hit_bound"]:
+        notes = (f"resource bound hit after {summary['iterations']} "
+                 "iterations — no semantic stop recorded")
+    text = (f"flow run {flow_run_id}: state={summary['state']} "
+            f"transitions_taken={summary['transitions_taken']} "
+            f"events_appended={summary['events_appended']}")
+    return 0, text, notes, summary, None
 
 
 def replay_flow_run(home: Path, manifest: dict, flow_run_id: str):
@@ -340,11 +408,14 @@ def replay_flow_run(home: Path, manifest: dict, flow_run_id: str):
         except (KeyError, TypeError, ValueError) as exc:
             data = {"run_id": flow_run_id, "valid": False,
                     "violations": [f"malformed stored event: {exc}"]}
-            return 5, None, None, data, None
+            return (5, None, None, data,
+                    "dsys automaton replay: flow transcript invalid: "
+                    f"malformed stored event: {exc}")
     try:
         _path = U.replay(events, transitions, aflow.initial_state_id)
     except ValueError as e:
         data = {"run_id": flow_run_id, "valid": False, "violations": [str(e)]}
-        return 5, None, None, data, None
+        return (5, None, None, data,
+                f"dsys automaton replay: flow transcript invalid: {e}")
     data = {"run_id": flow_run_id, "valid": True, "violations": []}
     return 0, f"flow run {flow_run_id}: transcript valid", None, data, None

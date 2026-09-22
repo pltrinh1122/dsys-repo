@@ -177,14 +177,33 @@ def _build_parser():
     p_iflow.add_argument("--accretion-path", default=None, metavar="PATH",
                          help="override the accretion repo path "
                          "(default: config accretion.path)")
-    p_adv = s_auto.add_parser("advance", help="advance a flow run")
-    p_adv.add_argument("--flow-run", required=True, metavar="ID")
-    p_adv.add_argument("--trigger", choices=("timer", "external"), default=None)
-    p_adv.add_argument("--payload", default=None, metavar="JSON")
+    p_init = s_auto.add_parser("init", help="initiate a run-book run")
+    p_init.add_argument("--runbook", required=True, metavar="ID")
+    p_init.add_argument("--ctx", default=None, metavar="JSON",
+                        help="initial context as a JSON object")
+    p_init.add_argument("--on-step-failure", default="abort",
+                        metavar="POLICY",
+                        help="abort | skip | retry:<n> (default: abort)")
+    p_adv = s_auto.add_parser("advance", help="advance a run or flow run")
+    g_adv = p_adv.add_mutually_exclusive_group(required=True)
+    g_adv.add_argument("--run", default=None, metavar="ID",
+                       help="a run-book run id")
+    g_adv.add_argument("--flow-run", default=None, metavar="ID",
+                       help="a flow run id")
+    p_adv.add_argument("--trigger", choices=("timer", "external"),
+                       default=None,
+                       help="flow-run trigger (with --flow-run)")
+    p_adv.add_argument("--external", default=None, metavar="KIND",
+                       help="inject an external event of this kind "
+                       "(with --run)")
+    p_adv.add_argument("--payload", default=None, metavar="JSON",
+                       help="trigger/event payload as a JSON object")
     p_adv.add_argument("--max-steps", type=int, default=1000, metavar="N")
     p_rep = s_auto.add_parser("replay",
-                              help="re-validate a flow run's transcript")
-    p_rep.add_argument("--flow-run", required=True, metavar="ID")
+                              help="re-validate a run or flow run transcript")
+    g_rep = p_rep.add_mutually_exclusive_group(required=True)
+    g_rep.add_argument("--run", default=None, metavar="ID")
+    g_rep.add_argument("--flow-run", default=None, metavar="ID")
 
     return parser
 
@@ -273,15 +292,43 @@ def cmd_automaton(args, cfg, home, manifest):
     if op == "init-flow":
         return auto.init_flow(home, manifest, args.flow,
                               args.accretion_path)
+    if op == "init":
+        xc, err = _import_sibling("executor_cli", "executor surface")
+        if xc is None:
+            return 1, None, None, None, err
+        return xc.init_run(home, args.runbook, args.ctx,
+                           args.on_step_failure,
+                           updater=auto._updater(home))
     if op == "advance":
-        return auto.advance_flow_run(home, manifest, args.flow_run,
-                                     args.trigger, args.payload,
-                                     args.max_steps)
+        if args.flow_run is not None:
+            if args.external is not None:
+                return (1, None, None, None,
+                        "dsys automaton advance: --external is for --run, "
+                        "not --flow-run")
+            return auto.advance_flow_run(home, manifest, args.flow_run,
+                                         args.trigger, args.payload,
+                                         args.max_steps)
+        if args.trigger is not None:
+            return (1, None, None, None,
+                    "dsys automaton advance: --trigger is for --flow-run, "
+                    "not --run")
+        xc, err = _import_sibling("executor_cli", "executor surface")
+        if xc is None:
+            return 1, None, None, None, err
+        return xc.advance_run_cmd(home, args.run, args.external,
+                                  args.payload, args.max_steps,
+                                  updater=auto._updater(home))
     if op == "replay":
-        return auto.replay_flow_run(home, manifest, args.flow_run)
+        if args.flow_run is not None:
+            return auto.replay_flow_run(home, manifest, args.flow_run)
+        xc, err = _import_sibling("executor_cli", "executor surface")
+        if xc is None:
+            return 1, None, None, None, err
+        return xc.replay_run_cmd(home, args.run,
+                                 updater=auto._updater(home))
     return (1, None, None, None,
             "dsys automaton: no operation given "
-            "(init-flow | advance | replay)")
+            "(init | init-flow | advance | replay)")
 
 
 def cmd_roles_list(args, cfg, home):
