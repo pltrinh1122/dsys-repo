@@ -77,3 +77,46 @@ automaton-exception; the closed trigger enum is listed once:
 Adopted bytes: `doc/automaton-executor-spec.md` as amended with
 C1–C6 (amendment follows this record; build follows the amendment).
 Next disposition identifier: DR-CMD-055.
+
+## Addendum — conditions C1–C6 met (2026-09-21 ~19:10 PDT)
+
+Build: `408f8ed` — "Executor BUILT (DR-CMD-054)". Evidence:
+`tests/test-automaton-surface.sh` 45/45 pass;
+`tests/test-executor-driver.py` 13/13 pass; package regressions
+green (`python3 -m core.package` RESULT: PASS; acquisition, updater,
+drive-contract, bridge, scenario-sim golden runs ok).
+
+- **C1** — met. `invoke_tool` (`lib/dsys/executor.py`) normalizes a
+  deviating tool result (exception, missing keys, non-JSON
+  `ctx_delta`) into a failed `ToolResult`; the log records
+  `step_failed` with the normalized error and the declared failure
+  policy applies. Exercised by fixture `fx-malformed.json` /
+  `lib/dsys/tools/malformed.py` and the surface suite's C1 cases.
+- **C2** — met. `revalidate_transcript` treats a trailing
+  `step_started` with no outcome event as a valid transcript (crash
+  recovery pending, F-E3), not a violation. Exercised by the surface
+  suite's dangling-`step_started` case.
+- **C3** — met. Named validators in `lib/dsys/executor.py`:
+  `i_attempt_adjacency` (I-28), `i_quiescence_sticky` (I-29),
+  `i30_init_idempotency` (I-30); `automaton replay` runs them over
+  the stored log and exits 5 with violations on failure.
+- **C4** — met. Spec §10; `lib/dsys/executor_cli.py` stores runs at
+  `var/runs/<run_id>.json` under the install home; the single-writer
+  lock is the OS file lock on the state file (`X.locked`).
+- **C5** — met. Spec §4 cites the drive contract's D4 K3 tripwire
+  and states the AX2 mapping explicitly (the executor *is* AX2's
+  deterministic walker; the wrapper is the scheduler, outside the
+  architecture).
+- **C6** — met. Spec §15 Glossary defines automaton-executor,
+  quiescence, wrapper, step_parked, idempotency key,
+  automaton-exception, and lists the closed trigger enum
+  {timer, external, run_completed, run_aborted} once.
+
+Recorded as-built deltas (spec §14.1, not silent bridges): absent
+scope keys read as `None` (falsy); `step_started` precedes tool
+lookup; disclosure outbox `<home>/var/disclosures/`; replay exit 5
+carries violations on stderr; child folded ctx minted as the
+`run_completed`/`run_aborted` trigger payload (spec §7).
+
+This addendum is not a new disposition; DR-CMD-055 remains the next
+disposition identifier.
