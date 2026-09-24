@@ -9,6 +9,30 @@ a scoped exception — "no network in the executor or tools,
 except the release-check poll (updater-spec §5 P2), whose
 result enters only as external trigger payload."
 
+**Spec stage completed** 2026-09-23: `doc/production-tools-spec.md`
+adopted as the build contract by **DR-CMD-056** (mode: authorize;
+spec checked against all DR-CMD-055 spec-stage conditions —
+F2(a) applied, per-tool World→system mapping, failure-record
+schema, subprocess scope, per-tool idempotency, R1/R2/R3/R5
+stories, A5 acceptance — and found self-contained with a
+Glossary; one step-count inconsistency resolved).
+
+**Build stage completed** 2026-09-23 via **DR-CMD-057** (mode:
+authorize; Peter selected O1 — build all eight tools at once
+against the adopted spec, mechanical verification as the
+acceptance bar). Ten new modules under `lib/dsys/tools/`
+(the eight tools + `_common.py` + the golden run);
+`_production_tools_golden_run.py` RESULT: PASS — 73 cases,
+0 violations; existing suites all green (bridge drift guard,
+updater, main, drive-contract, scenario-sim, acquisition,
+executor-driver 13 passed). As-built deltas recorded in
+`doc/production-tools-spec.md` §11, including the stated
+integration note: the flow driver does not yet seed the
+committing child's `ctx` — drive/flow wiring is a follow-on
+matter, not silently bridged. Status stays **ADOPTED**; the
+tree is UNCOMMITTED — commit and push need Peter's explicit
+word and return as follow-on dispositions (DR-CMD-058).
+
 **Matter:** *production-tools* — the dist-shipped, release-pinned
 executor tools the updater flow's run-books invoke. Follow-on of
 DR-CMD-054 (the executor build): the executor is built and drives
