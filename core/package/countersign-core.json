@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "countersign-core.json",
+  "title": "Countersign core schema",
+  "description": "The eight entities of the Countersign core (crafts/countersign/rules/schema.md), as one instance document. Logical, not a storage format: a system projects its own stores to it. Checks (an attribute, not an entity) are an optional ninth array. Every entity may carry a `profile` object holding what is the projecting system's own, outside the core (F5). Validated by the stdlib subset in projectors/project_countersign.py (`validate`), never by a third-party library.",
+  "type": "object",
+  "required": ["schema_version", "system", "parties", "acts", "proposals", "countersignatures", "mandates", "releases", "events", "escalations"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": "0.1.0"},
+    "system": {"type": "string", "description": "the name of the projecting system (a profile name)"},
+    "parties": {"type": "array", "items": {"$ref": "#/$defs/party"}},
+    "acts": {"type": "array", "items": {"$ref": "#/$defs/act"}},
+    "proposals": {"type": "array", "items": {"$ref": "#/$defs/proposal"}},
+    "countersignatures": {"type": "array", "items": {"$ref": "#/$defs/countersignature"}},
+    "mandates": {"type": "array", "items": {"$ref": "#/$defs/mandate"}},
+    "releases": {"type": "array", "items": {"$ref": "#/$defs/release"}},
+    "events": {"type": "array", "items": {"$ref": "#/$defs/event"}},
+    "escalations": {"type": "array", "items": {"$ref": "#/$defs/escalation"}},
+    "checks": {"type": "array", "items": {"$ref": "#/$defs/check"}}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[a-z][a-z0-9.-]*$"},
+    "ref": {"type": "string", "pattern": "^[a-z][a-z0-9.-]*$", "description": "the id of another instance in the same document"},
+    "optref": {"type": ["string", "null"], "pattern": "^[a-z][a-z0-9.-]*$"},
+    "extref": {"type": "string", "pattern": "^([a-z][a-z0-9.-]*|ext:.+)$", "description": "an id in this document, or `ext:<system>-<id>` naming an act outside it"},
+    "profile": {"type": "object", "description": "the projecting system's own fields, outside the core"},
+    "party": {
+      "type": "object",
+      "required": ["id", "kind"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["human", "agent", "executor"]},
+        "profile": {"$ref": "#/$defs/profile"}
+      }
+    },
+    "act": {
+      "type": "object",
+      "required": ["id", "title", "mode", "processor", "state", "refs"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "title": {"type": "string"},
+        "mode": {"enum": ["explicit", "implicit", "automatic"]},
+        "processor": {"$ref": "#/$defs/ref"},
+        "state": {"type": "string"},
+        "refs": {"type": "array", "items": {"type": "string"}},
+        "profile": {"$ref": "#/$defs/profile"}
+      }
+    },
+    "proposal": {
+      "type": "object",
+      "required": ["id", "act", "author", "body_ref", "artifact_hash"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "act": {"$ref": "#/$defs/ref"},
+        "author": {"$ref": "#/$defs/ref"},
+        "body_ref": {"type": ["string", "null"]},
+        "artifact_hash": {"type": ["string", "null"]},
+        "profile": {"$ref": "#/$defs/profile"}
+      }
+    },
+    "countersignature": {
+      "type": "object",
+      "required": ["id", "subject", "signer", "answer", "basis", "text", "bound_hash", "at"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "subject": {"$ref": "#/$defs/ref"},
+        "signer": {"$ref": "#/$defs/ref"},
+        "answer": {"enum": ["yes", "no", "amend"]},
+        "basis": {"enum": ["per-act", "mandate", "release"]},
+        "text": {"type": "string"},
+        "bound_hash": {"type": ["string", "null"]},
+        "at": {"type": "string"},
+        "profile": {"$ref": "#/$defs/profile"}
+      }
+    },
+    "mandate": {
+      "type": "object",
+      "required": ["id", "scope", "countersignature"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "scope": {
+          "type": "object",
+          "required": ["event_class", "plan_template", "budget", "rights"],
+          "additionalProperties": false,
+          "properties": {
+            "event_class": {"type": "string"},
+            "plan_template": {"type": ["string", "null"]},
+            "budget": {"type": ["string", "null"]},
+            "rights": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "countersignature": {"$ref": "#/$defs/optref"},
+        "profile": {"$ref": "#/$defs/profile"}
+      }
+    },
+    "release": {
+      "type": "object",
+      "required": ["id", "definition_ref", "version", "hash", "countersignature"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "definition_ref": {"type": "string"},
+        "version": {"type": "string"},
+        "hash": {"type": "string"},
+        "countersignature": {"$ref": "#/$defs/optref"},
+        "profile": {"$ref": "#/$defs/profile"}
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": ["id", "act", "seq", "payload", "at"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "act": {"$ref": "#/$defs/ref"},
+        "seq": {"type": "integer", "minimum": 0},
+        "payload": {"type": "object"},
+        "at": {"type": "string"},
+        "profile": {"$ref": "#/$defs/profile"}
+      }
+    },
+    "escalation": {
+      "type": "object",
+      "required": ["id", "from", "reason", "opens"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "from": {"$ref": "#/$defs/extref"},
+        "reason": {"type": "string"},
+        "opens": {"$ref": "#/$defs/optref"},
+        "profile": {"$ref": "#/$defs/profile"}
+      }
+    },
+    "check": {
+      "type": "object",
+      "required": ["name", "timing", "target"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string"},
+        "timing": {"enum": ["before", "after"]},
+        "target": {"enum": ["party", "act", "proposal", "countersignature", "mandate", "release", "event", "escalation"]},
+        "profile": {"$ref": "#/$defs/profile"}
+      }
+    }
+  }
+}

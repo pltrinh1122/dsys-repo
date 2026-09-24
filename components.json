@@ -66,6 +66,19 @@
       ]
     },
     {
+      "artifacts": [
+        "lib/core/package/countersign_map.py",
+        "lib/core/package/countersign_map_golden_run.py"
+      ],
+      "description": "Countersign mapping (dyad-system d-work #156): projects SystemState onto the Countersign core schema by derivation rule, validated against a pinned copy of countersign-core.json (version and sha256 in the module). The pinned JSON is not an installed artifact: install_tree converges core/package/*.py only. Mapping, not a model change: DispositionMode is renamed to basis at this boundary only. See doc/countersign-mapping.md.",
+      "kind": "shipped",
+      "name": "countersign-map",
+      "profiles": [
+        "base",
+        "full"
+      ]
+    },
+    {
       "description": "Authoring-and-building system producing AutomatonRelease candidates. Specified, not implemented.",
       "kind": "specified-only",
       "name": "factory",

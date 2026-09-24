@@ -321,6 +321,19 @@ holds while a single operator disposes and `decide` stays excluded
 as an inference type; it reopens if agents ever dispose or the
 operator leaves the loop.
 
+**Countersign mapping** — the projection of `SystemState` onto the
+Countersign core schema (eight entities: party, act, proposal,
+countersignature, mandate, release, event, escalation), authored under
+dyad-system d-work #156: `core/package/countersign_map.py`, checked by
+its golden run against a pinned copy of `countersign-core.json`
+(version and sha256 recorded in the module). Mapping only; no dsys
+entity changes. **`DispositionMode`** is a disposition *kind* (ratify,
+authorize, set_standing, overrule, triage), not a Countersign *mode*:
+the Countersign mode (explicit / implicit / automatic) belongs to an
+act and is derived by rule, and `DispositionMode` becomes a
+countersignature's `basis` at the mapping boundary only. See
+`doc/countersign-mapping.md`.
+
 ## Retired terms
 
 - **Bond** — retired 2026-09-20, superseded by canonical **R** (lexicon
