@@ -341,6 +341,12 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("report", help="read staged results")
     r.add_argument("--commission", required=True)
     sub.add_parser("pending", help="list commissions with no session")
+    i = sub.add_parser("infer", help="run the Half 2 inference-service loop")
+    i.add_argument("--agent", required=True,
+                   help="agent module in core.package (must define handle(event, inference_results))")
+    i.add_argument("--event", required=True, help="JSON event for the agent")
+    i.add_argument("--max-rounds", type=int, default=3)
+    i.add_argument("--claude-timeout-s", type=int, default=120)
 
     args = ap.parse_args(argv)
     root = Path(args.root)
@@ -369,6 +375,14 @@ def main(argv: list[str] | None = None) -> int:
             pending = pending_commissions(root)
             print(json.dumps([{"commission_id": r["commission_id"],
                                "seq": r["seq"]} for r in pending]))
+        elif args.cmd == "infer":
+            from . import author_infer
+            t = author_infer.infer_loop(
+                agent=args.agent, event=json.loads(args.event),
+                max_rounds=args.max_rounds,
+                claude_timeout_s=args.claude_timeout_s)
+            print(json.dumps(t, indent=1, sort_keys=True))
+            return 0 if t["outcome"] == "complete" else 4
         return 0
     except aa.Refusal as e:
         print(json.dumps({"refused": True, "reasons": [str(e)]}),

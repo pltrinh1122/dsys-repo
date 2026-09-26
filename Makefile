@@ -12,8 +12,11 @@
 #                   # -> writes install-receipt.json
 #   make run        # end-to-end loop + batteries x2 + determinism
 #                   # -> pasteable telemetry block for chat verification
+#   make infer      # Half 2 inference-service demo (stub-backed claude)
+#                   # -> pasteable telemetry block for chat verification
 #
-# make run refuses unless make install has completed (install-receipt.json).
+# make run / make infer refuse unless make install has completed
+# (install-receipt.json).
 
 SHELL := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
@@ -21,12 +24,13 @@ SHELL := /bin/bash
 ROOT := $(CURDIR)
 RECEIPT := $(ROOT)/install-receipt.json
 
-.PHONY: help install run clean
+.PHONY: help install run infer clean
 
 help:
 	@printf 'targets:\n'
 	@printf '  install   verify the tree (venv, golden batteries, CLI smoke)\n'
 	@printf '  run       execute end-to-end + gather pasteable telemetry\n'
+	@printf '  infer     Half 2 inference-service demo + telemetry\n'
 	@printf '  clean     remove install-receipt.json and install-logs/\n'
 
 install:
@@ -35,6 +39,10 @@ install:
 run:
 	@test -f "$(RECEIPT)" || { printf 'FAIL: installer has not executed in this tree.\n  missing: %s\nRun `make install` first.\n' "$(RECEIPT)" >&2; exit 1; }
 	python3 $(ROOT)/scripts/run_author_agent.py
+
+infer:
+	@test -f "$(RECEIPT)" || { printf 'FAIL: installer has not executed in this tree.\n  missing: %s\nRun `make install` first.\n' "$(RECEIPT)" >&2; exit 1; }
+	python3 $(ROOT)/scripts/run_infer_demo.py
 
 clean:
 	rm -rf "$(ROOT)/install-logs" "$(RECEIPT)"

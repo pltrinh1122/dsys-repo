@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Deterministic test double for the `claude` CLI contract (Half 2 spec §2).
+
+Contract: `claude [--kind KIND] PROMPT` → response text on stdout, exit 0.
+This stub's response is a pure function of (kind, prompt): a verdict line
+derived from sha256(kind + "\\x00" + prompt). No network. Byte-identical
+across runs and machines.
+
+Every transcript served by this stub records claude.backing="stub"; a
+stub-backed transcript must never be presented as production inference.
+"""
+import argparse
+import hashlib
+import sys
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="claude")
+    ap.add_argument("--kind", default="assess")
+    ap.add_argument("prompt")
+    a = ap.parse_args()
+    h = hashlib.sha256((a.kind + "\x00" + a.prompt).encode("utf-8")).hexdigest()
+    verdict = "URGENT" if int(h, 16) % 2 == 0 else "ROUTINE"
+    sys.stdout.write(f"[stub:{a.kind}:{h[:16]}]\nverdict: {verdict}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

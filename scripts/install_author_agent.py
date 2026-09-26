@@ -99,6 +99,7 @@ batteries = [
     ("channels", '"ok": true', [VPY, "-m", "core.package.author_channels_golden_run"]),
     ("author", '"ok": true', [VPY, "-m", "core.package.author_agent_golden_run"]),
     ("contain", "6/6 passed", [VPY, "core/package/author_contain_golden_run.py"]),
+    ("infer", "15/15 passed", [VPY, "-m", "core.package.author_infer_golden_run"]),
 ]
 for name, expect, cmd in batteries:
     if failed or not VPY:
@@ -157,7 +158,7 @@ if not failed:
         "pydantic": r.stdout.strip() if r.returncode == 0 else "?",
         "venv_dir": venv_dir,
         "checks": {"factory": True, "channels": True, "author": True,
-                   "contain": True, "cli_smoke": True},
+                   "contain": True, "infer": True, "cli_smoke": True},
     }
     RECEIPT.write_text(json.dumps(receipt, indent=1) + "\n")
     print(f"receipt written: {RECEIPT}")

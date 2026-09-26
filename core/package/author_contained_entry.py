@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -95,6 +96,46 @@ def _mode_hang(scratch: Path, commission: dict) -> dict:
     return {"mode": "hang", "outcome": "finished"}
 
 
+_AGENT_NAME_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _mode_infer(scratch: Path, commission: dict) -> dict:
+    """Half 2 inference-service round: run the named agent's handle().
+
+    commission: {"agent": "<module in core.package>", "event": {...},
+                 "inference_results": [...]}.
+    The agent may print @@prompt-request blocks to stdout (parsed
+    harness-side); its return value is adopted as agent_result.
+    Zero inference inside — like every other mode.
+    """
+    import importlib
+    name = commission.get("agent", "")
+    if not isinstance(name, str) or not _AGENT_NAME_RE.fullmatch(name):
+        return {"mode": "infer", "outcome": "refused",
+                "reason": f"bad agent name {name!r}"}
+    try:
+        mod = importlib.import_module(f"core.package.{name}")
+    except Exception as e:  # noqa: BLE001
+        return {"mode": "infer", "outcome": "refused",
+                "reason": f"no agent {name!r}: {type(e).__name__}: {e}"}
+    handle = getattr(mod, "handle", None)
+    if not callable(handle):
+        return {"mode": "infer", "outcome": "refused",
+                "reason": f"agent {name!r} has no handle(event, inference_results)"}
+    try:
+        result = handle(commission.get("event", {}),
+                        commission.get("inference_results", []))
+    except Exception as e:  # noqa: BLE001 — never let a crash escape raw
+        return {"mode": "infer", "outcome": "crashed",
+                "reason": f"{type(e).__name__}: {e}"}
+    try:
+        json.dumps(result)
+    except (TypeError, ValueError) as e:
+        return {"mode": "infer", "outcome": "crashed",
+                "reason": f"agent_result not JSON-serializable: {e}"}
+    return {"mode": "infer", "outcome": "ok", "agent_result": result}
+
+
 def main(argv: list[str]) -> int:
     scratch = _scratch()
     commission = json.loads((scratch / "commission.json").read_text())
@@ -107,6 +148,8 @@ def main(argv: list[str]) -> int:
         result = _mode_attempt_write(scratch, commission)
     elif mode == "hang":
         result = _mode_hang(scratch, commission)
+    elif mode == "infer":
+        result = _mode_infer(scratch, commission)
     else:
         result = {"mode": mode, "outcome": "refused",
                   "reason": f"unknown contained mode {mode!r}"}
