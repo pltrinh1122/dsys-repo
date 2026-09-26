@@ -3,3 +3,7 @@ __pycache__/
 *.pyo
 .DS_Store
 runs/
+run-scratch-*/
+# per-machine install state (not source)
+install-receipt.json
+install-logs/
