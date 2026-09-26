@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """make install — verify the Half 1 author-agent tree.
 
-1. checks python3 (>= 3.10) and pip
-2. installs pydantic on the host python if missing (pinned to the verified version)
-3. bootstraps the contained venv (~/.dsys/author-venv, hash-pinned;
-   override with AUTHOR_VENV_DIR)
-4. runs all four golden batteries and asserts the exact expected counts
-5. smoke-tests the channel CLI (read-only)
-6. writes install-receipt.json — proof of install; `make run` refuses without it
+1. checks python3 (>= 3.10) and the venv module
+2. bootstraps the contained venv (~/.dsys/author-venv, hash-pinned;
+   override with AUTHOR_VENV_DIR) — the venv is the ONLY python the
+   tree ever runs under; the host interpreter is never mutated
+   (this sidesteps PEP 668 externally-managed-environment systems)
+3. runs all four golden batteries under the venv python and asserts
+   the exact expected counts
+4. smoke-tests the channel CLI (read-only) under the venv python
+5. writes install-receipt.json — proof of install; `make run` refuses without it
 
 Idempotent: safe to re-run. Logs go to <tree>/install-logs/.
 Exit 0 on all green, 1 otherwise.
@@ -37,71 +39,69 @@ def fail(msg: str) -> None:
     failed.append(msg)
 
 
-def sh(*args: str, cwd: Path = ROOT, timeout: int = 600) -> subprocess.CompletedProcess:
-    return subprocess.run(list(args), cwd=cwd, capture_output=True,
-                          text=True, timeout=timeout)
-
-
 def step(n: str) -> None:
     print(f"\n==> {n}")
 
 
+def pyver(python: str) -> str:
+    r = subprocess.run([python, "-c",
+                        "import sys; print('.'.join(map(str, sys.version_info[:3])))"],
+                       capture_output=True, text=True, timeout=60)
+    return r.stdout.strip() if r.returncode == 0 else "?"
+
+
 # --- 1. preconditions ------------------------------------------------------
-step("1/5 preconditions")
+step("1/4 preconditions")
 ok(f"tree root: {ROOT}")
-r = sh(PY3, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')")
-pyver = r.stdout.strip()
-r = sh(PY3, "-c", "import sys; print('yes' if sys.version_info >= (3, 10) else 'no')")
+r = subprocess.run([PY3, "-c",
+                    "import sys; print('yes' if sys.version_info >= (3, 10) else 'no')"],
+                   capture_output=True, text=True, timeout=60)
+ver = pyver(PY3)
 if r.returncode == 0 and r.stdout.strip() == "yes":
-    ok(f"python3 {pyver} (>= 3.10)")
+    ok(f"python3 {ver} (>= 3.10)")
 else:
-    fail(f"python3 {pyver} missing or < 3.10 (need >= 3.10)")
-if sh(PY3, "-m", "pip", "--version").returncode == 0:
-    ok("pip available")
-else:
-    fail("pip not available for python3 (try: python3 -m ensurepip)")
-
-# --- 2. host pydantic ------------------------------------------------------
-step("2/5 host pydantic")
-r = sh(PY3, "-c", "import pydantic; print(pydantic.VERSION)")
+    fail(f"python3 {ver} missing or < 3.10 (need >= 3.10)")
+r = subprocess.run([PY3, "-c", "import venv, ensurepip"],
+                   capture_output=True, text=True, timeout=60)
 if r.returncode == 0:
-    ok(f"pydantic {r.stdout.strip()} already installed")
-    pydantic_ver = r.stdout.strip()
+    ok("venv module available")
 else:
-    print("installing pydantic==2.13.5 (verified version; needs network)...")
-    r = sh(PY3, "-m", "pip", "install", "pydantic==2.13.5")
-    (LOGDIR / "pip-pydantic.log").write_text(r.stdout + r.stderr)
-    if r.returncode == 0:
-        ok("pydantic installed")
-        pydantic_ver = "2.13.5"
-    else:
-        fail("pip install pydantic failed (network?) — see install-logs/pip-pydantic.log")
-        pydantic_ver = "?"
+    fail("python3 -m venv unavailable (Debian/Ubuntu: apt install python3-venv)")
 
-# --- 3. contained venv (harness-managed; ratified J-C1) --------------------
-step("3/5 contained venv")
+# --- 2. contained venv (harness-managed; ratified J-C1) --------------------
+step("2/4 contained venv")
 venv_dir = os.environ.get("AUTHOR_VENV_DIR") or str(Path.home() / ".dsys" / "author-venv")
+VPY = ""
 if failed:
     fail("skipped: earlier step failed")
 else:
     sys.path.insert(0, str(ROOT))
     try:
         from core.package.author_contain import ensure_venv, venv_fingerprint
-        py = ensure_venv(Path(venv_dir))
-        ok(f"contained venv ready ({py}; fingerprint {venv_fingerprint(py)})")
+        vpy = ensure_venv(Path(venv_dir))
+        VPY = str(vpy)
+        fp = venv_fingerprint(vpy)
+        ok(f"contained venv ready ({VPY}; pydantic {fp['packages'].get('pydantic', '?')})")
     except Exception as e:  # noqa: BLE001
-        fail(f"ensure_venv failed: {e}")
+        (LOGDIR / "ensure-venv.log").write_text(str(e))
+        fail(f"contained venv failed: {e} — see install-logs/ensure-venv.log")
 
-# --- 4. golden batteries ---------------------------------------------------
-step("4/5 golden batteries")
+
+def sh(*args: str, timeout: int = 600) -> subprocess.CompletedProcess:
+    return subprocess.run(list(args), cwd=ROOT, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+# --- 3. golden batteries (under the venv python) ---------------------------
+step("3/4 golden batteries")
 batteries = [
-    ("factory", "passed cases: 183", [PY3, "-m", "core.package.factory_golden_run"]),
-    ("channels", '"ok": true', [PY3, "-m", "core.package.author_channels_golden_run"]),
-    ("author", '"ok": true', [PY3, "-m", "core.package.author_agent_golden_run"]),
-    ("contain", "6/6 passed", [PY3, "core/package/author_contain_golden_run.py"]),
+    ("factory", "passed cases: 183", [VPY, "-m", "core.package.factory_golden_run"]),
+    ("channels", '"ok": true', [VPY, "-m", "core.package.author_channels_golden_run"]),
+    ("author", '"ok": true', [VPY, "-m", "core.package.author_agent_golden_run"]),
+    ("contain", "6/6 passed", [VPY, "core/package/author_contain_golden_run.py"]),
 ]
 for name, expect, cmd in batteries:
-    if failed:
+    if failed or not VPY:
         fail(f"{name} skipped (earlier failure)")
         continue
     r = sh(*cmd)
@@ -117,41 +117,44 @@ if flog.exists():
     else:
         fail("factory violations non-empty — see install-logs/factory.log")
 
-# --- 5. CLI smoke (read-only) ----------------------------------------------
-step("5/5 channel CLI smoke (read-only)")
-if failed:
+# --- 4. CLI smoke (read-only, under the venv python) -----------------------
+step("4/4 channel CLI smoke (read-only)")
+if failed or not VPY:
     fail("skipped: earlier failure")
 else:
-    r = sh(PY3, "-m", "core.package.author_channels", "pending")
+    r = sh(VPY, "-m", "core.package.author_channels", "pending")
     if r.returncode == 0 and r.stdout.strip() == "[]":
         ok("pending -> []")
     else:
         fail("pending did not return []")
-    r = sh(PY3, "-m", "core.package.author_channels",
+    r = sh(VPY, "-m", "core.package.author_channels",
            "report", "--commission", "commission-001")
     if r.returncode == 0 and '"all_green": true' in r.stdout:
         ok("report commission-001 -> diagnostics all green")
     else:
         fail("report commission-001 not all green")
 
-# --- 6. receipt + summary ----------------------------------------------------
+# --- 5. receipt + summary ----------------------------------------------------
 print()
 if not failed:
     def git(*a: str) -> str | None:
         try:
-            r = sh("git", "-C", str(ROOT), *a, timeout=10)
+            r = subprocess.run(["git", "-C", str(ROOT), *a],
+                               capture_output=True, text=True, timeout=10)
             return r.stdout.strip() or None
         except Exception:  # noqa: BLE001
             return None
 
     branch, sha = git("branch", "--show-current"), git("rev-parse", "--short", "HEAD")
+    r = subprocess.run([VPY, "-c", "import pydantic; print(pydantic.VERSION)"],
+                       capture_output=True, text=True, timeout=60)
     receipt = {
         "installer_version": "make install (scripts/install_author_agent.py)",
         "installed_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "tree": str(ROOT),
         "tree_git": f"{branch}@{sha}" if branch and sha else None,
-        "python": pyver,
-        "pydantic": pydantic_ver,
+        "python": pyver(VPY),
+        "pydantic": r.stdout.strip() if r.returncode == 0 else "?",
         "venv_dir": venv_dir,
         "checks": {"factory": True, "channels": True, "author": True,
                    "contain": True, "cli_smoke": True},
