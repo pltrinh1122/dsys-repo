@@ -3,9 +3,11 @@
 #  containment DR-CMD-086/088).
 #
 # Empty-directory flow:
-#   git clone --depth 1 --branch build/half1 \
-#       https://github.com/pltrinh1122/dsys-repo.git dsys
-#   cd dsys
+#   curl -O https://raw.githubusercontent.com/pltrinh1122/dsys-repo/build/half1/bootstrap-dsys.sh
+#   bash bootstrap-dsys.sh   # clones the tree, runs make install
+#   cd dsys && make run
+#
+# (From a checkout you can also run make directly.)
 #   make install    # python/venv checks, golden batteries, CLI smoke
 #                   # -> writes install-receipt.json
 #   make run        # end-to-end loop + batteries x2 + determinism
