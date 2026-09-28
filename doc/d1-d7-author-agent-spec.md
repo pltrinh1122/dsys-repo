@@ -9,7 +9,7 @@ playbook as verification of success.
 
 The D1–D7 factory (ratified DR-CMD-082) verifies agents but operates none:
 falsified 2026-09-26 — no runner exists; golden runs are harnesses; the
-updater drives flows not agents; `execute --as` is spec-only; the Triad is
+updater drives flows not agents; `execute --as` is spec-only; the Tetrad is
 an authoring constraint, not an execution engine. Every profile to date
 was authored by the ambient directly. The loop closes that gap for
 *authoring*: a governed author-agent authors profiles, the Factory builds

@@ -102,8 +102,12 @@ _AGENT_NAME_RE = re.compile(r"[A-Za-z0-9_]+")
 def _mode_infer(scratch: Path, commission: dict) -> dict:
     """Half 2 inference-service round: run the named agent's handle().
 
-    commission: {"agent": "<module in core.package>", "event": {...},
-                 "inference_results": [...]}.
+    commission: {"agent": "<module>", "agent_ns": "" | "authored",
+                 "event": {...}, "inference_results": [...]}.
+    agent_ns "authored" resolves core.package.authored.<agent> — the
+    verified-build overlay the harness placed in the scratch tree
+    (prepare_scratch authored_overlay). The bare namespace keeps the
+    legacy core.package.<agent> demo/test agents.
     The agent may print @@prompt-request blocks to stdout (parsed
     harness-side); its return value is adopted as agent_result.
     Zero inference inside — like every other mode.
@@ -113,11 +117,17 @@ def _mode_infer(scratch: Path, commission: dict) -> dict:
     if not isinstance(name, str) or not _AGENT_NAME_RE.fullmatch(name):
         return {"mode": "infer", "outcome": "refused",
                 "reason": f"bad agent name {name!r}"}
+    ns = commission.get("agent_ns", "")
+    if ns not in ("", "authored"):
+        return {"mode": "infer", "outcome": "refused",
+                "reason": f"bad agent_ns {ns!r}"}
+    modname = (f"core.package.authored.{name}" if ns == "authored"
+               else f"core.package.{name}")
     try:
-        mod = importlib.import_module(f"core.package.{name}")
+        mod = importlib.import_module(modname)
     except Exception as e:  # noqa: BLE001
         return {"mode": "infer", "outcome": "refused",
-                "reason": f"no agent {name!r}: {type(e).__name__}: {e}"}
+                "reason": f"no agent {modname!r}: {type(e).__name__}: {e}"}
     handle = getattr(mod, "handle", None)
     if not callable(handle):
         return {"mode": "infer", "outcome": "refused",

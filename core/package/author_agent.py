@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import sys
 import json
 import tempfile
 from pathlib import Path
@@ -200,6 +201,10 @@ def _load_authored(root: Path, agent_name: str) -> Any:
         f"author_agent_staged_{agent_name}", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    # Proper module identity: staged modules may define their own pydantic
+    # models, whose PEP 563 forward references resolve via
+    # sys.modules[__module__]. Without this entry the models never complete.
+    sys.modules[f"author_agent_staged_{agent_name}"] = module
     spec.loader.exec_module(module)
     return module
 

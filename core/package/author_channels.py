@@ -26,8 +26,11 @@ World channels: specified, UNBOUND for the wright (D7 0.75, D5 0.0).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
 import sys
+import tempfile
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -192,6 +195,286 @@ def _next_commission_id(root: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Authoring-package staging (AP-E1 staged-proposal; the MECHANICAL side of
+# "authoring"). The ambient's inference delivers an AuthoringPackage; this
+# command checks everything checkable and stages it. Zero inference here.
+#
+# Pipeline (fail-closed, reasons at every step):
+#   G1 envelope -> commission exists + operator-attributed
+#   -> stage bytes + hash-pinned manifest
+#   -> G2 archetype gate, run early so the ambient gets immediate
+#      feedback (drive_one re-runs it; the driver trusts nothing)
+#   -> G4 rationale present, G6 diagnostic_cases present
+#   -> record authoring session -> stage build-request (J1-ii)
+# A refusal after bytes are staged leaves the bytes without a
+# build-request: the driver builds only staged build-requests, so a
+# refused package can never be built silently.
+# ---------------------------------------------------------------------------
+
+def stage_profile_package(root: Path, *, agent_name: str, profile_file: Path,
+                          rationale_file: Path, archetypes: list[str],
+                          commission_id: str, note: str = "") -> dict:
+    from .author_package import (AuthoringPackage, CHECKLIST_ITEMS,
+                                 PackageViolation, validate_envelope)
+    from .factory_archetypes import check_profile
+
+    if list(CHECKLIST_ITEMS) != list(aa.CHECKLIST):
+        raise aa.Refusal("checklist drift: author_package.CHECKLIST_ITEMS "
+                         "does not match author_agent.CHECKLIST")
+
+    def refuse(reasons: list[str]):
+        raise aa.Refusal("; ".join(reasons))
+
+    try:
+        source = profile_file.read_text()
+    except OSError as e:
+        refuse([f"cannot read profile file {profile_file}: {e}"])
+    try:
+        rationale = rationale_file.read_text()
+    except OSError as e:
+        refuse([f"cannot read rationale file {rationale_file}: {e}"])
+
+    pkg = AuthoringPackage(
+        agent_name=agent_name, profile_source=source, rationale=rationale,
+        archetypes=tuple(archetypes), commission_id=commission_id,
+        checklist={k: True for k in CHECKLIST_ITEMS}, note=note)
+    try:
+        summary = validate_envelope(pkg)
+    except PackageViolation as e:
+        refuse([f"package envelope invalid: {e}"])
+
+    log = aa.read_log(root)
+    commissions = [r for r in log
+                   if r.get("kind") == "commission"
+                   and r.get("commission_id") == commission_id]
+    if not commissions:
+        refuse([f"no such commission {commission_id!r} (G1)"])
+    if commissions[-1].get("principal_id") != "operator":
+        refuse([f"commission {commission_id!r} is not operator-attributed "
+                f"(principal={commissions[-1].get('principal_id')!r}) (G1)"])
+
+    staged = aa.stage_authored_profile(
+        root, agent_name, source, rationale, commission_id)
+
+    module = aa._load_authored(root, agent_name)
+    builder = getattr(module, f"{agent_name}_profile", None)
+    if builder is None:
+        refuse([f"module lacks builder {agent_name}_profile() (G2)"])
+    try:
+        violations = check_profile(builder(), archetypes)
+    except ValueError as e:
+        refuse([f"G2 archetype-gate: {e}"])
+    if violations:
+        refuse([f"G2 archetype-gate: {v}" for v in violations])
+
+    cases_fn = getattr(module, "diagnostic_cases", None)
+    if cases_fn is None:
+        refuse(["module lacks diagnostic_cases() (G6)"])
+    if not cases_fn():
+        refuse(["diagnostic_cases() empty (G6: profile incomplete)"])
+
+    session = aa.record_authoring_session(
+        root, commission_id, agent_name,
+        {k: True for k in aa.CHECKLIST}, note=note)
+    req = aa.stage_build_request(root, agent_name, commission_id)
+    return {
+        "agent": agent_name,
+        "profile_sha256": staged["sha256"],
+        "session_seq": session["seq"],
+        "build_request_seq": req["seq"],
+        "gates": {"G1 commission operator-attributed": "ok",
+                  "G2 archetype-gate": "ok",
+                  "G4 rationale staged": "ok",
+                  "G5 stage-only": "ok (command stages; never deploys)",
+                  "G6 diagnostics authored": "ok"},
+        "envelope": summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Customization sequence channels (the bridge: customizer proposes,
+# operator disposes, factory registers — pre-delivery, never after).
+# ---------------------------------------------------------------------------
+
+def stage_customization_proposal(root: Path, *, proposal_file: Path,
+                                 commission_id: str,
+                                 note: str = "") -> dict:
+    """Mechanical side of 'propose': validate the envelope, require an
+    operator-attributed commission, RE-RUN the registry lookup to verify
+    the carried absence evidence, then stage the proposal (bytes pinned).
+    Refuses with reasons on any failure. Never registers, never builds."""
+    from .customizer import (CustomizationProposal, ProposalViolation,
+                             validate_proposal_envelope)
+    from . import artifact_registry as reg
+
+    def refuse(reasons: list[str]):
+        raise aa.Refusal("; ".join(reasons))
+
+    try:
+        raw = json.loads(proposal_file.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        refuse([f"cannot read proposal file {proposal_file}: {e}"])
+    try:
+        proposal = CustomizationProposal(**raw)
+    except Exception as e:
+        refuse([f"proposal envelope malformed: {e}"])
+    try:
+        summary = validate_proposal_envelope(proposal)
+    except ProposalViolation as e:
+        refuse([f"proposal envelope invalid: {e}"])
+
+    log = aa.read_log(root)
+    commissions = [r for r in log
+                   if r.get("kind") == "commission"
+                   and r.get("commission_id") == commission_id]
+    if not commissions:
+        refuse([f"no such commission {commission_id!r}"])
+    if commissions[-1].get("principal_id") != "operator":
+        refuse([f"commission {commission_id!r} is not operator-attributed "
+                f"(principal={commissions[-1].get('principal_id')!r})"])
+    if proposal.commission_id != commission_id:
+        refuse([f"proposal cites {proposal.commission_id!r}, staged under "
+                f"{commission_id!r}: commission mismatch"])
+
+    # Verify the evidence: re-run the lookup NOW and compare.
+    fresh = reg.absence_evidence(root, proposal.artifact_kind,
+                                 proposal.registry_evidence.query)
+    if sorted(fresh["hits"]) != sorted(proposal.registry_evidence.hits):
+        refuse([f"registry evidence stale or forged: proposal claims hits "
+                f"{proposal.registry_evidence.hits}, registry now returns "
+                f"{fresh['hits']}"])
+
+    # Supersede chain: a versioned customization must name a registered
+    # artifact and propose exactly latest.version + 1.
+    if proposal.supersedes is not None:
+        latest = reg.latest_version(root, proposal.artifact_kind,
+                                    proposal.supersedes)
+        if latest is None:
+            refuse([f"supersedes={proposal.supersedes!r}: not registered"])
+        if proposal.proposed_version != latest.version + 1:
+            refuse([f"supersedes {proposal.artifact_kind}/"
+                    f"{proposal.supersedes} v{latest.version}: "
+                    f"proposed_version must be {latest.version + 1}, got "
+                    f"{proposal.proposed_version}"])
+        if proposal.artifact_name != latest.name:
+            refuse([f"supersede must version the same artifact: proposal "
+                    f"names {proposal.artifact_name!r}, supersedes "
+                    f"{latest.name!r}"])
+
+    rec = aa._append(root, {
+        "kind": "staged-proposal",
+        "proposal": proposal.model_dump(),
+        "proposal_sha256": summary["artifact_sha256"],
+        "commission_id": commission_id,
+        "status": "pending-disposition",
+        "note": note,
+    })
+    return {"proposal_seq": rec["seq"],
+            "proposal_sha256": summary["artifact_sha256"],
+            "status": "pending-disposition",
+            "evidence_verified": fresh}
+
+
+def adopt_customization_proposal(root: Path, *, proposal_seq: int,
+                                 disposition_ref: str,
+                                 by: str = "operator") -> dict:
+    """Mechanical side of 'dispose -> register': adopt a pending proposal.
+
+    Requires the disposition to be operator-attributed (by == "operator"
+    with a non-empty disposition_ref). Registers the artifact versioned
+    and content-pinned; marks the proposal adopted. A proposal is adopted
+    once; adoption is the only path to registration — the customizer can
+    never self-register (its D5 write_scope is empty).
+    """
+    from . import artifact_registry as reg
+
+    def refuse(reasons: list[str]):
+        raise aa.Refusal("; ".join(reasons))
+
+    if by != "operator":
+        refuse([f"adoption refused: disposition must be operator-attributed "
+                f"(by={by!r})"])
+    if not disposition_ref or not disposition_ref.strip():
+        refuse(["adoption refused: disposition_ref required — registration "
+                "rests on disposition, never on drafting"])
+
+    log = aa.read_log(root)
+    proposals = [r for r in log
+                 if r.get("kind") == "staged-proposal"
+                 and r.get("seq") == proposal_seq]
+    if not proposals:
+        refuse([f"no staged proposal seq={proposal_seq}"])
+    prec = proposals[-1]
+    if any(r.get("kind") == "proposal-adopted"
+           and r.get("proposal_seq") == proposal_seq for r in log):
+        refuse([f"proposal seq={proposal_seq} already adopted: adopted "
+                f"once, never twice"])
+    p = prec["proposal"]
+    try:
+        rec = reg.register(
+            root, kind=p["artifact_kind"], name=p["artifact_name"],
+            artifact_bytes=p["artifact_source"].encode("utf-8"),
+            producer="customizer", commission_id=p["commission_id"],
+            disposition_ref=disposition_ref)
+    except reg.RegistryError as e:
+        refuse([f"registration refused: {e}"])
+
+    aa._append(root, {"kind": "proposal-adopted",
+                      "proposal_seq": proposal_seq,
+                      "artifact": rec.model_dump(),
+                      "disposition_ref": disposition_ref,
+                      "by": by})
+    # mark the staged proposal adopted (append-only: a superseding record)
+    return {"proposal_seq": proposal_seq,
+            "status": "adopted",
+            "artifact": rec.model_dump()}
+
+
+# ---------------------------------------------------------------------------
+# Verified-build runtime: the runtime executes only VERIFIED builds.
+# resolve_verified_agent pins the staged bytes (sha256 vs the staged
+# manifest), requires a staged build-request for those bytes, and
+# requires a "verified" verdict for the agent. Anything else refuses
+# with reasons — an unverified or tampered-with agent never executes.
+# ---------------------------------------------------------------------------
+
+def resolve_verified_agent(root: Path, agent_name: str
+                           ) -> tuple[Path, str]:
+    """Return (module_path, sha256) for a verified built agent.
+
+    Raises aa.Refusal unless the staged bytes are hash-pinned, covered
+    by a build-request, and the agent has a "verified" verdict.
+    """
+    log = aa.read_log(root)
+    staged = [r for r in log
+              if r.get("kind") == "staged-profile"
+              and r.get("agent") == agent_name]
+    if not staged:
+        raise aa.Refusal(f"no staged profile for {agent_name!r}")
+    pin = staged[-1]["sha256"]
+    path = root / f"{agent_name}.py"
+    if not path.exists():
+        raise aa.Refusal(f"staged module missing: {path}")
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual != pin:
+        raise aa.Refusal(
+            f"staged bytes changed under the runtime: pinned "
+            f"{pin[:12]} vs actual {actual[:12]}")
+    if not any(r.get("kind") == "build-request"
+               and r.get("agent") == agent_name
+               and r.get("profile_sha256") == pin for r in log):
+        raise aa.Refusal(
+            f"no build-request covers pinned bytes {pin[:12]} "
+            f"for {agent_name!r}")
+    if not any(r.get("kind") == "verdict"
+               and r.get("agent") == agent_name
+               and r.get("outcome") == "verified" for r in log):
+        raise aa.Refusal(f"no verified verdict for {agent_name!r}; "
+                         "the runtime executes verified builds only")
+    return path, pin
+
+
+# ---------------------------------------------------------------------------
 # Principal-efferent: result reports (AP-E2)
 # ---------------------------------------------------------------------------
 
@@ -338,15 +621,47 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--agent", default="wright", choices=["wright"])
 
     sub.add_parser("drive", help="run the factory driver once")
+    s = sub.add_parser("stage-profile",
+                       help="stage an authored profile package "
+                            "(mechanical side of authoring)")
+    s.add_argument("--commission", required=True)
+    s.add_argument("--agent", required=True,
+                   help="agent name; module must define "
+                        "{agent}_profile(), ARCHETYPES, diagnostic_cases()")
+    s.add_argument("--profile-file", required=True,
+                   help="path to the authored profile module source")
+    s.add_argument("--rationale-file", required=True,
+                   help="path to the staged rationale prose (G4)")
+    s.add_argument("--archetypes", required=True,
+                   help="comma-separated declared archetypes")
+    s.add_argument("--note", default="",
+                   help="ambient note recorded with the session")
     r = sub.add_parser("report", help="read staged results")
     r.add_argument("--commission", required=True)
     sub.add_parser("pending", help="list commissions with no session")
     i = sub.add_parser("infer", help="run the Half 2 inference-service loop")
     i.add_argument("--agent", required=True,
                    help="agent module in core.package (must define handle(event, inference_results))")
+    i.add_argument("--root", default=None,
+                   help="authoring root: resolve --agent as a VERIFIED "
+                        "build (hash-pinned, verdict-gated) and execute "
+                        "the staged module instead of core.package")
     i.add_argument("--event", required=True, help="JSON event for the agent")
     i.add_argument("--max-rounds", type=int, default=3)
     i.add_argument("--claude-timeout-s", type=int, default=120)
+    p = sub.add_parser("propose-customization",
+                       help="stage a customization proposal (mechanical "
+                            "side of 'propose'; never registers)")
+    p.add_argument("--commission", required=True)
+    p.add_argument("--proposal-file", required=True,
+                   help="JSON CustomizationProposal envelope")
+    p.add_argument("--note", default="")
+    a = sub.add_parser("adopt-proposal",
+                       help="adopt a pending proposal on operator "
+                            "disposition (registers the artifact)")
+    a.add_argument("--proposal-seq", type=int, required=True)
+    a.add_argument("--disposition-ref", required=True)
+    a.add_argument("--by", default="operator")
 
     args = ap.parse_args(argv)
     root = Path(args.root)
@@ -369,18 +684,50 @@ def main(argv: list[str] | None = None) -> int:
                               "seq": rec["seq"]}))
         elif args.cmd == "drive":
             print(json.dumps(aa.run_factory_driver_once(root)))
+        elif args.cmd == "stage-profile":
+            rec = stage_profile_package(
+                root, agent_name=args.agent,
+                profile_file=Path(args.profile_file),
+                rationale_file=Path(args.rationale_file),
+                archetypes=[a.strip() for a in args.archetypes.split(",")
+                            if a.strip()],
+                commission_id=args.commission, note=args.note)
+            print(json.dumps(rec, indent=2))
         elif args.cmd == "report":
             print(json.dumps(read_results(root, args.commission), indent=2))
         elif args.cmd == "pending":
             pending = pending_commissions(root)
             print(json.dumps([{"commission_id": r["commission_id"],
                                "seq": r["seq"]} for r in pending]))
+        elif args.cmd == "propose-customization":
+            rec = stage_customization_proposal(
+                root, proposal_file=Path(args.proposal_file),
+                commission_id=args.commission, note=args.note)
+            print(json.dumps(rec, indent=2))
+        elif args.cmd == "adopt-proposal":
+            rec = adopt_customization_proposal(
+                root, proposal_seq=args.proposal_seq,
+                disposition_ref=args.disposition_ref, by=args.by)
+            print(json.dumps(rec, indent=2))
         elif args.cmd == "infer":
             from . import author_infer
-            t = author_infer.infer_loop(
-                agent=args.agent, event=json.loads(args.event),
-                max_rounds=args.max_rounds,
-                claude_timeout_s=args.claude_timeout_s)
+            ns, overlay, sha = "", None, None
+            if args.root is not None:
+                vroot = Path(args.root)
+                mod_path, sha = resolve_verified_agent(vroot, args.agent)
+                tmp = Path(tempfile.mkdtemp(prefix="verified-agent-"))
+                shutil.copyfile(mod_path, tmp / f"{args.agent}.py")
+                overlay, ns = tmp, "authored"
+            try:
+                t = author_infer.infer_loop(
+                    agent=args.agent, event=json.loads(args.event),
+                    max_rounds=args.max_rounds,
+                    claude_timeout_s=args.claude_timeout_s,
+                    authored_overlay=overlay, agent_ns=ns,
+                    agent_sha256=sha)
+            finally:
+                if overlay is not None:
+                    shutil.rmtree(overlay, ignore_errors=True)
             print(json.dumps(t, indent=1, sort_keys=True))
             return 0 if t["outcome"] == "complete" else 4
         return 0
@@ -405,6 +752,9 @@ __all__ = [
     "main",
     "pending_commissions",
     "read_results",
+    "stage_customization_proposal",
+    "adopt_customization_proposal",
+    "stage_profile_package",
     "world_egress",
     "world_ingress",
 ]

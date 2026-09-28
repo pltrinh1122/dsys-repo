@@ -159,14 +159,24 @@ def infer_loop(*, agent: str, event: dict[str, Any],
                max_rounds: int = DEFAULT_MAX_ROUNDS,
                claude_timeout_s: int = DEFAULT_CLAUDE_TIMEOUT_S,
                venv_dir: Any = None,
-               keep_scratch: bool = True) -> dict[str, Any]:
+               keep_scratch: bool = True,
+               authored_overlay: Any = None,
+               agent_ns: str = "",
+               agent_sha256: str | None = None) -> dict[str, Any]:
     """Run the §3 inference loop. Returns the §5 transcript.
+
+    authored_overlay: when given, the contained runs overlay this dir at
+    core.package.authored and agent_ns must be "authored" — the agent
+    that executes is then a staged module, not an in-tree demo.
+    agent_sha256 pins the executed bytes; recorded in the transcript.
 
     outcome is 'complete' (agent_result adopted) or 'refused' (fail-closed;
     refusal_reasons set, no result adopted).
     """
     transcript: dict[str, Any] = {
         "agent": agent,
+        "agent_ns": agent_ns,
+        "agent_sha256": agent_sha256,
         "outcome": "refused",  # overwritten on completion
         "rounds": [],
         "claude": {"backing": claude_backing(),
@@ -182,9 +192,10 @@ def infer_loop(*, agent: str, event: dict[str, Any],
 
     inference_results: list[dict[str, Any]] = []
     for r in range(1, max_rounds + 1):
-        commission = {"mode": "infer", "agent": agent, "event": event,
-                      "inference_results": inference_results}
-        rec = run_contained(commission, timeout_s=DEFAULT_TIMEOUT_S,
+        commission = {"mode": "infer", "agent": agent, "agent_ns": agent_ns,
+                      "event": event, "inference_results": inference_results}
+        rec = run_contained(commission, authored_overlay=authored_overlay,
+                            timeout_s=DEFAULT_TIMEOUT_S,
                             venv_dir=venv_dir, keep_scratch=keep_scratch)
         if rec["outcome"] != "ok":
             return refuse([

@@ -1,4 +1,5 @@
-"""Factory profile set 001 — six D1-D7 agent profiles (Peter, 2026-09-26).
+"""Factory profile set 001 — seven D1-D7 agent profiles (Peter, 2026-09-26;
+customizer admitted as seventh member by Peter, 2026-09-27, DR-CMD-090).
 
 Org-function labels ratified by Peter, 2026-09-26 (DR-CMD-068):
   analyst   (was diverge)    — ideate, research, observe
@@ -7,6 +8,11 @@ Org-function labels ratified by Peter, 2026-09-26 (DR-CMD-068):
   executor  (was execute)    — run, remedy, report, audit (disposed or standing actions only)
   monitor   (was sentinel)   — watch, alert (afferent-relay; never acts)
   coordinator                — inter-agent mediation: route, arbitrate, sequence
+DR-CMD-090 (Peter, 2026-09-27):
+  customizer — draft missing artifacts, stage customization proposals
+               (the customization-sequence agent; secondary agent, not a
+               Factory mode; authored end-to-end through the author-agent
+               loop, commission -> stage -> drive -> verified)
 
 cognitive-assist:
   analyst  — ideate, research, observe
@@ -115,6 +121,7 @@ from .agent_behavior import (
 from .factory_compiler import compile_profile
 from .factory_verifier import verify
 from .factory_archetypes import check_profile
+from .customizer import customizer_profile
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +141,7 @@ PROFILE_ARCHETYPES: dict[str, tuple[str, ...]] = {
     "executor": ("field",),
     "monitor": ("staff", "field"),
     "coordinator": ("staff", "office"),
+    "customizer": ("staff", "office"),  # DR-CMD-090
 }
 
 
@@ -428,6 +436,7 @@ PROFILE_SET_001: dict[str, Any] = {
     "executor": executor_profile,
     "monitor": monitor_profile,
     "coordinator": coordinator_profile,
+    "customizer": customizer_profile,  # DR-CMD-090
 }
 
 
@@ -497,7 +506,7 @@ def run_agent(name: str) -> dict[str, Any]:
 
 
 def run() -> dict[str, Any]:
-    """Run all six profiles through validate -> compile -> verify."""
+    """Run all seven profiles through validate -> compile -> verify."""
     reports = {name: run_agent(name) for name in PROFILE_SET_001}
     ok = all(r["verify"]["verdict"] == "verified" for r in reports.values())
     return {"ok": ok, "agents": reports}
@@ -526,4 +535,5 @@ __all__ = [
     "run",
     "run_agent",
     "monitor_profile",
+    "customizer_profile",
 ]

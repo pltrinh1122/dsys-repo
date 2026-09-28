@@ -9,21 +9,28 @@ check runs at authoring time, before compile.
 An archetype = a named set of facet invariants + declared parameter points +
 a conformance predicate ``conforms(profile, archetype) -> [violations]``.
 A new profile declares its archetype(s); the authoring gate refuses
-violations with explicit reasons. The six ratified profiles
-(factory_profile_set_001.py) are the exemplars: every one must conform,
-and a non-conformance is a finding about the archetype definition, never
-a license to alter a profile facet.
+violations with explicit reasons. The exemplar set is the registered
+built population (DR-CMD-098): every profile present in a
+PROFILE_SET_00X + PROFILE_ARCHETYPES_00X registry with a green set run
+must conform, and a non-conformance is a finding about the archetype
+definition, never a license to alter a profile facet.
 
-Archetype set (derived from the six profiles' shared invariants; only
-archetypes earned by >=2 members or guarding a critical risk):
-  staff   (analyst, advisor, author, monitor, coordinator)
+Archetype set — the Tetrad (DR-CMD-094, 2026-09-27; "Triad" deprecated):
+staff/field/office derived from the seven profiles' shared invariants
+(DR-CMD-069); clerk admitted by operator disposition (DR-CMD-094),
+which supersedes DR-CMD-093's deferral and the DR-CMD-069 evidentiary
+bar for this instance. The bar stands for future admissions.
+  staff   (analyst, advisor, author, monitor, coordinator, customizer)
   field   (analyst, monitor, executor)
-  office  (advisor, author, coordinator)
+  office  (advisor, author, coordinator, customizer)
+  clerk   () — no built profiles yet; populating it (e.g. inbox-organizer,
+            news-synthesizer-poster) is outstanding work
 
 Declined: a single-member "acting-agent" archetype for the executor's
-D1/D5 shape. The data does not earn it (one member); C7 plus the
-field archetype already cover the critical core (no unverified
-world contact, no fail-open at high assurance).
+field may-act D1/D5 shape. The data does not earn it (one member); C7
+plus the field archetype already cover the critical core (no unverified
+world contact, no fail-open at high assurance). The may-act x office
+cell is a different matter: clerk fills it (DR-CMD-094).
 
 Deterministic: every predicate is a pure function of the profile.
 
@@ -151,7 +158,8 @@ STAFF = Archetype(
     description=("Agents whose entire work product is staged proposals for "
                  "operator disposition (proposer != disposer). Mechanizes "
                  "judgment call J-A."),
-    members=("analyst", "advisor", "author", "monitor", "coordinator"),
+    members=("analyst", "advisor", "author", "monitor", "coordinator",
+             "customizer"),
     invariants=(
         Invariant("S1", "D1 0.0: per-event disposition, no self-correction, "
                         "no self-planning (standing dispositions excluded "
@@ -277,7 +285,7 @@ OFFICE = Archetype(
     name="office",
     description=("Agents that read harness-internal staged material only: "
                  "no world-target verification claimed."),
-    members=("advisor", "author", "coordinator"),
+    members=("advisor", "author", "coordinator", "customizer"),
     invariants=(
         Invariant("H1", "D7 0.75: intent, event, trigger verified; "
                         "world_target False",
@@ -298,8 +306,140 @@ OFFICE = Archetype(
 )
 
 
+# ---------------------------------------------------------------------------
+# clerk — may-act x office (DR-CMD-094; label confirmed DR-CMD-095).
+# Agents that act on the world on standing operator
+# disposition while reading staged material only. Fills the unnamed cell of
+# the two-axis model (DR-CMD-092 §3.4). No built profiles yet (members=()).
+# ---------------------------------------------------------------------------
+
+def _cl1_d1_may_act(profile: AgentBehaviorProfile) -> str | None:
+    # Flipped S1 polarity; DR-CMD-070 applies symmetrically: the derived D1
+    # position carries the standing-disposition grant — archetypes may not
+    # touch standing_dispositions (PRINCIPAL_PERSONAL/BUILD). A clerk
+    # commits to action on standing operator disposition: no per-event
+    # disposition gate, derived position above 0.0.
+    a = profile.d1_authority
+    problems = []
+    if a.per_event_disposition:
+        problems.append("per_event_disposition must be False: a clerk acts "
+                        "on standing operator disposition, not per-event "
+                        "disposition")
+    if a.position <= 0.0:
+        problems.append(f"D1 position must be > 0.0, got {a.position}")
+    return "; ".join(problems) or None
+
+
+def _cl2_d4_full_instrumentation(profile: AgentBehaviorProfile) -> str | None:
+    o = profile.d4_observability
+    if o.position != 1.0:
+        return (f"D4 position must be 1.0, got {o.position}: a clerk's world "
+                f"actions are fully observed (mirrors staff S3's position "
+                f"requirement)")
+    return None
+
+
+def _cl3_d5_bounded_write_scope(profile: AgentBehaviorProfile) -> str | None:
+    s = profile.d5_scope
+    problems = []
+    if not s.write_scope:
+        problems.append("write_scope must be non-empty: a clerk acts, and "
+                        "its effect channels are declared")
+    if any(w in {"unbounded", "open-ended", "*"} for w in s.write_scope):
+        problems.append("write_scope must be bounded: 'unbounded', "
+                        "'open-ended' and '*' are refused — declare the "
+                        "effect channels (cf. derive_d5_position bands)")
+    if s.position <= 0.0:
+        problems.append(f"D5 position must be > 0.0, got {s.position}")
+    return "; ".join(problems) or None
+
+
+def _cl4_d6_operator_only(profile: AgentBehaviorProfile) -> str | None:
+    sources = profile.d6_initiative.sources
+    bad = sorted(s.value for s in sources if s is not TriggerSource.OPERATOR)
+    if bad:
+        return ("D6 sources must be OPERATOR only: acting without external "
+                "corroboration is operator-initiated or it does not happen; "
+                f"got {bad}")
+    if not sources:
+        return ("D6 sources must be non-empty (C5): a clerk is activated "
+                "by the operator")
+    return None
+
+
+def _cl6_d2_principal_wins(profile: AgentBehaviorProfile) -> str | None:
+    # DR-CMD-077: D2 is the binary enum {principal_wins_ties,
+    # world_wins_ties}. DR-CMD-093's derivation said "commission_wins_ties";
+    # corrected here (DR-CMD-094): the principal's commission binds — the
+    # commission IS the principal's standing disposition. Presented bytes
+    # never win ties; world_wins_ties is incoherent for office reading
+    # (there is no world_target to win).
+    rule = profile.d2_fidelity.conflict_rule
+    if rule != "principal_wins_ties":
+        return (f"D2 conflict_rule must be 'principal_wins_ties', got "
+                f"{rule!r}: the principal's commission binds action "
+                f"parameters; presented bytes never win ties — "
+                f"'world_wins_ties' is incoherent with office reading "
+                f"(no world_target)")
+    return None
+
+
+CLERK = Archetype(
+    name="clerk",
+    description=("Agents that act on the world on standing operator "
+                 "disposition while reading staged material only: "
+                 "may-act x office. Label confirmed DR-CMD-095."),
+    members=(),
+    invariants=(
+        Invariant("CL1", "D1 > 0.0: standing operator disposition, no "
+                         "per-event disposition gate (flipped S1 polarity; "
+                         "standing_dispositions excluded via the derived "
+                         "position per DR-CMD-070)",
+                  _cl1_d1_may_act,
+                  touches=(("d1_authority", "per_event_disposition"),
+                           ("d1_authority", "position"))),
+        Invariant("CL2", "D4 1.0: full instrumentation — a clerk's world "
+                         "actions are fully observed (mirrors staff S3's "
+                         "position requirement)",
+                  _cl2_d4_full_instrumentation,
+                  touches=(("d4_observability", "position"),)),
+        Invariant("CL3", "D5 > 0.0: non-empty, bounded write_scope — effect "
+                         "channels declared, never unbounded",
+                  _cl3_d5_bounded_write_scope,
+                  touches=(("d5_scope", "write_scope"),
+                           ("d5_scope", "position"))),
+        Invariant("CL4", "D6 OPERATOR only: no WORLD, AGENT, or SELF triggers "
+                         "(non-empty per C5)",
+                  _cl4_d6_operator_only,
+                  touches=(("d6_initiative", "sources"),)),
+        Invariant("CL5", "D7 office reading: reuses H1 (0.75; intent, event, "
+                         "trigger verified; world_target False)",
+                  _h1_no_world_target,
+                  touches=(("d7_verification", "intent_target"),
+                           ("d7_verification", "event_target"),
+                           ("d7_verification", "world_target"),
+                           ("d7_verification", "trigger_target"),
+                           ("d7_verification", "position"))),
+        Invariant("CL6", "D2 principal_wins_ties: the principal's commission "
+                         "binds action parameters; presented bytes never win "
+                         "ties (world_wins_ties incoherent with office "
+                         "reading; DR-CMD-077)",
+                  _cl6_d2_principal_wins,
+                  touches=(("d2_fidelity", "conflict_rule"),)),
+    ),
+    parameters=(
+        "D1 standing disposition classes (the pre-authorized action classes)",
+        "D5 write_scope bounds (effect channels, declared)",
+        "D6 authorization rule text (operator authorization for may-act)",
+        "D2 fixed: principal_wins_ties",
+        "D7 on_failure: escalate | fail_closed",
+        "agent label",
+    ),
+)
+
+
 ARCHETYPES: dict[str, Archetype] = {
-    a.name: a for a in (STAFF, FIELD, OFFICE)
+    a.name: a for a in (STAFF, FIELD, OFFICE, CLERK)
 }
 
 
@@ -368,6 +508,7 @@ __all__ = [
     "STAFF",
     "FIELD",
     "OFFICE",
+    "CLERK",
     "Archetype",
     "Invariant",
     "Violation",
@@ -377,18 +518,31 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    # Gate self-test: the six exemplars must conform; a synthetic
-    # write-scope violation must refuse with an explicit reason.
+    # Gate self-test: the exemplar set IS the registered built population
+    # (DR-CMD-098) — "registered" = present in a PROFILE_SET_00X +
+    # PROFILE_ARCHETYPES_00X registry with its set run green. New profiles in
+    # existing sets join automatically; a new set joins with one line in
+    # PROFILE_SET_PAIRS below. registrar_clerk and triager are not
+    # registered (compile-refused, DR-CMD-096/097) and correctly do not join
+    # yet; they join on registration with green set runs, no disposition.
     from .agent_behavior import D5Scope
     from .factory_profile_set_001 import PROFILE_ARCHETYPES, PROFILE_SET_001
+    from .factory_profile_set_002 import (
+        PROFILE_ARCHETYPES_002, PROFILE_SET_002)
+
+    PROFILE_SET_PAIRS = (
+        (PROFILE_SET_001, PROFILE_ARCHETYPES),
+        (PROFILE_SET_002, PROFILE_ARCHETYPES_002),
+    )
 
     total = 0
-    for label, builder in PROFILE_SET_001.items():
-        vs = check_profile(builder(), PROFILE_ARCHETYPES[label])
-        print(f"{label}: {len(vs)} violations")
-        total += len(vs)
-        for v in vs:
-            print(f"    {v}")
+    for profile_set, archetypes in PROFILE_SET_PAIRS:
+        for label, builder in profile_set.items():
+            vs = check_profile(builder(), archetypes[label])
+            print(f"{label}: {len(vs)} violations")
+            total += len(vs)
+            for v in vs:
+                print(f"    {v}")
     assert total == 0, f"exemplars must conform, got {total} violations"
 
     # Validating rebuild: model_copy(update=) skips pydantic validation
@@ -411,5 +565,26 @@ if __name__ == "__main__":
         print(f"unknown archetype rejected as expected: {e}")
     else:
         raise AssertionError("unknown archetype name must raise ValueError")
+
+    # Clerk non-vacuousness (DR-CMD-094): no built clerk profile exists, so
+    # discrimination is shown with existing exemplars as negative controls.
+    # A staff profile (D1 0.0, D5 0.0) must refuse clerk (CL1, CL3); the
+    # executor (D7 1.0, world_target) must refuse clerk (CL5).
+    staff_vs_clerk = check_profile(PROFILE_SET_001["analyst"](), ("clerk",))
+    assert staff_vs_clerk, "staff profile must refuse clerk"
+    assert any(v.invariant == "CL1" for v in staff_vs_clerk), \
+        "expected a CL1 (D1 may-act) refusal"
+    print("staff profile refused clerk as expected:")
+    for v in staff_vs_clerk:
+        print(f"    {v}")
+
+    executor_vs_clerk = check_profile(PROFILE_SET_001["executor"](),
+                                       ("clerk",))
+    assert executor_vs_clerk, "executor must refuse clerk"
+    assert any(v.invariant == "CL5" for v in executor_vs_clerk), \
+        "expected a CL5 (office reading) refusal"
+    print("executor refused clerk as expected:")
+    for v in executor_vs_clerk:
+        print(f"    {v}")
 
     print("archetype gate self-test: ok")
