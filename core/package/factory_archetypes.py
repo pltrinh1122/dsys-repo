@@ -310,7 +310,8 @@ OFFICE = Archetype(
 # clerk — may-act x office (DR-CMD-094; label confirmed DR-CMD-095).
 # Agents that act on the world on standing operator
 # disposition while reading staged material only. Fills the unnamed cell of
-# the two-axis model (DR-CMD-092 §3.4). No built profiles yet (members=()).
+# the two-axis model (DR-CMD-092 §3.4). First member: registrar_clerk
+# (registered DR-CMD-104).
 # ---------------------------------------------------------------------------
 
 def _cl1_d1_may_act(profile: AgentBehaviorProfile) -> str | None:
@@ -389,7 +390,7 @@ CLERK = Archetype(
     description=("Agents that act on the world on standing operator "
                  "disposition while reading staged material only: "
                  "may-act x office. Label confirmed DR-CMD-095."),
-    members=(),
+    members=("registrar_clerk",),
     invariants=(
         Invariant("CL1", "D1 > 0.0: standing operator disposition, no "
                          "per-event disposition gate (flipped S1 polarity; "
@@ -522,9 +523,10 @@ if __name__ == "__main__":
     # (DR-CMD-098) — "registered" = present in a PROFILE_SET_00X +
     # PROFILE_ARCHETYPES_00X registry with its set run green. New profiles in
     # existing sets join automatically; a new set joins with one line in
-    # PROFILE_SET_PAIRS below. registrar_clerk and triager are not
-    # registered (compile-refused, DR-CMD-096/097) and correctly do not join
+    # PROFILE_SET_PAIRS below. triager and dr_registrar are not
+    # registered (compile-refused, DR-CMD-097/100) and correctly do not join
     # yet; they join on registration with green set runs, no disposition.
+    # registrar_clerk joined on registration (DR-CMD-104).
     from .agent_behavior import D5Scope
     from .factory_profile_set_001 import PROFILE_ARCHETYPES, PROFILE_SET_001
     from .factory_profile_set_002 import (

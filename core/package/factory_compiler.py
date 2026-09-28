@@ -31,7 +31,7 @@ Step-5 judgment calls (beyond transcription, documented):
       registry (B-3 analog): a channel naming a registered tool id, or a
       registered alias, compiles; anything else is a loud refusal at the
       routing stage. One alias is registered: "contracted-tools-only"
-      (the dsys profile's channel) -> all eight contracted tools.
+      (the dsys profile's channel) -> all nine contracted tools.
   J2. A standing-disposition class resolves to bound tools iff its name
       is a registered tool id or alias (exactly one tool -> direct).
       An unresolvable class name is NOT a refusal (that would refuse the
@@ -116,12 +116,19 @@ AGENT_TOOL_IDS: tuple[str, ...] = (
     "tool-run-doctor",
     "tool-record-promotion",
     "tool-commit-accretion",
+    # DR-CMD-102 tranche 1: the contracted write channel for the
+    # content-addressed append-only artifact registry (spec
+    # doc/tool-register-artifact-spec.md). Addition under the standing
+    # J1 discipline — the registry stays closed; it now has nine members.
+    "tool-register-artifact",
 )
 
 # Registry aliases: channel names that expand to tool sets. Part of the
-# pinned registry (J1). Exactly one alias: the dsys profile's channel.
+# pinned registry (J1). Two aliases: the dsys profile's channel, and
+# "artifact-registry" (the registrar_clerk's write channel, DR-CMD-096).
 CHANNEL_ALIASES: dict[str, list[str]] = {
     "contracted-tools-only": list(AGENT_TOOL_IDS),
+    "artifact-registry": ["tool-register-artifact"],
 }
 
 _TOOL_PIN_DIGEST = hashlib.sha256(

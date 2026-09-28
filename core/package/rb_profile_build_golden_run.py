@@ -1,15 +1,20 @@
 """Golden run for rb-profile-build (the closed bootstrap loop, DR-CMD-101).
 
 Acceptances:
-  B-1. registrar_clerk build-request -> the run refuses at COMPILE with the
-       EXACT routing-refusal reason (byte-equal to the direct-compile
-       oracle and to the DR-CMD-096 record).
+  B-1. registrar_clerk build-request -> RECEIVE -> VALIDATE -> GATE ->
+       COMPILE -> VERIFY -> STAGE, all ok (DR-CMD-102 tranche 1:
+       tool-register-artifact landed, so the 'artifact-registry'
+       channel resolves at the routing stage; the DR-CMD-096 refusal
+       is gone). The staged bundle carries the not-published /
+       not-registered disclaimer — registration is the Operator's
+       disposition, never the loop's. Two runs yield byte-equal
+       transcripts (deterministic replay).
   B-2. triager build-request -> refuses at COMPILE with the exact reason
        (DR-CMD-097 record).
   B-3. dr_registrar build-request -> refuses at COMPILE with the exact
-       reason (DR-CMD-100 record). Together B-1..B-3 prove the loop
-       handles the deviation class honestly — the refusal is staged
-       verbatim, never routed around.
+       reason (DR-CMD-100 record). Together B-2..B-3 prove the loop
+       still handles the deviation class honestly — the refusal is
+       staged verbatim, never routed around (tranche 2 not authorized).
   B-4. wright build-request (clean) -> RECEIVE -> VALIDATE -> GATE ->
        COMPILE -> VERIFY -> STAGE, all ok; the staged bundle carries the
        content hashes and the not-published/not-registered disclaimer;
@@ -96,11 +101,10 @@ def gate_violator_profile():
     return triager_profile()
 '''
 
-# The three clerk routing refusals, verbatim per DR-CMD-096/097/100.
+# The two remaining clerk routing refusals, verbatim per DR-CMD-097/100.
+# (registrar_clerk's DR-CMD-096 refusal is gone: DR-CMD-102 tranche 1
+# landed tool-register-artifact, so 'artifact-registry' resolves.)
 _EXPECTED_CLERK_REFUSALS = {
-    "registrar_clerk":
-        "compile refused at routing: write-scope channel 'artifact-registry' "
-        "names no registered contracted tool or alias (B-3 analog)",
     "triager":
         "compile refused at routing: write-scope channel 'quarantine' "
         "names no registered contracted tool or alias (B-3 analog)",
@@ -119,12 +123,36 @@ def run() -> dict:
     violations: list[str] = []
     refusals: list[str] = []
 
-    # B-1..B-3: the three clerk profiles — exact refusal reproduction.
+    # B-1: registrar_clerk now stages — the tranche-1 unblock, detected
+    # mechanically. The 'artifact-registry' channel resolves at the
+    # routing stage, so COMPILE passes; VERIFY and STAGE follow.
     from .authored.registrar_clerk import registrar_clerk_profile
+    req1 = make_request("registrar_clerk", _read_fixture("registrar_clerk"),
+                        ("clerk",), "commission:registrar-clerk-fixture")
+    t1a = drive_build(req1)
+    t1b = drive_build(req1)
+    assert t1a["terminal"]["outcome"] == "staged", \
+        f"registrar_clerk: expected staged, got {t1a['terminal']}"
+    assert [s["status"] for s in t1a["steps"]] == ["ok"] * 6, \
+        f"registrar_clerk: all six steps must pass: {t1a['steps']}"
+    v1 = t1a["steps"][4]["detail"]
+    assert v1["verdict"] == "verified" and v1["operable"], \
+        f"registrar_clerk: verify must be verified+operable: {v1}"
+    st1 = t1a["staged"]
+    assert st1["disposition"] == "staged-for-operator", st1
+    assert "NOT published; NOT registered; NOT disposed" in st1["note"], st1
+    assert transcript_bytes(t1a) == transcript_bytes(t1b), \
+        "registrar_clerk: two runs must yield byte-equal transcripts"
+    violations.append("registrar_clerk staged through all six steps "
+                      "(tranche-1 unblock); replay byte-equal; "
+                      "NOT registered — registration is the Operator's "
+                      "disposition")
+
+    # B-2..B-3: triager and dr_registrar still refuse at COMPILE with the
+    # exact routing-refusal reasons (tranche 2 not authorized).
     from .authored.triager import triager_profile
     from .authored.dr_registrar import dr_registrar_profile
-    for name, builder in (("registrar_clerk", registrar_clerk_profile),
-                          ("triager", triager_profile),
+    for name, builder in (("triager", triager_profile),
                           ("dr_registrar", dr_registrar_profile)):
         req = make_request(name, _read_fixture(name), ("clerk",),
                            f"commission:{name}-fixture")

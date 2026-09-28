@@ -129,6 +129,21 @@ def register(root: Path, *, kind: str, name: str, artifact_bytes: bytes,
     return rec
 
 
+def find_by_sha256(root: Path, sha256: str) -> ArtifactRecord | None:
+    """First record pinning these exact bytes, or None.
+
+    Additive lookup for the contracted write channel
+    (`tool-register-artifact`): on a duplicate content-hash the tool
+    returns the existing receipt instead of appending a second row.
+    First (lowest-seq) record wins — the original registration.
+    Changes no existing behavior.
+    """
+    for raw in _read(root):
+        if raw.get("sha256") == sha256:
+            return ArtifactRecord(**raw)
+    return None
+
+
 def absence_evidence(root: Path, kind: str, query: str) -> dict:
     """The evidence object a proposal must carry: the query, run now,
     and the hit names it returned. The propose channel re-runs this and
