@@ -4,15 +4,16 @@
 - Date: 2026-09-27
 - Commissioned by: DR-CMD-105 (O2 of the "next best action" /pb-decide; Peter, ~19:00 PDT)
 - Precondition for: tranche 2's DR registration channel (DR-CMD-102)
+- Note: the DR registrar profile was renamed `dr_registrar` → `chronicler` (DR-CMD-107); this document uses the adopted name throughout.
 
 ## 1. Matter
 
 Design the Decision Record (DR) registry as a contracted structure: the
-machine-readable store against which the `dr_registrar` (DR-CMD-100) vets
+machine-readable store against which the `chronicler` (DR-CMD-100) vets
 staged DR drafts and into which well-formed records are registered
 append-only. Today `doc/decision-records/` is a directory of markdown files
 plus ambient-maintained conventions (the manually tracked next-free chain);
-there is no contracted structure, so the dr_registrar's write channel
+there is no contracted structure, so the chronicler's write channel
 `decision-record-registry` names nothing and compile refuses at routing.
 
 This spike answers four questions (§5) and renders a verdict on tranche 2's
@@ -35,14 +36,14 @@ here.
   the Product Vision Board Definition of Done) that the sequencing rule must
   skip and that only Operator business may redeem.
 
-## 2. Requirements (from the dr_registrar's six vetting checks, DR-CMD-100)
+## 2. Requirements (from the chronicler's six vetting checks, DR-CMD-100)
 
 The store must support, mechanically:
 
 1. **Identifier sequencing** — tip tracking; next-in-sequence assignment;
    no gaps, no duplicates; reservations honored (059 and any future).
 2. **Content-hash dedup** — sha256 pinned per record; duplicate hash under a
-   new identifier detectable (the dr_registrar defers it; the store must be
+   new identifier detectable (the chronicler defers it; the store must be
    able to answer "hash already registered?").
 3. **Supersedes/addendum chain integrity** — records carry `supersedes[]`
    and `addendum_to`; targets must exist at write time; chain traversal
@@ -72,7 +73,7 @@ Fit assessment:
 - Identifier sequencing: the registry tracks `seq` (append order) and
   versions per `(kind, name)` — neither is DR numbering. "Next number",
   reservations, and no-gap enforcement would live entirely outside the
-  store (in the dr_registrar's vetting). The store could not answer "what
+  store (in the chronicler's vetting). The store could not answer "what
   is the tip?" without a convention layered on top.
 - Content-hash dedup: `find_by_sha256` exists — works.
 - Chains: `ArtifactRecord` has no relation fields. Supersedes/addendum
@@ -118,7 +119,7 @@ Store-level invariants (enforced at write, fail-closed, reasons verbatim):
 - `id` well-formed (`DR-CMD-###`); not already registered.
 - `n == tip.next` **or** `n` redeems a reservation (redemption is
   operator business; the standing path refuses reserved numbers — this is
-  the dr_registrar's check 2, re-enforced at the store as defense in depth).
+  the chronicler's check 2, re-enforced at the store as defense in depth).
 - `sha256` not already registered under a different id.
 - every `supersedes[]` / `addendum_to` / `premise_refs[]` entry resolves to
   a registered id.
@@ -156,7 +157,7 @@ more complex than A. **Not recommended.**
   same rule the artifact registry got when `tool-register-artifact`
   closed its direct-call gap. The tool is hermetic (no network, no clock);
   the registry root is passed in, never defaulted.
-- **Who may invoke the tool**: the `dr_registrar` on its standing operator
+- **Who may invoke the tool**: the `chronicler` on its standing operator
   disposition (scheduled sweep of the staging area), or per-event operator
   disposition. Arrivals never trigger registration; malformed drafts defer
   for operator disposition (proposer≠disposer preserved).
@@ -201,10 +202,10 @@ is a bridge to nowhere; building it now would be speculative tooling
 the staged-draft discipline — processor/transcriber subagents (which
 already exist as a standing pattern after each disposition) stage *drafts*
 (markdown + metadata) into a staging area instead of writing registry
-files directly; the `dr_registrar`, once registered, vets on standing
+files directly; the `chronicler`, once registered, vets on standing
 disposition and the tool registers. Volume exists; the staging discipline
 is what's missing. Name it: condition (ii) is met when DR drafts flow
-through a staged pipeline that the dr_registrar services.
+through a staged pipeline that the chronicler services.
 
 **Q4 — location and writers.** `doc/decision-records/registry.jsonl`,
 git-versioned beside the markdown; writes only through the future
@@ -253,7 +254,7 @@ import with honest provenance labeling.
    flow; the tool stays hermetic to the registry root).
 3. Reservation redemption record shape (registry event vs. DR itself).
 4. Whether `status` transitions (e.g. proposed → adopted) are new rows or
-   metadata — the dr_registrar only registers adopted records; proposed
+   metadata — the chronicler only registers adopted records; proposed
    drafts live in the staging area, not the registry. Confirm.
 
 ## 10. Glossary

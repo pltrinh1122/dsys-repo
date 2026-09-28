@@ -14,8 +14,9 @@ DR-CMD-102; DR-CMD-055 tool discipline). Pure mechanical, deterministic,
 zero inference. Every refusal raises ToolAborted with the reason
 verbatim (the executor's C1 preserves it into the failure record).
 
-Backs the write-scope channel 'artifact-registry' (registrar_clerk's
-channel, DR-CMD-096) in the compiler's J1 registry.
+Backs the write-scope channel 'artifact-registry' (recorder's
+channel, DR-CMD-096; renamed from registrar_clerk, DR-CMD-107) in the
+compiler's J1 registry.
 """
 
 import hashlib

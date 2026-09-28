@@ -1,8 +1,8 @@
-"""registrar_clerk — may-act registrar for the artifact registry (DR-CMD-096).
+"""recorder — may-act recorder for the artifact registry (DR-CMD-107;
+renamed from registrar_clerk, DR-CMD-096).
 
-Working name (provisional-in-name-only; final naming is the Operator's
-disposition). The minimal pair across the acting axis with the set-002
-staff registrar (DR-CMD-083): same office reading (D7 0.75 — validates
+The minimal pair across the acting axis with the set-002 staff
+registrar (DR-CMD-083): same office reading (D7 0.75 — validates
 presented documents, never investigates the world), flipped acting
 posture (D1 0.5 / D5 0.15 — records directly on standing operator
 disposition instead of staging proposals).
@@ -23,16 +23,13 @@ operator-initiated or it does not happen.
 D2 principal_wins_ties: the registry is the principal's instrument —
 the commission binds action parameters; presented bytes never win ties.
 
-AS-BUILT DEVIATION (DR-CMD-096): write_scope=["artifact-registry"]
-names the real effect channel, but the factory compiler's closed
-contracted-tool registry (J1, DR-CMD-055/057) resolves write channels
-only against AGENT_TOOL_IDS / CHANNEL_ALIASES — no contracted tool
-writes the artifact registry today (adopt-proposal writes via direct
-reg.register() calls, ambient-side). Compile therefore refuses at the
-routing stage until a contracted `tool-register-artifact` exists or the
-channel is re-scoped. The profile is authored, validates, and passes
-the clerk gate; factory registration (PROFILE_SET_002) is deferred
-pending the Operator's disposition on the channel.
+NOTE (DR-CMD-107): the DR-CMD-096 as-built deviation is closed.
+write_scope=["artifact-registry"] names the true effect channel and it
+now resolves: the factory compiler's contracted-tool registry (J1,
+DR-CMD-055/057) carries the channel alias "artifact-registry" ->
+tool-register-artifact (DR-CMD-102 tranche 1, DR-CMD-103). The
+profile's write channel is a registered contracted tool; compile no
+longer refuses at the routing stage.
 """
 
 from __future__ import annotations
@@ -54,8 +51,8 @@ from core.package.agent_behavior import (
 ARCHETYPES = ("clerk",)
 
 
-def registrar_clerk_profile() -> AgentBehaviorProfile:
-    """mediation-assist / registrar_clerk: may-act artifact registrar.
+def recorder_profile() -> AgentBehaviorProfile:
+    """mediation-assist / recorder: may-act artifact registrar.
 
     Records verified, attested artifacts into the content-addressed
     append-only artifact registry on standing operator disposition;
@@ -65,7 +62,7 @@ def registrar_clerk_profile() -> AgentBehaviorProfile:
     per-event outcomes).
     """
     return AgentBehaviorProfile(
-        agent="registrar_clerk",
+        agent="recorder",
         d1_authority=D1Authority(
             position=0.5, per_event_disposition=False,
             standing_dispositions=["register-artifact-standing"],
@@ -84,10 +81,10 @@ def registrar_clerk_profile() -> AgentBehaviorProfile:
             position=0.15,
             read_scope=["staging-area", "accretion-repo",
                         "disposition-records", "artifact-registry"],
-            # AS-BUILT DEVIATION: "artifact-registry" is the true effect
-            # channel but resolves against no contracted tool (see module
-            # docstring). Bounded (single declared channel), never
-            # wildcard — CL3's boundedness holds; J1 resolution does not.
+            # "artifact-registry" resolves via the compiler's channel
+            # alias to tool-register-artifact (DR-CMD-103). Bounded
+            # (single declared channel), never wildcard — CL3's
+            # boundedness and J1's closed registry both hold.
             write_scope=["artifact-registry"]),
         d6_initiative=D6Initiative(
             sources={TriggerSource.OPERATOR},
@@ -134,7 +131,7 @@ def registry_record_decision(notice: dict) -> tuple[str, dict]:
 
 
 def diagnostic_cases():
-    """The registrar_clerk's self-diagnostic playbook (J2)."""
+    """The recorder's self-diagnostic playbook (J2)."""
 
     def rc_d1_may_act_shape(ctx):
         p = ctx["profile"]

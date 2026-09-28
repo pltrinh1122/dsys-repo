@@ -18,7 +18,7 @@ Sections:
      registry's reason.
   F. Compiler routing — the write-scope channel 'artifact-registry'
      resolves to ['tool-register-artifact'] through the J1 registry
-     (the registrar_clerk unblock, checked at the routing stage).
+     (the recorder unblock, checked at the routing stage).
   G. Real loading path — executor.load_tools picks the tool up by its
      TOOL_NAME (this module's leading underscore keeps the golden run
      itself out of the registry).

@@ -1,4 +1,5 @@
-"""dr_registrar — may-act decision-record registrar (DR-CMD-100).
+"""chronicler — may-act decision-record registrar (DR-CMD-107;
+renamed from dr_registrar, DR-CMD-100).
 
 The dog-food clerk: the agent that governs Decision Records themselves —
 the D1-D7 architecture's own governance memory. Peter rendered "proceed
@@ -38,17 +39,18 @@ Archetype: clerk (may-act x office). D6 {OPERATOR} only: no WORLD,
 AGENT, or SELF triggers. D2 principal_wins_ties: the commissioned
 vetting criteria bind; presented bytes never win ties.
 
-AS-BUILT DEVIATION (DR-CMD-100): write_scope=["decision-record-registry"]
-names the true effect channel, but the factory compiler's closed
-contracted-tool registry (J1, DR-CMD-055/057) resolves write channels
-only against AGENT_TOOL_IDS / CHANNEL_ALIASES — no contracted tool
-backs decision-record registration today. Compile therefore refuses at
-the routing stage until a contracted tool exists for this channel or
-the channel question is disposed (Peter). Separately, the DR registry
-does not exist as a contracted structure (doc/decision-records/ is a
-directory); reading it as presented material needs no new
-infrastructure, but a registry structure is explicit follow-on work.
-The profile is authored, validates, and passes the clerk gate; factory
+AS-BUILT DEVIATION (DR-CMD-100, still open at DR-CMD-107):
+write_scope=["decision-record-registry"] names the true effect channel,
+but the factory compiler's closed contracted-tool registry (J1,
+DR-CMD-055/057) resolves write channels only against AGENT_TOOL_IDS /
+CHANNEL_ALIASES — no contracted tool backs decision-record
+registration today (tranche 2, DR-CMD-102, conditional). Compile
+therefore refuses at the routing stage until a contracted tool exists
+for this channel or the channel question is disposed (Peter).
+Separately, the DR registry now exists as an adopted design
+(doc/dr-registry-structure-design.md, DR-CMD-106: held, not built);
+reading it as presented material needs no new infrastructure. The
+profile is authored, validates, and passes the clerk gate; factory
 registration (PROFILE_SET_002) is deferred pending the Operator's
 disposition on the channel. No channel was silently substituted, no
 tool was added to the pinned registry, the closed-registry discipline
@@ -75,8 +77,8 @@ from core.package.agent_behavior import (
 ARCHETYPES = ("clerk",)
 
 
-def dr_registrar_profile() -> AgentBehaviorProfile:
-    """design/authoring-assist / dr_registrar: may-act DR registrar.
+def chronicler_profile() -> AgentBehaviorProfile:
+    """design/authoring-assist / chronicler: may-act DR registrar.
 
     Vets staged decision-record drafts against the commissioned
     mechanical criteria on the operator's schedule; registers the
@@ -85,7 +87,7 @@ def dr_registrar_profile() -> AgentBehaviorProfile:
     doc/decision-records/ directory as presented material only (office).
     """
     return AgentBehaviorProfile(
-        agent="dr_registrar",
+        agent="chronicler",
         d1_authority=D1Authority(
             position=0.5, per_event_disposition=False,
             standing_dispositions=["vet-and-register-dr-drafts-standing"],
@@ -215,7 +217,7 @@ def _draft_fixture(**over) -> dict:
 
 
 def diagnostic_cases():
-    """The dr_registrar's self-diagnostic playbook (J2)."""
+    """The chronicler's self-diagnostic playbook (J2)."""
 
     def d_dr1_may_act_shape(ctx):
         p = ctx["profile"]

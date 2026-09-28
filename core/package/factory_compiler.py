@@ -125,7 +125,8 @@ AGENT_TOOL_IDS: tuple[str, ...] = (
 
 # Registry aliases: channel names that expand to tool sets. Part of the
 # pinned registry (J1). Two aliases: the dsys profile's channel, and
-# "artifact-registry" (the registrar_clerk's write channel, DR-CMD-096).
+# "artifact-registry" (the recorder's write channel, DR-CMD-096;
+# renamed from registrar_clerk, DR-CMD-107).
 CHANNEL_ALIASES: dict[str, list[str]] = {
     "contracted-tools-only": list(AGENT_TOOL_IDS),
     "artifact-registry": ["tool-register-artifact"],

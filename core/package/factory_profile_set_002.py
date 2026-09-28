@@ -9,9 +9,9 @@ verify pipeline.
   wright     — agent-profile author (harness-side author-agent; J3 bootstrap)
   registrar  — verified-build registry (J4 demo: authored end-to-end
                through the loop)
-  registrar_clerk — may-act x office clerk variant of the registrar
+  recorder   — may-act x office clerk variant of the registrar
                (DR-CMD-096, adopted with deviation; registered DR-CMD-104
-               after tool-register-artifact landed)
+               after tool-register-artifact landed; renamed DR-CMD-107)
 
 Invariants (as set 001): proposer != disposer; zero warnings; positions
 derived, never hand-set; D2 binary enum; D6 structural.
@@ -25,7 +25,7 @@ from typing import Any
 
 from .agent_behavior import bind_personalization
 from .authored.registrar import registrar_profile
-from .authored.registrar_clerk import registrar_clerk_profile
+from .authored.recorder import recorder_profile
 from .authored.wright import wright_profile
 from .factory_archetypes import check_profile
 from .factory_compiler import compile_profile
@@ -34,13 +34,13 @@ from .factory_verifier import verify
 PROFILE_SET_002: dict[str, Any] = {
     "wright": wright_profile,
     "registrar": registrar_profile,
-    "registrar_clerk": registrar_clerk_profile,
+    "recorder": recorder_profile,
 }
 
 PROFILE_ARCHETYPES_002: dict[str, tuple[str, ...]] = {
     "wright": ("staff", "office"),
     "registrar": ("staff", "office"),
-    "registrar_clerk": ("clerk",),
+    "recorder": ("clerk",),
 }
 
 

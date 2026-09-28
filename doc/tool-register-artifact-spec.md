@@ -2,13 +2,13 @@
 
 **Status: ADOPTED for build** — tranche-1 commission under DR-CMD-102 (2026-09-27, Peter; O1 adopted-with-conditions): build the contracted `tool-register-artifact` now, per DR-CMD-055 tool discipline. Tranche 2 (triage channels, DR registration channel) is conditional and NOT commissioned by this spec.
 
-This spec is the build contract for `tool-register-artifact`: the contracted tool backing the write-scope channel `artifact-registry` (registrar_clerk's channel, DR-CMD-096). It settles the tool's contract, its refusal cases, its idempotency argument, and its registration in the compiler's closed contracted-tool registry (J1) — an addition under the standing discipline, not an amendment of J1 (O3 was refused; the closed-registry discipline stays intact).
+This spec is the build contract for `tool-register-artifact`: the contracted tool backing the write-scope channel `artifact-registry` (recorder's channel, DR-CMD-096; renamed from registrar_clerk, DR-CMD-107). It settles the tool's contract, its refusal cases, its idempotency argument, and its registration in the compiler's closed contracted-tool registry (J1) — an addition under the standing discipline, not an amendment of J1 (O3 was refused; the closed-registry discipline stays intact).
 
 ## 1. What this spec is
 
 `tool-register-artifact` is a dist-shipped `lib/dsys/tools/` module. Like the eight production tools (DR-CMD-055/056/057), it defines `TOOL_NAME: str` and `run(ctx: dict) -> {"ok": bool, "result": <json>, "ctx_delta": <json>}`, loaded by the executor's `load_tools` (no overlays, no search paths). It is the contracted write path into the content-addressed append-only artifact registry (`core/package/artifact_registry.py`, built under DR-CMD-091): given artifact bytes plus metadata, it computes the content hash, appends to the registry, and returns a receipt.
 
-The registry exists as a contracted structure with no contracted write path today — `adopt-proposal` writes through direct ambient-side `register()` calls. This tool closes that half of the DR-CMD-091 bridge. It also unblocks `registrar_clerk` (DR-CMD-096), whose compile refusal at routing names exactly this missing tool, and the DR-CMD-099 schema-artifact registration path.
+The registry exists as a contracted structure with no contracted write path today — `adopt-proposal` writes through direct ambient-side `register()` calls. This tool closes that half of the DR-CMD-091 bridge. It also unblocks `recorder` (DR-CMD-096; renamed from registrar_clerk, DR-CMD-107), whose compile refusal at routing names exactly this missing tool, and the DR-CMD-099 schema-artifact registration path.
 
 ## 2. The tool contract
 
@@ -66,7 +66,7 @@ The tool is dist-shipped at `lib/dsys/tools/register_artifact.py`; the registry 
 ## 6. Compiler registration (J1 addition, not amendment)
 
 - `tool-register-artifact` joins `AGENT_TOOL_IDS` in `core/package/factory_compiler.py`.
-- New channel alias: `artifact-registry` → [`tool-register-artifact`], so registrar_clerk's `write_scope=["artifact-registry"]` resolves at the routing stage.
+- New channel alias: `artifact-registry` → [`tool-register-artifact`], so recorder's `write_scope=["artifact-registry"]` resolves at the routing stage.
 - `TOOL_REGISTRY_PIN` recomputes from the id list automatically — the pin mechanism is exactly the established path for registry membership changes. The J1 discipline (channels resolve against the *closed* registry; unknown channels refuse loudly) is unchanged: the registry stays closed, it now has nine members. This is the addition O1 commissioned; O3 (amending the discipline) was refused and is not what this is.
 
 No schema-enum or schema-field change is involved, so no minor schema bump under the DR-CMD-082 rule; the pin digest captures the membership change inside `FactoryVersion`.
@@ -75,7 +75,7 @@ No schema-enum or schema-field change is involved, so no minor schema bump under
 
 - Tranche 2 channels (triage, DR registration) — explicitly not authorized (DR-CMD-102).
 - The DR-registry structure design — still open follow-on work (DR-CMD-100).
-- Registration of `registrar_clerk` itself — a green build stages it for Peter's registration disposition; `CLERK.members` stays `()` until he disposes.
+- Registration of `recorder` itself — a green build stages it for Peter's registration disposition; `CLERK.members` stays `()` until he disposes.
 
 ## Glossary
 
