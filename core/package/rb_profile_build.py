@@ -28,10 +28,13 @@ staged with exact reasons, never worked around:
                  must equal content_hash (tamper -> refuse, fail-closed;
                  cf. the verified-build hash-pinning precedent). The
                  module's own ARCHETYPES must agree with declared_archetypes
-                 (charter disagreement -> refuse).
-  2. VALIDATE — construct the profile via the module's
-                 <profile_name>_profile builder; build-time personalization
-                 binding (DR-CMD-070); zero warnings; revalidation.
+                 (charter disagreement -> refuse). O1a (DR-CMD-111): the
+                 module exec + builder call run in a supervised child
+                 process; this process never execs authored bytes.
+  2. VALIDATE — revalidate the child-returned profile JSON (data only);
+                 build-time personalization binding (DR-CMD-070); zero
+                 warnings; revalidation. A builder-phase failure in the
+                 child is raised here (refuses at s2, verbatim reason).
   3. GATE     — the archetype gate (check_profile) over declared_archetypes;
                  violations -> refuse with exact reasons.
   4. COMPILE  — compile_profile; CompileRefused -> refuse with the EXACT
@@ -44,10 +47,22 @@ staged with exact reasons, never worked around:
                  disposes.
 
 As-built boundaries (honest, not bridged):
-  - Authored bytes execute in-process (exec in a fresh namespace). This is
-    the recorded open gap "contain proposed authored code during
-    stage-profile" — same trust posture as today's hand-driven builds,
-    containment NOT claimed.
+  - O1a containment (DR-CMD-111): the arbitrary-code surface (module exec +
+    builder call) runs in a supervised child process
+    (`sys.executable -m core.package.rb_profile_build --build-child`;
+    interpreter pinned to the running one; stdin/stdout JSON protocol).
+    The parent hash-pins (pure hashlib), spawns, enforces a 120s timeout,
+    applies POSIX best-effort resource limits (RLIMIT_AS 2 GiB, RLIMIT_CPU
+    via preexec_fn; skipped off-POSIX), and relays the result. Child
+    timeout / crash / malformed output -> deterministic RECEIVE refusal;
+    the child's stderr goes to the parent's stderr, never into the
+    transcript (byte-equal replay preserved). GATE/COMPILE/VERIFY/STAGE
+    run ambient-side on revalidated data only. O1b (whole drive in the
+    child) was refused: the placement experiment demonstrated a co-located
+    builder corrupting the vetting it shares a process with.
+  - A builder returning a non-AgentBehaviorProfile is now a staged
+    VALIDATE refusal (fail-closed); pre-O1a it propagated out of
+    drive_build uncaught. Deliberate hardening, recorded here.
   - The build-time binding (principal_id="factory-build-time",
     disposition_ref="commission:<commission_ref>") is NOT a deployment
     personalization: it satisfies DR-CMD-070's compiler contract (the
@@ -66,8 +81,12 @@ the transcript path).
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
@@ -97,6 +116,199 @@ class BuildRefused(Exception):
         super().__init__(f"{step_id} refused: {reason}")
         self.step_id = step_id
         self.reason = reason
+
+
+# ---------------------------------------------------------------------------
+# O1a containment (DR-CMD-111): the arbitrary-code surface — module exec +
+# builder call — runs in a supervised child process. The parent keeps
+# integrity (hash-pin, pure hashlib) + supervision (spawn, timeout,
+# resource limits, transcript relay) and never execs authored bytes.
+# GATE/COMPILE/VERIFY/STAGE stay ambient-side and witnessed, operating
+# only on revalidated data.
+#
+# Why O1a and not O1b (whole drive_build in the child): the placement
+# experiment (2026-09-27) falsified the O1b relocation claim. A builder
+# that mutates imported factory module state in-process (two lines
+# patching the compiler's channel-alias map) staged a must-refuse profile
+# through all six steps with a well-formed transcript when vetting shared
+# the builder's process; the split placement refused it with the
+# byte-identical honest reason. O1b fails open with a well-formed
+# transcript — the worst failure shape in this architecture.
+#
+# Child protocol (stdin -> stdout, exactly one JSON object on stdout):
+#   in:  {"module_b64": base64(authored bytes), "profile_name": str}
+#   out: {"ok": true, "builder_name": str, "archetypes": [...],
+#         "profile_json": <model_dump(mode="json")>}
+#     or {"ok": false, "step_id": "receive"|"validate"|"child",
+#         "reason": str, "builder_name": str|None, "archetypes": [...]}
+# The child's stderr is echoed to the parent's stderr for debugging and
+# NEVER enters the transcript (byte-equal replay). Timeouts, crashes, and
+# malformed child output become deterministic RECEIVE refusals.
+# ---------------------------------------------------------------------------
+
+BUILD_SUBPROCESS_TIMEOUT_S = 120  # as-built; tunable. Builds are infrequent.
+_CHILD_ARGV_FLAG = "--build-child"
+
+
+def _exec_authored_module(module_bytes: bytes, profile_name: str):
+    """Exec the authored bytes in a fresh namespace; locate the builder.
+
+    Runs in the child. Raises BuildRefused("receive", ...) with the exact
+    reasons the pre-O1a RECEIVE step produced.
+    """
+    namespace: dict[str, Any] = {
+        "__name__": f"rb_build_{profile_name}",
+    }
+    try:
+        code = compile(bytes(module_bytes),
+                       f"<build-request:{profile_name}>", "exec")
+    except (SyntaxError, ValueError) as e:
+        raise BuildRefused(
+            "receive",
+            f"authored module does not compile: {type(e).__name__}: {e}")
+    try:
+        exec(code, namespace)
+    except Exception as e:  # noqa: BLE001 — any exec failure refuses
+        raise BuildRefused(
+            "receive",
+            f"authored module does not execute: {type(e).__name__}: {e}")
+    builder_name = f"{profile_name}_profile"
+    builder = namespace.get(builder_name)
+    if not callable(builder):
+        raise BuildRefused(
+            "receive",
+            f"authored module exposes no builder {builder_name!r} "
+            f"(expected '<profile_name>_profile')")
+    module_archetypes = tuple(namespace.get("ARCHETYPES") or ())
+    return builder_name, module_archetypes, builder
+
+
+def _call_builder(builder) -> AgentBehaviorProfile:
+    """Call the builder. Runs in the child. Raises BuildRefused("validate",
+    ...) with the exact reasons the pre-O1a VALIDATE step produced for the
+    builder-call phase.
+    """
+    try:
+        profile = builder()
+    except ValidationError as e:
+        raise BuildRefused(
+            "validate", f"profile construction failed validation: {e}")
+    except Exception as e:  # noqa: BLE001 — any builder failure refuses
+        raise BuildRefused("validate", f"builder raised {type(e).__name__}: {e}")
+    if not isinstance(profile, AgentBehaviorProfile):
+        # AS-BUILT hardening: pre-O1a this propagated out of drive_build
+        # uncaught; now it is a staged validate refusal (fail-closed).
+        raise BuildRefused(
+            "validate",
+            f"builder returned {type(profile).__name__}, not an "
+            f"AgentBehaviorProfile")
+    return profile
+
+
+def _build_child_main() -> None:
+    """Child entry point (`python -m core.package.rb_profile_build
+    --build-child`). Reads the request JSON on stdin, execs the module,
+    calls the builder, writes exactly one JSON object on stdout."""
+    payload = json.load(sys.stdin)
+    module_bytes = base64.b64decode(payload["module_b64"])
+    profile_name = payload["profile_name"]
+    try:
+        builder_name, module_archetypes, builder = _exec_authored_module(
+            module_bytes, profile_name)
+    except BuildRefused as e:
+        sys.stdout.write(json.dumps({
+            "ok": False, "step_id": e.step_id, "reason": e.reason,
+            "builder_name": None, "archetypes": [],
+        }))
+        return
+    try:
+        profile = _call_builder(builder)
+    except BuildRefused as e:
+        # Builder-phase failure: still report builder identity so the
+        # parent's RECEIVE detail stays faithful; VALIDATE raises it.
+        sys.stdout.write(json.dumps({
+            "ok": False, "step_id": e.step_id, "reason": e.reason,
+            "builder_name": builder_name,
+            "archetypes": list(module_archetypes),
+        }))
+        return
+    try:
+        profile_json = profile.model_dump(mode="json")
+    except Exception as e:  # noqa: BLE001 — fail-closed, never propagate
+        sys.stdout.write(json.dumps({
+            "ok": False, "step_id": "validate",
+            "reason": f"builder product not serializable: "
+                      f"{type(e).__name__}: {e}",
+            "builder_name": builder_name,
+            "archetypes": list(module_archetypes),
+        }))
+        return
+    sys.stdout.write(json.dumps({
+        "ok": True,
+        "builder_name": builder_name,
+        "archetypes": list(module_archetypes),
+        "profile_json": profile_json,
+    }))
+
+
+def _limit_child_resources() -> None:
+    """POSIX best-effort resource limits for the build child (preexec_fn).
+
+    The timeout in _run_build_child is the hard wall; these are defense in
+    depth. Any failure here is swallowed — the child still runs.
+    """
+    try:
+        import resource
+        mem = 2 * 1024 ** 3  # 2 GiB address space
+        resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+        cpu = BUILD_SUBPROCESS_TIMEOUT_S + 60
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+    except Exception:
+        pass
+
+
+def _run_build_child(module_bytes: bytes, profile_name: str) -> dict:
+    """Spawn the supervised build child; return its result dict.
+
+    Child timeout / non-zero exit / malformed output become deterministic
+    RECEIVE refusals (fail-closed). The child's stderr is echoed to our
+    stderr for debugging and never enters the transcript.
+    """
+    payload = json.dumps({
+        "module_b64": base64.b64encode(bytes(module_bytes)).decode("ascii"),
+        "profile_name": profile_name,
+    })
+    argv = [sys.executable, "-m", "core.package.rb_profile_build",
+            _CHILD_ARGV_FLAG]
+    # The child inherits our cwd and environment, so `core.package` resolves
+    # exactly as it did for this process; the interpreter is pinned to the
+    # running one (sys.executable).
+    preexec = _limit_child_resources if os.name == "posix" else None
+    try:
+        proc = subprocess.run(argv, input=payload, capture_output=True,
+                              text=True, timeout=BUILD_SUBPROCESS_TIMEOUT_S,
+                              preexec_fn=preexec)
+    except subprocess.TimeoutExpired:
+        raise BuildRefused(
+            "receive",
+            "build subprocess timed out after "
+            f"{BUILD_SUBPROCESS_TIMEOUT_S}s")
+    if proc.stderr.strip():
+        print(f"[rb-profile-build] build child stderr:\n{proc.stderr}",
+              file=sys.stderr)
+    if proc.returncode != 0:
+        raise BuildRefused(
+            "receive",
+            f"build subprocess exited {proc.returncode}")
+    try:
+        result = json.loads(proc.stdout)
+    except ValueError:
+        raise BuildRefused(
+            "receive", "build subprocess returned malformed result")
+    if not isinstance(result, dict) or "ok" not in result:
+        raise BuildRefused(
+            "receive", "build subprocess returned malformed result")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -161,58 +373,48 @@ def _tool_receive_build_request(ctx: dict) -> dict:
             "receive",
             f"build-request hash mismatch: declared {declared_hash} != "
             f"computed {computed} (tamper or corruption — fail-closed)")
-    # Execute the authored bytes in a fresh namespace (no sys.modules
-    # pollution; deterministic: same bytes -> same namespace contents).
-    # AS-BUILT: in-process execution — the containment gap is recorded
-    # open work, not claimed (see module docstring).
-    namespace: dict[str, Any] = {
-        "__name__": f"rb_build_{profile_name}_{computed[:12]}",
-    }
-    try:
-        code = compile(bytes(module_bytes),
-                       f"<build-request:{profile_name}>", "exec")
-    except (SyntaxError, ValueError) as e:
-        raise BuildRefused(
-            "receive",
-            f"authored module does not compile: {type(e).__name__}: {e}")
-    try:
-        exec(code, namespace)
-    except Exception as e:  # noqa: BLE001 — any exec failure refuses
-        raise BuildRefused(
-            "receive",
-            f"authored module does not execute: {type(e).__name__}: {e}")
-    builder_name = f"{profile_name}_profile"
-    builder = namespace.get(builder_name)
-    if not callable(builder):
-        raise BuildRefused(
-            "receive",
-            f"authored module exposes no builder {builder_name!r} "
-            f"(expected '<profile_name>_profile')")
-    module_archetypes = tuple(namespace.get("ARCHETYPES") or ())
+    # O1a (DR-CMD-111): the module exec + builder call run in the supervised
+    # child process. This process (the parent) never execs authored bytes:
+    # it hash-pinned them above (pure hashlib) and now supervises.
+    child = _run_build_child(bytes(module_bytes), profile_name)
+    if not child["ok"] and child.get("step_id") != "validate":
+        # Exec-phase failure (or child malfunction): RECEIVE owns it, with
+        # the child's verbatim reason.
+        raise BuildRefused("receive", child["reason"])
+    module_archetypes = tuple(child.get("archetypes") or ())
+    builder_name = child.get("builder_name") or f"{profile_name}_profile"
     if module_archetypes != declared_archetypes:
         raise BuildRefused(
             "receive",
             f"charter disagreement: build-request declares "
             f"{list(declared_archetypes)} but the authored module declares "
             f"{list(module_archetypes)} — fail-closed")
+    if not child["ok"]:
+        # Builder-phase failure: VALIDATE owns the refusal (step fidelity —
+        # a broken builder refuses at s2, never at s1). Stash and defer.
+        ctx["child_build_error"] = child
+    else:
+        # The profile crosses the boundary as data only; the parent
+        # revalidates it below before any vetting step touches it.
+        ctx["profile_json"] = child["profile_json"]
     ctx["commission_ref"] = req["commission_ref"]
     ctx["profile_name"] = profile_name
     ctx["content_hash"] = computed
     ctx["declared_archetypes"] = declared_archetypes
-    ctx["builder"] = builder
     return {"builder": builder_name, "archetypes_match": True}
 
 
 def _tool_validate_profile(ctx: dict) -> dict:
-    builder: Callable[[], AgentBehaviorProfile] = ctx["builder"]
+    child_error = ctx.get("child_build_error")
+    if child_error is not None:
+        # Builder-phase failure relayed from the child: raised here so the
+        # refusal lands at VALIDATE (s2) with the verbatim reason.
+        raise BuildRefused("validate", child_error["reason"])
     try:
-        generic = builder()
+        generic = AgentBehaviorProfile.model_validate(ctx["profile_json"])
     except ValidationError as e:
         raise BuildRefused(
-            "validate", f"profile construction failed validation: {e}")
-    except Exception as e:  # noqa: BLE001 — any builder failure refuses
-        raise BuildRefused(
-            "validate", f"builder raised {type(e).__name__}: {e}")
+            "validate", f"profile data failed revalidation: {e}")
     # Build-time binding (NOT a deployment personalization): satisfies
     # DR-CMD-070's compiler contract. The archetype gate itself is the
     # run-book's own GATE step, so gate=None here by design.
@@ -378,3 +580,7 @@ __all__ = [
     "drive_build",
     "transcript_bytes",
 ]
+
+
+if __name__ == "__main__" and _CHILD_ARGV_FLAG in sys.argv:
+    _build_child_main()
