@@ -1,9 +1,10 @@
-"""CLI: taxprep ingest|list|show|review|carryforward|mcp"""
+"""CLI: taxprep ingest|list|show|review|carryforward|mcp|verify"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from decimal import Decimal
 from pathlib import Path
 
@@ -13,6 +14,12 @@ from .review import DEFAULT_PORT, serve_forever
 from .store import DocumentStore
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+# Blind-orchestrator mode: when TAXPREP_BLIND=1, commands that would print
+# field values redact them (box_code + confidence + has_value only).
+# The MCP tool boundary is the primary PII guarantee; this is defense in
+# depth for the workstation session's shell.
+BLIND = os.environ.get("TAXPREP_BLIND") == "1"
 
 
 def _store(data_dir: str | None) -> DocumentStore:
@@ -86,6 +93,13 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(f"form_type:   {doc.form_type}")
     print(f"tax_year:    {doc.tax_year}")
     print(f"status:      {doc.status}")
+    if BLIND:
+        print("fields:      [redacted: TAXPREP_BLIND=1]")
+        for code, f in doc.fields.items():
+            v = f.get("value") if isinstance(f, dict) else None
+            has = v is not None and v != ""
+            print(f"  {code:28}  has_value={has!s:5}  [{f.get('confidence') if isinstance(f, dict) else '?'}]")
+        return 0
     print(f"source:      {doc.source_path}")
     print(f"ocr_text:    {doc.ocr_text_ref}")
     print("fields:")
@@ -153,6 +167,29 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    from .verify import verify_all
+
+    store = _store(args.data_dir)
+    result = verify_all(store, args.year)
+    print(f"verify_all{' year=' + str(args.year) if args.year else ''}: "
+          f"{'PASS' if result['passed'] else 'FAIL'}")
+    for name, r in result["checks"].items():
+        status = "PASS" if r.get("passed") else "FAIL"
+        detail = ", ".join(
+            f"{k}={v}" for k, v in r.items()
+            if k not in ("passed",) and not k.endswith("_ids")
+            and isinstance(v, (int, str, bool)))
+        ids = [v for k, v in r.items()
+               if k.endswith("_ids") and isinstance(v, list) and v]
+        line = f"  {name:32} {status:4}  {detail}"
+        print(line)
+        for idlist in ids:
+            for i in idlist:
+                print(f"    - {i}")
+    return 0 if result["passed"] else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="taxprep", description="Transcribe tax documents into structured digital form (local-only).")
     p.add_argument("--data-dir", default=None, help="data directory (default: ./data)")
@@ -193,6 +230,11 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--data-dir", default=argparse.SUPPRESS,
                     help="data directory (default: ./data or TAXPREP_DATA_DIR)")
     pm.set_defaults(func=cmd_mcp)
+
+    pv = sub.add_parser("verify", help="run mechanical verification checks (PII-free output)")
+    pv.add_argument("--year", type=int, default=None,
+                    help="restrict per-year checks to one year (default: all years)")
+    pv.set_defaults(func=cmd_verify)
     return p
 
 

@@ -23,6 +23,31 @@ Real taxpayer material never leaves the workstation. Concretely:
 - Discrepancy reports travel as *shapes*, not values: "W-2 box 1 regex
   missed a `$` prefix on one employer format" — never the actual numbers.
 
+## The blind-orchestrator rule
+
+The workstation agent operates **blind**: it must never see PII in its
+context — no field values, no raw_text snippets, no OCR text, no dollar
+amounts, no names, no EINs, no addresses. Concretely:
+
+- MCP tools never return PII. Values live only in `data/reports/*`
+  (full carryforward reports, Peter's eyes only) and the localhost review
+  UI — both local, both gitignored.
+- The agent sees metadata only: doc_ids, tax years, form types, box codes,
+  confidence levels, has_value flags, counts, statuses, pass/fail results,
+  report paths, refusal messages.
+- All agent-side verification is mechanical and deterministic
+  (`taxprep verify`, the `verify_*` MCP tools): every check returns
+  counts/ids/booleans. A FAILED check means "needs human eyes", never
+  "wrong". The agent must not attempt to read document content through
+  any other channel.
+- Validation is human-only via the review UI. There is deliberately no
+  `validate_document` MCP tool: an agent that cannot see content can
+  never supply corrections.
+- Defense in depth: the workstation session operates with
+  `TAXPREP_BLIND=1` exported, which redacts field values in
+  `taxprep show`. The MCP tool boundary is the primary guarantee; the
+  env flag is the backstop.
+
 ## Branch discipline
 
 - Both sessions work on the same branch (currently `build/half1`).

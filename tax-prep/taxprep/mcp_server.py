@@ -1,9 +1,35 @@
-"""Local MCP server for the tax-prep agent (Phase 6).
+"""Local MCP server for the tax-prep agent (Phase 6+).
 
-Exposes the tax-prep pipeline as Model Context Protocol tools over the
-**stdio transport only**. The HTTP/SSE transports are deliberately NOT
-exposed: taxpayer PII must never traverse a socket, and this server has
-no reason to listen on any port. ``taxprep mcp`` runs ``mcp.run()``
+BLIND-ORCHESTRATOR CONTRACT
+----------------------------
+The workstation agent that calls these tools must NEVER see PII in its
+context. It orchestrates BLIND:
+
+  MAY see:  doc_ids, tax_year, form_type, box codes, confidence levels,
+            has_value flags, counts, statuses, pass/fail results,
+            report file paths, refusal/error messages.
+  NEVER:    field values, raw_text snippets, OCR text, dollar amounts,
+            payer/employer names, EINs, addresses.
+
+Enforcement points (defense in depth):
+
+  1. show_document scrubs every field to {box_code, confidence,
+     has_value}; payer names embedded in transcript field codes
+     ("payer1.ACME CORP.1") are redacted to "payer1.[payer].1"; the
+     source_path / ocr_text_ref are dropped (local paths can leak
+     usernames and are not needed for box inventory).
+  2. compute_carryforward writes the full PII-bearing report to a
+     local file under data/reports/ (gitignored, operator's eyes
+     only); the tool returns only {report_path, years_covered,
+     n_warnings, status}.
+  3. There is NO validate tool: validation is human-only, in the
+     localhost review UI. An agent that cannot see content can never
+     supply corrections -- so it is not given the chance.
+  4. All verify_* tools return counts/ids/booleans only (see verify.py).
+
+Transport: stdio only. The HTTP/SSE transports are deliberately NOT
+exposed: taxpayer PII must never traverse a socket, and this server
+has no reason to listen on any port. ``taxprep mcp`` runs ``mcp.run()``
 with FastMCP's default stdio transport; there is no code path that
 starts a network listener.
 
@@ -15,18 +41,56 @@ real taxpayer material only ever on the operator's own machine, and
 from __future__ import annotations
 
 import os
+import re
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 from .ingest import ingest_dir
-from .review import apply_validation
 from .store import DocumentStore
 
 mcp = FastMCP("taxprep")
 
 PACKAGE_DEFAULT_DATA_DIR = str(Path(__file__).resolve().parent.parent / "data")
+
+# Transcript field codes embed the payer name: "payer1.ACME CORP.1".
+# Redact the name segment so PII never leaks through a key.
+_PAYER_CODE_RE = re.compile(r"^payer\d+$")
+
+
+def _scrub_code(code: str) -> str:
+    parts = code.split(".")
+    if len(parts) >= 3 and _PAYER_CODE_RE.fullmatch(parts[0]):
+        return f"{parts[0]}.[payer].{parts[-1]}"
+    return code
+
+
+def _scrub_doc(doc_dict: dict) -> dict:
+    """Strip PII from a document record for the blind orchestrator.
+
+    Every field becomes {box_code, confidence, has_value}; value and
+    raw_text are dropped, payer names in transcript field codes are
+    redacted, and source_path / ocr_text_ref are dropped.
+    """
+    fields = {}
+    for code, f in (doc_dict.get("fields") or {}).items():
+        if not isinstance(f, dict):
+            continue
+        v = f.get("value")
+        fields[_scrub_code(code)] = {
+            "confidence": f.get("confidence"),
+            "has_value": v is not None and v != "",
+        }
+    return {
+        "doc_id": doc_dict.get("doc_id"),
+        "tax_year": doc_dict.get("tax_year"),
+        "form_type": doc_dict.get("form_type"),
+        "status": doc_dict.get("status"),
+        "validated_at": doc_dict.get("validated_at"),
+        "fields": fields,
+    }
 
 
 def _store(data_dir: str | None) -> DocumentStore:
@@ -54,7 +118,7 @@ def _jsonable(v):
 def ingest_directory(input_dir: str, data_dir: str | None = None) -> dict:
     """Ingest PDFs / .txt OCR files from a directory (recursive) into the
     document store. Returns document counts by form x year and the ids of
-    documents flagged as needing review."""
+    documents flagged as needing review. No PII in the output."""
     store = _store(data_dir)
     docs = ingest_dir(input_dir, store)
     counts = [
@@ -74,7 +138,7 @@ def ingest_directory(input_dir: str, data_dir: str | None = None) -> dict:
 def list_documents(tax_year: int | None = None, form_type: str | None = None,
                    data_dir: str | None = None) -> list:
     """List ingested documents, optionally filtered by tax year and form
-    type. Returns one summary dict per document."""
+    type. Returns one PII-free summary dict per document."""
     store = _store(data_dir)
     return _jsonable([
         {
@@ -90,23 +154,22 @@ def list_documents(tax_year: int | None = None, form_type: str | None = None,
 
 @mcp.tool()
 def show_document(doc_id: str, data_dir: str | None = None) -> dict:
-    """Show one document's full record: extracted fields (value, confidence,
-    raw_text), status, and validation timestamp. Raises a tool error when
-    the doc_id is unknown."""
+    """Show one document's scrubbed record: box codes present, confidence
+    per box, and whether each box has a value -- but NEVER the values
+    themselves, raw_text, payer names, or source paths (blind-orchestrator
+    contract). Raises a tool error when the doc_id is unknown."""
     store = _store(data_dir)
     doc = store.get(doc_id)
     if doc is None:
         raise KeyError(f"unknown doc_id: {doc_id}")
-    return _jsonable({
+    return _jsonable(_scrub_doc({
         "doc_id": doc.doc_id,
         "tax_year": doc.tax_year,
         "form_type": doc.form_type,
-        "source_path": doc.source_path,
-        "ocr_text_ref": doc.ocr_text_ref,
         "status": doc.status,
         "validated_at": doc.validated_at,
         "fields": doc.fields,
-    })
+    }))
 
 
 @mcp.tool()
@@ -142,6 +205,35 @@ def validation_queue(tax_year: int | None = None, form_type: str | None = None,
     })
 
 
+def _render_carryforward_report(result: dict, filing_status_by_year: dict,
+                                lot_notes: list[str]) -> str:
+    """Full PII-bearing report text. Written to a local file for the
+    operator's eyes only -- never returned over the tool boundary."""
+    lines = [
+        "taxprep carryforward report",
+        f"generated: {datetime.now().isoformat(timespec='seconds')}",
+        "filing statuses: " + ", ".join(
+            f"{y}={filing_status_by_year.get(y, '?')}"
+            for y in sorted(result["years"])),
+        "",
+        result["table"],
+        "",
+        "per-year detail:",
+    ]
+    for y in sorted(result["years"]):
+        r = result["years"][y]
+        lines.append(
+            f"  {y}: deductible={r['deductible_loss']} "
+            f"st_out={r['st_carry_out']} lt_out={r['lt_carry_out']}")
+    lines.append("")
+    lines.append("lots: " + "; ".join(lot_notes))
+    if result["warnings"]:
+        lines.append("")
+        lines.append("warnings:")
+        lines.extend(f"  ! {w}" for w in result["warnings"])
+    return "\n".join(lines) + "\n"
+
+
 @mcp.tool()
 def compute_carryforward(filing_status_by_year: dict,
                          prior_st: str | None = None,
@@ -150,6 +242,11 @@ def compute_carryforward(filing_status_by_year: dict,
     """Run the capital-loss carryforward chain (IRS Schedule D worksheet,
     lines 1-13, Decimal-exact) for each tax year 2023-2026 present in the
     store, from validated 1099-B lots only.
+
+    The full report (dollar amounts included) is written to a local file
+    under data/reports/ for the operator's eyes only. The tool itself
+    returns ONLY {report_path, years_covered, n_warnings, status} -- no
+    amounts cross the tool boundary (blind-orchestrator contract).
 
     filing_status_by_year maps year to status, e.g.
     {"2023": "single", "2024": "mfj"} (keys are strings because JSON
@@ -184,34 +281,69 @@ def compute_carryforward(filing_status_by_year: dict,
         statuses,
         prior_carryover={"st": prior_st or "0", "lt": prior_lt or "0"},
     )
+    reports_dir = Path(store.data_dir) / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = reports_dir / f"carryforward_{stamp}.txt"
+    report_path.write_text(
+        _render_carryforward_report(result, filing_status_by_year, lot_notes),
+        encoding="utf-8",
+    )
     return _jsonable({
-        "table": result["table"],
-        "years": result["years"],
-        "warnings": result["warnings"],
-        "lot_notes": lot_notes,
-        "carryforward_into_2026": result["carryforward_into_2026"],
+        "report_path": str(report_path),
+        "years_covered": years,
+        "n_warnings": len(result["warnings"]),
+        "status": "ok",
     })
+
+
+# -- mechanical verification tools (blind-orchestrator safe) ---------
 
 
 @mcp.tool()
-def validate_document(doc_id: str, corrections: dict, confirmed: list,
-                      data_dir: str | None = None) -> dict:
-    """Apply field corrections to one document and mark it validated.
+def verify_completeness(data_dir: str | None = None) -> dict:
+    """Mechanical check: every document has a known form_type and a
+    non-null tax_year. Returns counts and doc_ids only -- no PII."""
+    from .verify import verify_completeness as _v
+    return _jsonable(_v(_store(data_dir)))
 
-    HUMAN-GATED WRITE TOOL: this is the only tool that mutates review
-    state. MCP clients MUST require explicit user approval for every
-    call -- never auto-approve it. The localhost review UI
-    (`taxprep review`) remains the primary validation surface; this
-    tool exists for corrections the operator directs explicitly.
 
-    corrections maps box codes to corrected values
-    (e.g. {"box1_wages": "105000.00"}); confirmed lists box codes the
-    human verified as-is. Returns the updated status."""
-    store = _store(data_dir)
-    doc = apply_validation(store, doc_id, corrections, confirmed or [])
-    return _jsonable({
-        "doc_id": doc.doc_id,
-        "status": doc.status,
-        "validated_at": doc.validated_at,
-        "n_fields": len(doc.fields),
-    })
+@mcp.tool()
+def verify_validation_gate(tax_year: int | None = None,
+                           data_dir: str | None = None) -> dict:
+    """Mechanical check: all documents (optionally filtered to a year)
+    have status validated. Returns counts and unvalidated doc_ids."""
+    from .verify import verify_validation_gate as _v
+    return _jsonable(_v(_store(data_dir), tax_year))
+
+
+@mcp.tool()
+def verify_lot_integrity(tax_year: int, data_dir: str | None = None) -> dict:
+    """Mechanical check: structural integrity of 1099-B lots for a year
+    (proceeds/basis present and non-negative, term in {short, long},
+    dates parseable when present). Returns counts and failing doc_ids --
+    never the offending values."""
+    from .verify import verify_lot_integrity as _v
+    return _jsonable(_v(_store(data_dir), tax_year))
+
+
+@mcp.tool()
+def verify_transcript_reconciliation(tax_year: int,
+                                     data_dir: str | None = None) -> dict:
+    """Mechanical check: reconcile validated W-2/1099 docs against the
+    IRS wage & income transcript for a year. Payers matched on normalized
+    EIN, then normalized name, then unambiguous 1:1 form_type; headline
+    amounts compared with 1-cent tolerance. Returns counts and doc_ids
+    only -- never names or amounts. Unvalidated docs are skipped."""
+    from .verify import verify_transcript_reconciliation as _v
+    return _jsonable(_v(_store(data_dir), tax_year))
+
+
+@mcp.tool()
+def verify_all(tax_year: int | None = None,
+               data_dir: str | None = None) -> dict:
+    """Run every mechanical verification check. With tax_year=None the
+    per-year checks run for each year present. Returns {passed, checks} --
+    all PII-free."""
+    from .verify import verify_all as _v
+    return _jsonable(_v(_store(data_dir), tax_year))

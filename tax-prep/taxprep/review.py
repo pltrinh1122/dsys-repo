@@ -252,14 +252,16 @@ document.getElementById("validateBtn").addEventListener("click", async () => {{
 # -- validation API -------------------------------------------------
 
 def _coerce(value: str):
-    """'1,234.56' -> 1234.56 ; '1234' -> 1234 ; else the string as-is."""
+    """'1,234.56' -> '1234.56' ; '1234' -> '1234' ; else the string as-is.
+
+    Numeric corrections stay STRINGS (never float): downstream consumers
+    (carryforward.from_store) parse via Decimal and loudly reject floats,
+    so a float here would break the validate -> carryforward pipeline.
+    """
     s = value.strip().replace(",", "").replace("$", "")
-    if re.fullmatch(r"-?\d+", s):
-        return int(s)
-    try:
-        return float(s)
-    except ValueError:
-        return value
+    if re.fullmatch(r"-?\d+(\.\d+)?", s):
+        return s
+    return value
 
 
 def apply_validation(store: DocumentStore, doc_id: str,

@@ -191,7 +191,7 @@ def test_validate_updates_store(server):
     assert code == 200 and resp == {"ok": True}
     doc = DocumentStore(store.data_dir).get("int-bank-2024")
     assert doc.status == "validated"
-    assert doc.fields["box1_interest"]["value"] == 420.0
+    assert doc.fields["box1_interest"]["value"] == "420.00"  # Decimal-safe string, never float
     assert doc.validated_at is not None
 
 

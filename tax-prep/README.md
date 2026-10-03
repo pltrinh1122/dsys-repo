@@ -37,6 +37,9 @@ python3 -m venv .venv
 
 # Run the local MCP server over stdio (for Claude Code / MCP clients)
 .venv/bin/taxprep mcp --data-dir ./data
+
+# Mechanical verification (PII-free output for the blind orchestrator)
+.venv/bin/taxprep verify --data-dir ./data [--year 2024]
 ```
 
 `ingest` prints a summary table (counts by form × year) plus the list of
@@ -65,6 +68,39 @@ any other bind address is refused):
 Typical loop: `ingest` → `review` in the browser → validated.
 Validated documents leave the queue; nothing is deleted.
 
+## Blind-orchestrator contract
+
+The workstation agent (Claude Code) operates this system **blind**: it
+must never see PII in its context. Enforcement is layered:
+
+- **MCP tool boundary (primary).** `show_document` scrubs every field
+  to `{box_code, confidence, has_value}` — values, `raw_text`, payer
+  names (even inside transcript field codes), and source paths are
+  stripped. `compute_carryforward` writes the full PII-bearing report
+  to `data/reports/carryforward_YYYYMMDD_HHMMSS.txt` (gitignored,
+  operator's eyes only) and returns only
+  `{report_path, years_covered, n_warnings, status}`. There is **no**
+  validate tool: validation is human-only in the review UI, because an
+  agent that cannot see content can never supply corrections.
+- **Mechanical verification** (`taxprep/verify.py`, `taxprep verify`).
+  The agent verifies structurally instead of reading content:
+  completeness (known form/year), the validation gate (all validated),
+  1099-B lot integrity (present/non-negative boxes, valid term,
+  parseable dates), transcript reconciliation (validated docs vs the
+  IRS wage & income transcript, 1-cent tolerance), and
+  carryforward-readiness. Every check returns counts/ids/booleans
+  only. A FAILED check means "needs human eyes", not "wrong".
+- **CLI blind mode (defense in depth).** With `TAXPREP_BLIND=1`,
+  `taxprep show` redacts field values (box_code + confidence +
+  has_value only). The workstation session should export
+  `TAXPREP_BLIND=1` in its shell.
+
+The agent may see: doc_ids, tax_year, form_type, box codes, confidence
+levels, has_value flags, counts, statuses, pass/fail results, report
+file paths, refusal messages. It must never see: field values,
+raw_text, OCR text, dollar amounts, payer/employer names, EINs,
+addresses.
+
 ## Layout
 
 ```
@@ -83,10 +119,18 @@ taxprep/
                  worksheet logic (Decimal-only), 2023-2026 chaining,
                  from_store() adapter over validated 1099-Bs
   mcp_server.py  local MCP server (FastMCP, stdio transport only):
-                 ingest_directory, list_documents, show_document,
-                 validation_queue, compute_carryforward,
-                 validate_document (human-gated write tool)
-  cli.py         argparse CLI: ingest | list | show | review | carryforward | mcp
+                 blind-orchestrator contract -- show_document scrubs fields
+                 to {box_code, confidence, has_value}; compute_carryforward
+                 writes the full report to data/reports/ and returns only
+                 {report_path, years_covered, n_warnings, status}; no
+                 validate tool (human-only validation); verify_* tools
+                 wrap verify.py
+  verify.py      mechanical verification suite (blind-safe): completeness,
+                 validation gate, 1099-B lot integrity, transcript
+                 reconciliation (EIN/name/1:1 matching, 1-cent tolerance),
+                 carryforward-readiness; all outputs counts/ids/booleans
+  cli.py         argparse CLI: ingest | list | show | review | carryforward | mcp | verify
+                 (TAXPREP_BLIND=1 redacts `show` field values)
 tests/
   test_extractors.py   synthetic fixtures per form type
   test_transcript.py   synthetic transcript samples
@@ -141,21 +185,28 @@ MCP clients (e.g. Claude Code on the operator's workstation), over the
 exposed anywhere in `mcp_server.py`: taxpayer PII must never traverse
 a socket, and this server has no reason to listen on any port.
 
-Tools:
+Tools (blind-orchestrator contract — see below):
 
 - `ingest_directory(input_dir)` — ingest PDFs/OCR text; returns counts
   and the needs-review id list.
 - `list_documents(tax_year?, form_type?)` — per-document summaries.
-- `show_document(doc_id)` — full record with field confidences.
+- `show_document(doc_id)` — **scrubbed** record: box codes, confidence,
+  has_value per box. Never values, raw_text, names, or paths.
 - `validation_queue(tax_year?, form_type?)` — the human review queue
   plus per-year validated/total progress.
 - `compute_carryforward(filing_status_by_year, prior_st?, prior_lt?)` —
-  the 2023-2026 worksheet chain from validated 1099-Bs; raises the
+  the 2023-2026 worksheet chain from validated 1099-Bs; writes the full
+  report (amounts included) to `data/reports/` and returns only
+  `{report_path, years_covered, n_warnings, status}`. Raises the
   loud unvalidated-document refusal as a tool error.
-- `validate_document(doc_id, corrections, confirmed)` — **human-gated
-  write tool**: the only tool that mutates review state. MCP clients
-  must require explicit user approval for every call; the localhost
-  review UI (`taxprep review`) remains the primary validation surface.
+- `verify_completeness()` / `verify_validation_gate(tax_year?)` /
+  `verify_lot_integrity(tax_year)` /
+  `verify_transcript_reconciliation(tax_year)` / `verify_all(tax_year?)`
+  — mechanical checks; counts/ids/booleans only.
+
+There is deliberately **no** `validate_document` tool. Validation is
+human-only in the localhost review UI: an agent that cannot see
+content can never supply corrections, so it is not given the chance.
 
 All money figures cross the tool boundary as strings (raw Decimals
 never leak into tool output); every return value is JSON-serializable.
