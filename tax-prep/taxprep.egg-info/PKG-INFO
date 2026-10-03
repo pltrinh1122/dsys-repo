@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: taxprep
+Version: 0.1.0
+Summary: Phase 1: local-only CLI to transcribe tax documents (PDF + OCR) into structured digital form for amended-return preparation.
+Requires-Python: >=3.11
+Requires-Dist: pypdf
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: reportlab; extra == "dev"

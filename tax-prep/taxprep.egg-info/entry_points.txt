@@ -1,0 +1,2 @@
+[console_scripts]
+taxprep = taxprep.cli:main
