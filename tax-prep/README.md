@@ -34,6 +34,9 @@ python3 -m venv .venv
 .venv/bin/taxprep carryforward --data-dir ./data --filing-status single
 # single year: .venv/bin/taxprep carryforward --year 2024 --filing-status mfs
 # seed a 2022 carryover: --prior-st 4500 --prior-lt 1200
+
+# Run the local MCP server over stdio (for Claude Code / MCP clients)
+.venv/bin/taxprep mcp --data-dir ./data
 ```
 
 `ingest` prints a summary table (counts by form × year) plus the list of
@@ -79,7 +82,11 @@ taxprep/
   carryforward.py  capital-loss carryforward engine: per-year Schedule D
                  worksheet logic (Decimal-only), 2023-2026 chaining,
                  from_store() adapter over validated 1099-Bs
-  cli.py         argparse CLI: ingest | list | show | review | carryforward
+  mcp_server.py  local MCP server (FastMCP, stdio transport only):
+                 ingest_directory, list_documents, show_document,
+                 validation_queue, compute_carryforward,
+                 validate_document (human-gated write tool)
+  cli.py         argparse CLI: ingest | list | show | review | carryforward | mcp
 tests/
   test_extractors.py   synthetic fixtures per form type
   test_transcript.py   synthetic transcript samples
@@ -125,3 +132,38 @@ docstring for the full statement):
   section 1250 gain (25%), 28% collectibles rate,
   qualified-dividend interactions. Wash-sale adjustments are
   assumed already in 1099-B basis. State rules not modeled.
+
+## Phase 6 — local MCP server (stdio only)
+
+`taxprep mcp` exposes the pipeline as Model Context Protocol tools for
+MCP clients (e.g. Claude Code on the operator's workstation), over the
+**stdio transport only**. The HTTP/SSE transports are deliberately not
+exposed anywhere in `mcp_server.py`: taxpayer PII must never traverse
+a socket, and this server has no reason to listen on any port.
+
+Tools:
+
+- `ingest_directory(input_dir)` — ingest PDFs/OCR text; returns counts
+  and the needs-review id list.
+- `list_documents(tax_year?, form_type?)` — per-document summaries.
+- `show_document(doc_id)` — full record with field confidences.
+- `validation_queue(tax_year?, form_type?)` — the human review queue
+  plus per-year validated/total progress.
+- `compute_carryforward(filing_status_by_year, prior_st?, prior_lt?)` —
+  the 2023-2026 worksheet chain from validated 1099-Bs; raises the
+  loud unvalidated-document refusal as a tool error.
+- `validate_document(doc_id, corrections, confirmed)` — **human-gated
+  write tool**: the only tool that mutates review state. MCP clients
+  must require explicit user approval for every call; the localhost
+  review UI (`taxprep review`) remains the primary validation surface.
+
+All money figures cross the tool boundary as strings (raw Decimals
+never leak into tool output); every return value is JSON-serializable.
+
+Connect from Claude Code (on the machine holding the data):
+
+```bash
+claude mcp add taxprep -- /path/to/tax-prep/.venv/bin/taxprep mcp --data-dir /path/to/data
+```
+
+`--data-dir` may also be supplied via the `TAXPREP_DATA_DIR` env var.

@@ -1,4 +1,4 @@
-"""CLI: taxprep ingest|list|show|review|carryforward"""
+"""CLI: taxprep ingest|list|show|review|carryforward|mcp"""
 
 from __future__ import annotations
 
@@ -144,6 +144,15 @@ def _fmt(raw: str) -> str:
     return f"({s})" if d < 0 else s
 
 
+def cmd_mcp(args: argparse.Namespace) -> int:
+    import os
+    if getattr(args, "data_dir", None):
+        os.environ["TAXPREP_DATA_DIR"] = args.data_dir
+    from .mcp_server import mcp
+    mcp.run()  # stdio transport only -- never network
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="taxprep", description="Transcribe tax documents into structured digital form (local-only).")
     p.add_argument("--data-dir", default=None, help="data directory (default: ./data)")
@@ -178,6 +187,12 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--prior-lt", default="0",
                     help="2022 LT loss carryover into the first year (default 0)")
     pc.set_defaults(func=cmd_carryforward)
+
+    pm = sub.add_parser("mcp", help="run the local MCP server over stdio (no network)")
+    # SUPPRESS so `taxprep --data-dir D mcp` (parent flag) isn't clobbered.
+    pm.add_argument("--data-dir", default=argparse.SUPPRESS,
+                    help="data directory (default: ./data or TAXPREP_DATA_DIR)")
+    pm.set_defaults(func=cmd_mcp)
     return p
 
 

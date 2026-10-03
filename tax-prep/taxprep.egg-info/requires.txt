@@ -1,5 +1,0 @@
-pypdf
-
-[dev]
-pytest
-reportlab
