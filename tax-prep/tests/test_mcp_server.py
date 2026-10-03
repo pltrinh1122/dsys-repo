@@ -33,6 +33,7 @@ EXPECTED_TOOLS = {
     "bus_publish",
     "bus_poll",
     "assess_relevance",
+    "relevance_override",
     "analyze_gaps",
 }
 
@@ -86,7 +87,7 @@ def _pii_free(obj):
         assert not re.search(r"\$\d", obj), f"money leaked: {obj[:60]!r}"
 
 
-def test_all_fourteen_tools_registered():
+def test_all_fifteen_tools_registered():
     async def names():
         return {t.name for t in await mcp.list_tools()}
 
@@ -138,6 +139,52 @@ def test_show_document_scrubbed_shape(tmp_path):
     codes = list(trec["fields"])
     assert codes == ["payer1.[payer].1"], f"payer name leaked via key: {codes}"
     _pii_free(trec)
+
+
+def test_show_document_provenance_and_positional_payer_keys(tmp_path):
+    """R5: provenance keys are exposed as non-PII metadata. R8: positional
+    payer keys (payer1.1) pass through; the payer name survives only as a
+    redacted has_value on payer1.name."""
+    doc = _doc("ocr-1", 2024, "W-2",
+               {"1": _field("10000.00", "high", "Box 1"),
+                "payer1.name": _field("ACME CORP", "high", ""),
+                "payer1.1": _field(85000.0, "high", "")},
+               "transcribed")
+    doc.text_source = "ocr"
+    doc.reason_code = None
+    doc.ocr_engine = "tesseract"
+    doc.engine_version = "5.3.4"
+    doc.ocr_mode = "redo-ocr"
+    doc.attempts = [
+        {"mode": "skip-text", "engine": "tesseract",
+         "engine_version": "5.3.4", "ok": False, "chars": 12,
+         "mean_confidence": None, "reason_code": "ocr_failed"},
+        {"mode": "redo-ocr", "engine": "tesseract",
+         "engine_version": "5.3.4", "ok": True, "chars": 480,
+         "mean_confidence": 91.2, "reason_code": None},
+    ]
+    doc.mean_confidence = 91.2
+    store = _store_with(tmp_path, [doc])
+    dd = str(store.data_dir)
+
+    rec = mcp_server.show_document("ocr-1", data_dir=dd)
+    # provenance keys present (operational metadata, not taxpayer data)
+    assert set(mcp_server.PROVENANCE_KEYS) <= set(rec)
+    assert rec["text_source"] == "ocr"
+    assert rec["ocr_engine"] == "tesseract"
+    assert rec["engine_version"] == "5.3.4"
+    assert rec["ocr_mode"] == "redo-ocr"
+    assert rec["mean_confidence"] == 91.2
+    assert [a["mode"] for a in rec["attempts"]] == ["skip-text", "redo-ocr"]
+    # positional payer keys pass through unredacted; names never leak
+    assert set(rec["fields"]) == {"1", "payer1.name", "payer1.1"}
+    assert rec["fields"]["payer1.name"] == {"confidence": "high",
+                                           "has_value": True}
+    blob = json.dumps(rec)
+    assert "ACME" not in blob
+    assert "source_path" not in rec and "ocr_text_ref" not in rec
+    json.dumps(rec)
+    _pii_free(rec)
 
     with pytest.raises(KeyError):
         mcp_server.show_document("nope", data_dir=str(store.data_dir))
@@ -259,11 +306,25 @@ def test_pii_sweep_all_tools(tmp_path, monkeypatch):
              "validated"),
         _b1099("b1", 2024, "100.00", "50.00", "short", "validated"),
     ])
+    # R5 provenance on one doc: the sweep below must cover the new keys
+    prov = store.get("w2-a")
+    prov.text_source = "ocr"
+    prov.ocr_engine = "tesseract"
+    prov.engine_version = "5.3.4"
+    prov.ocr_mode = "skip-text"
+    prov.attempts = [{"mode": "skip-text", "engine": "tesseract",
+                      "engine_version": "5.3.4", "ok": True, "chars": 900,
+                      "mean_confidence": 93.0, "reason_code": None}]
+    prov.mean_confidence = 93.0
+    store.upsert(prov)
     dd = str(store.data_dir)
     outputs = [
         mcp_server.list_documents(data_dir=dd),
         mcp_server.show_document("w2-a", data_dir=dd),
         mcp_server.validation_queue(data_dir=dd),
+        mcp_server.validation_queue(data_dir=dd, include_irrelevant=True),
+        mcp_server.relevance_override("w2-a", "relevant",
+                                      "operator sweep note", data_dir=dd),
         mcp_server.compute_carryforward({"2024": "single"}, data_dir=dd),
         mcp_server.verify_completeness(data_dir=dd),
         mcp_server.verify_validation_gate(data_dir=dd),
@@ -337,3 +398,44 @@ def test_new_mcp_tools_shapes(tmp_path, monkeypatch):
     assert Path(gaps["report_path"]).is_file()
     json.dumps(gaps)
     _pii_free(gaps)
+
+
+def test_guard_refusal_surfaces_blockers_through_mcp(tmp_path):
+    """R3: the guard's blocker list surfaces through the MCP boundary.
+
+    compute_carryforward refuses (raised tool error) with doc_ids +
+    reason codes in the message; verify_all's carryforward_ready reason
+    carries the same. Both are swept for PII: doc_ids and reason codes
+    only, no values, no exclusion reasons.
+    """
+    store = _store_with(tmp_path, [
+        _b1099("b1", 2024, "100.00", "50.00", "short", "validated"),
+        _doc("u1", 2024, "UNKNOWN", {}, "validated"),
+        _doc("z1", 2024, "1099-B", {}, "validated"),
+    ])
+    dd = str(store.data_dir)
+
+    with pytest.raises(ValueError) as ei:
+        mcp_server.compute_carryforward({"2024": "single"}, data_dir=dd)
+    msg = str(ei.value)
+    assert "u1(unknown_form)" in msg
+    assert "z1(zero_lots)" in msg
+    _pii_free(msg)
+
+    out = mcp_server.verify_all(tax_year=2024, data_dir=dd)
+    cr = out["checks"]["carryforward_ready"]
+    assert cr["passed"] is False
+    assert "u1(unknown_form)" in cr["reason"]
+    assert "z1(zero_lots)" in cr["reason"]
+    json.dumps(out)
+    _pii_free(out)
+
+    # an Operator exclusion clears the guard through the same path
+    from taxprep import exclusions as _x
+    _x.record_exclusion(dd, "u1", "operator: duplicate of scanned W-2")
+    _x.record_exclusion(dd, "z1", "operator: informational copy, no lots")
+    out2 = mcp_server.verify_all(tax_year=2024, data_dir=dd)
+    assert out2["checks"]["carryforward_ready"] == {
+        "passed": True, "reason": "ready"}
+    json.dumps(out2)
+    _pii_free(out2)

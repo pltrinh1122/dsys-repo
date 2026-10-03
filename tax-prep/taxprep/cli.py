@@ -1,4 +1,4 @@
-"""CLI: taxprep ingest|list|show|review|carryforward|mcp|verify|bus|config|relevance|gaps"""
+"""CLI: taxprep ingest|list|show|review|carryforward|mcp|verify|bus|config|relevance|gaps|pipeline|relevance-override|validation-queue|exclude|exclusions|sync|ingest-csv"""
 
 from __future__ import annotations
 
@@ -14,10 +14,13 @@ from . import bus as bus_mod
 from . import config as taxprep_config
 from .ingest import ingest_dir
 from .models import FORM_TYPES
-from .review import DEFAULT_PORT, serve_forever
+from .review import DEFAULT_PORT, add_token_argument, serve_forever
 from .store import DocumentStore
 
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+# N1: data_dir has no package default. It is REQUIRED -- set once via
+# `taxprep config set data_dir <path>` (or TAXPREP_DATA_DIR / --data-dir);
+# config.resolve("data_dir") fails closed naming that command, and
+# refuses paths inside site-packages.
 
 # Blind-orchestrator mode: when TAXPREP_BLIND=1, commands that would print
 # field values redact them (box_code + confidence + has_value only).
@@ -27,7 +30,12 @@ BLIND = os.environ.get("TAXPREP_BLIND") == "1"
 
 
 def _store(data_dir: str | None) -> DocumentStore:
-    return DocumentStore(taxprep_config.resolve("data_dir", cli_value=data_dir))
+    try:
+        return DocumentStore(taxprep_config.resolve("data_dir", cli_value=data_dir))
+    except ValueError as exc:
+        # N1 fail-closed: no usable data dir configured.
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
@@ -56,6 +64,16 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     widths = [max(len(r[i]) for r in [header] + rows) for i in range(len(header))]
 
     print(f"Ingested {len(docs)} document(s) from {input_dir}")
+    # R6 per-run accounting (reason codes; file names hidden in blind mode)
+    rep = docs.summary()
+    print(f"files seen: {rep['files_seen']}, ingested: {rep['ingested']}, "
+          f"skipped: {len(rep['skipped'])}, errored: {len(rep['errored'])}")
+    for entry in rep["skipped"]:
+        suffix = "" if BLIND else f"  {entry['file']}"
+        print(f"  skipped [{entry['reason_code']}]" + suffix)
+    for entry in rep["errored"]:
+        suffix = "" if BLIND else f"  {entry['file']}"
+        print(f"  errored [{entry['reason_code']}]" + suffix)
     print(" | ".join(h.ljust(w) for h, w in zip(header, widths)))
     print("-+-".join("-" * w for w in widths))
     for row in rows:
@@ -64,7 +82,9 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     need = store.needs_review()
     print(f"\n{len(need)} document(s) need review:")
     for d in need:
-        print(f"  {d.doc_id}  [{d.form_type} {ylab(d.tax_year)}]  {d.source_path}")
+        # R8: blind mode drops source_path -- local paths can leak usernames.
+        suffix = "" if BLIND else f"  {d.source_path}"
+        print(f"  {d.doc_id}  [{d.form_type} {ylab(d.tax_year)}]{suffix}")
     print(f"\nStore: {store.db_path} ({len(store)} records)")
     return 0
 
@@ -103,11 +123,16 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(f"tax_year:    {doc.tax_year}")
     print(f"status:      {doc.status}")
     if BLIND:
+        # R8: reuse the MCP scrub helper -- transcript field codes embed
+        # payer names ("payer1.ACME CORP.1"); they must be redacted here
+        # too. (Local import: keeps FastMCP out of every CLI invocation.)
+        from .mcp_server import _scrub_code
+
         print("fields:      [redacted: TAXPREP_BLIND=1]")
         for code, f in doc.fields.items():
             v = f.get("value") if isinstance(f, dict) else None
             has = v is not None and v != ""
-            print(f"  {code:28}  has_value={has!s:5}  [{f.get('confidence') if isinstance(f, dict) else '?'}]")
+            print(f"  {_scrub_code(code):28}  has_value={has!s:5}  [{f.get('confidence') if isinstance(f, dict) else '?'}]")
         return 0
     print(f"source:      {doc.source_path}")
     print(f"ocr_text:    {doc.ocr_text_ref}")
@@ -122,7 +147,7 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 def cmd_review(args: argparse.Namespace) -> int:
     store = _store(args.data_dir)
-    serve_forever(store, port=args.port)
+    serve_forever(store, port=args.port, token=args.token)
     return 0
 
 
@@ -171,6 +196,12 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     import os
     if getattr(args, "data_dir", None):
         os.environ["TAXPREP_DATA_DIR"] = args.data_dir
+    try:
+        # N1 fail-closed with a clean CLI error (not a FastMCP traceback).
+        taxprep_config.resolve("data_dir")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     from .mcp_server import mcp
     mcp.run()  # stdio transport only -- never network
     return 0
@@ -246,6 +277,8 @@ def cmd_bus_listen(args: argparse.Namespace) -> int:
     interval = int(tuning["tuning"].get("poll_interval_seconds", 30))
     timeout = args.timeout
     once = args.once
+    wait_first = args.wait_first  # N3: block until first delivery, then exit
+    delivered = 0
     start = time.monotonic()
     while True:
         for i, topic in enumerate(topics):
@@ -259,9 +292,12 @@ def cmd_bus_listen(args: argparse.Namespace) -> int:
                 return 2
             for msg in result:
                 print(json.dumps(msg))
+                delivered += 1
             for w in result.warnings:
                 print(f"warning: {w}", file=sys.stderr)
         sys.stdout.flush()
+        if wait_first and delivered:
+            return 0
         if once or (time.monotonic() - start) >= timeout:
             return 0
         time.sleep(min(interval, max(1, timeout - (time.monotonic() - start))))
@@ -274,21 +310,50 @@ def cmd_bus_topics(args: argparse.Namespace) -> int:
 
 
 def cmd_bus_tune(args: argparse.Namespace) -> int:
+    # N3: tuning into a topic on top of the default "*" expands it to an
+    # explicit list -- say so, instead of a silent no-op.
+    was_star = bus_mod.load_tuning(args.tuning)["tuning"]["topics"] == ["*"]
     if args.off:
         tuning = bus_mod.unsubscribe(args.topic, args.tuning)
         print(f"tuned out of {args.topic}")
     else:
         tuning = bus_mod.subscribe(args.topic, args.tuning)
         print(f"tuned into {args.topic}")
+        if was_star:
+            print("note: '*' expanded to the explicit topic list above -- "
+                  "a later `tune --topic <t> --off` now narrows it")
     print("subscribed topics: " +
           ", ".join(tuning["tuning"]["topics"]))
     return 0
 
 
 def cmd_bus_whoami(args: argparse.Namespace) -> int:
+    import tomllib
+
     tuning = bus_mod.load_tuning(args.tuning)
-    sid = tuning["session"]["id"] or "(not set -- generated on first publish)"
-    print(f"session_id:  {sid}")
+    # N3: TAXPREP_SESSION_ID is the ROLE, not the id -- show both
+    # distinctly. The generated id (<role>-<6 hex>) lives in the tuning
+    # file; a bare role-shaped value there is not an id.
+    role = os.environ.get("TAXPREP_SESSION_ID") or "(not set)"
+    tp = Path(args.tuning) if args.tuning else bus_mod.default_tuning_path()
+    file_id = ""
+    if tp.is_file():
+        try:
+            with tp.open("rb") as fh:
+                raw = tomllib.load(fh)
+            if isinstance(raw, dict):
+                file_id = str(raw.get("session", {}).get("id", "") or "")
+        except (OSError, tomllib.TOMLDecodeError):
+            file_id = ""
+    if file_id and bus_mod._SESSION_ID_RE.match(file_id):
+        sid_line = file_id
+    elif file_id:
+        sid_line = (f"{file_id}  (not a generated id -- a fresh "
+                    "<role>-<6 hex> id is minted on first publish)")
+    else:
+        sid_line = "(not generated yet -- minted on first publish)"
+    print(f"role:        {role}  (TAXPREP_SESSION_ID: the role, not the id)")
+    print(f"session_id:  {sid_line}")
     print("subscribed:  " +
           ", ".join(bus_mod.subscribed_topics(
               tuning, bus_dir=args.bus_dir, store_dir=args.store_dir)))
@@ -302,7 +367,6 @@ def cmd_bus_whoami(args: argparse.Namespace) -> int:
     print(f"bus_dir:     {bus_dir}")
     print(f"tuning:      {bus_mod.default_tuning_path() if args.tuning is None else args.tuning}")
     print(f"cursor:      {bus_mod.default_cursor_path()}")
-    return 0
     print("(tuning and cursor are local-only; never committed)")
     return 0
 
@@ -326,7 +390,12 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     print(f"config file: {path}  "
           f"({'present' if path.is_file() else 'missing -- defaults apply'})")
     for key in ("source_dir", "data_dir", "scope_years", "store_dir"):
-        print(f"{key:12} = {taxprep_config.resolve(key)}")
+        try:
+            value = taxprep_config.resolve(key)
+        except ValueError as exc:
+            # N1: data_dir is required; show the setup hint, not a traceback.
+            value = f"(unset: {exc})"
+        print(f"{key:12} = {value}")
     print("(machine-local; never committed)")
     return 0
 
@@ -376,9 +445,194 @@ def cmd_gaps(args: argparse.Namespace) -> int:
     return 0
 
 
+# -- G: pipeline stages + relevance override + validation queue -------
+
+
+def cmd_pipeline_stages(args: argparse.Namespace) -> int:
+    from .pipeline import registry
+
+    for s in registry():
+        alongside = "  [rides alongside -- analysis, not a gate]" \
+            if s["kind"] == "analysis" else ""
+        print(f"{s['name']:16} [{s['kind']:10}] {s['title']}{alongside}")
+        print(f"    {s['description']}")
+    return 0
+
+
+def cmd_pipeline_run(args: argparse.Namespace) -> int:
+    from .pipeline import run_pipeline, slice_sequence
+
+    store = _store(args.data_dir)  # N1 fail-closed
+    input_dir = args.input_dir or taxprep_config.resolve("source_dir")
+    scope = taxprep_config.resolve("scope_years")
+    try:
+        stages = slice_sequence(args.from_stage, args.to_stage)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if input_dir is None and any(s["name"] == "INGESTION" for s in stages):
+        print("error: no input directory: pass one or run "
+              "`taxprep config set source_dir <dir>` once", file=sys.stderr)
+        return 2
+    result = run_pipeline(
+        store, input_dir=input_dir, scope_years=scope, year=args.year,
+        from_stage=args.from_stage, to_stage=args.to_stage)
+    print()
+    done = sum(1 for r in result["stages"] if r["status"] == "ok")
+    skipped = sum(1 for r in result["stages"] if r["status"] == "skipped")
+    if result["ok"]:
+        print(f"pipeline: OK ({done} ran, {skipped} operator-step skipped)")
+        return 0
+    print(f"pipeline: FAILED at {result['failed_stage']} "
+          f"({done} ran before the failure)")
+    return 1
+
+
+def cmd_relevance_override(args: argparse.Namespace) -> int:
+    from .relevance import relevance_override
+
+    store = _store(args.data_dir)
+    doc_id = _resolve_doc_id(store, args.doc_id)
+    try:
+        out = relevance_override(store, doc_id, args.verdict, args.reason)
+    except (ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    rec = out["record"]
+    print(f"override recorded: {rec['doc_id']} -> {rec['verdict']} "
+          f"(reason: {rec['reason']}, ts: {rec['ts']})")
+    print(f"applied verdict: {out['applied_verdict']}")
+    if out["suppressed"]:
+        print("note: suppressed -- the document is validated, so "
+              "validated_by_operator dominates (stays relevant)")
+    return 0
+
+
+def cmd_validation_queue(args: argparse.Namespace) -> int:
+    store = _store(args.data_dir)
+    docs = [d for d in store.list(year=args.year, form=args.form)
+            if d.status in ("transcribed", "needs_review")]
+    hidden = [d for d in docs if d.relevance == "irrelevant"]
+    if not args.include_irrelevant:
+        docs = [d for d in docs if d.relevance != "irrelevant"]
+    if not docs:
+        print("validation queue empty.")
+    else:
+        print(f"{'doc_id':36} {'year':6} {'form':22} {'status':13} relevance")
+        for d in sorted(docs, key=lambda d: d.doc_id):
+            year = str(d.tax_year) if d.tax_year else "????"
+            print(f"{d.doc_id:36} {year:6} {d.form_type:22} "
+                  f"{d.status:13} {d.relevance}")
+    if hidden and not args.include_irrelevant:
+        print(f"\n{len(hidden)} irrelevant document(s) hidden "
+              "(--include-irrelevant to list; `taxprep relevance-override` "
+              "to restore)")
+    return 0
+
+
+# -- R4/R6/R7: sync, exclusions, broker CSV (wave-2 workstream F) --------
+
+
+def _resolve_doc_id(store: DocumentStore, doc_id: str):
+    """Exact doc_id, else unique prefix match (like cmd_show)."""
+    doc = store.get(doc_id)
+    if doc is not None:
+        return doc.doc_id
+    matches = [d for d in store.list() if d.doc_id.startswith(doc_id)]
+    if len(matches) == 1:
+        return matches[0].doc_id
+    if matches:
+        print(f"Ambiguous prefix; {len(matches)} matches.", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"No document: {doc_id}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    from .ingest import sync as sync_store
+
+    input_dir = args.input_dir or taxprep_config.resolve("source_dir")
+    if not input_dir:
+        print("error: no input directory: pass one or run "
+              "`taxprep config set source_dir <dir>` once", file=sys.stderr)
+        return 2
+    store = _store(args.data_dir)
+    result = sync_store(input_dir, store)
+    print(f"sync {input_dir}: files_seen={result['files_seen']} "
+          f"ingested={result['ingested']} "
+          f"skipped={len(result['skipped'])} "
+          f"errored={len(result['errored'])}")
+    for entry in result["skipped"]:
+        suffix = "" if BLIND else f"  {entry['file']}"
+        print(f"  skipped [{entry['reason_code']}]" + suffix)
+    for entry in result["errored"]:
+        suffix = "" if BLIND else f"  {entry['file']}"
+        print(f"  errored [{entry['reason_code']}]" + suffix)
+    if result["orphaned"]:
+        print(f"{len(result['orphaned'])} document(s) ORPHANED "
+              "(source missing):")
+        for doc_id in result["orphaned"]:
+            print(f"  {doc_id}")
+    else:
+        print("no orphaned documents")
+    return 0
+
+
+def cmd_exclude(args: argparse.Namespace) -> int:
+    from . import exclusions as excl_mod
+
+    store = _store(args.data_dir)
+    doc_id = _resolve_doc_id(store, args.doc_id)
+    try:
+        rec = excl_mod.record_exclusion(store.data_dir, doc_id, args.reason)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"excluded {rec['doc_id']} (recorded {rec['recorded_at']})")
+    return 0
+
+
+def cmd_exclusions(args: argparse.Namespace) -> int:
+    from . import exclusions as excl_mod
+
+    store = _store(args.data_dir)
+    recs = excl_mod.list_exclusions(store.data_dir)
+    if not recs:
+        print("no exclusions recorded")
+        return 0
+    for r in recs:
+        # Operator free text stays local: redacted in blind mode.
+        reason = "[redacted: TAXPREP_BLIND=1]" if BLIND else r["reason"]
+        print(f"{r['doc_id']}: {reason} (recorded {r['recorded_at']})")
+    return 0
+
+
+def cmd_ingest_csv(args: argparse.Namespace) -> int:
+    from .brokercsv import ingest_csv
+
+    store = _store(args.data_dir)
+    try:
+        docs = ingest_csv(args.file, args.broker, args.year, store)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"ingested {len(docs)} lot(s) from broker CSV "
+          f"(broker={args.broker}, year={args.year})")
+    for d in docs:
+        codes = sorted(d.fields)
+        print(f"  {d.doc_id}  [{d.form_type} {d.tax_year}] "
+              f"{len(codes)} fields: {','.join(codes)}")
+    print("status needs_review: validate with `taxprep review` before "
+          "carryforward will consume these lots")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="taxprep", description="Transcribe tax documents into structured digital form (local-only).")
-    p.add_argument("--data-dir", default=None, help="data directory (default: ./data)")
+    p.add_argument("--data-dir", default=None,
+                   help="data directory (default: TAXPREP_DATA_DIR or config "
+                        "data_dir; required -- set once via "
+                        "`taxprep config set data_dir <path>`")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pi = sub.add_parser("ingest", help="ingest PDFs / OCR text files from a directory")
@@ -398,6 +652,7 @@ def build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("review", help="serve the visual validation UI (localhost only)")
     pr.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help=f"port to listen on (default {DEFAULT_PORT})")
+    add_token_argument(pr)  # R10: optional per-run auth token
     pr.set_defaults(func=cmd_review)
 
     pc = sub.add_parser("carryforward",
@@ -415,7 +670,8 @@ def build_parser() -> argparse.ArgumentParser:
     pm = sub.add_parser("mcp", help="run the local MCP server over stdio (no network)")
     # SUPPRESS so `taxprep --data-dir D mcp` (parent flag) isn't clobbered.
     pm.add_argument("--data-dir", default=argparse.SUPPRESS,
-                    help="data directory (default: ./data or TAXPREP_DATA_DIR)")
+                    help="data directory (TAXPREP_DATA_DIR or config data_dir "
+                         "otherwise; required)")
     pm.set_defaults(func=cmd_mcp)
 
     pv = sub.add_parser("verify", help="run mechanical verification checks (PII-free output)")
@@ -446,6 +702,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="seconds to listen (default 300)")
     blis.add_argument("--once", action="store_true",
                       help="single pass, then exit")
+    blis.add_argument("--wait-first", action="store_true",
+                      help="block until the first delivery, then exit "
+                           "(wakes a background process; --timeout still bounds it)")
     blis.add_argument("--include-own", action="store_true",
                       help="do NOT filter out this session's own broadcasts")
     blis.set_defaults(func=cmd_bus_listen)
@@ -478,6 +737,73 @@ def build_parser() -> argparse.ArgumentParser:
     pgp = sub.add_parser("gaps", help="transcript-vs-ingested gap analysis (PII-free shape + local report)")
     pgp.add_argument("--year", type=int, default=None)
     pgp.set_defaults(func=cmd_gaps)
+
+    # -- G: canonical pipeline stages + relevance override + queue --------
+
+    ppl = sub.add_parser("pipeline", help="canonical pipeline stages (registry + run)")
+    psub = ppl.add_subparsers(dest="pipeline_cmd", required=True)
+
+    pst = psub.add_parser("stages", help="list the canonical stage sequence")
+    pst.set_defaults(func=cmd_pipeline_stages)
+
+    prun = psub.add_parser("run", help="run the mechanical stages in the corrected order")
+    prun.add_argument("input_dir", nargs="?", default=None,
+                      help="directory to ingest (default: configured source_dir; "
+                           "needed only when the slice includes INGESTION)")
+    prun.add_argument("--from", dest="from_stage", default=None, metavar="STAGE",
+                      help="first stage to run (default: INGESTION)")
+    prun.add_argument("--to", dest="to_stage", default=None, metavar="STAGE",
+                      help="last stage to run, inclusive (default: CARRYFORWARD)")
+    prun.add_argument("--year", type=int, default=None,
+                      help="restrict per-year reporting/checks to one year")
+    prun.set_defaults(func=cmd_pipeline_run)
+
+    pro = sub.add_parser("relevance-override",
+                         help="record an explicit Operator override of a "
+                              "document's relevance verdict")
+    pro.add_argument("doc_id", help="doc_id (prefix ok if unambiguous)")
+    pro.add_argument("verdict", choices=["relevant", "irrelevant",
+                                        "needs_human"])
+    pro.add_argument("--reason", required=True,
+                     help="why this verdict (required; recorded in the "
+                          "audit trail)")
+    pro.set_defaults(func=cmd_relevance_override)
+
+    pvq = sub.add_parser("validation-queue",
+                         help="list the human validation queue (irrelevants "
+                              "excluded by default)")
+    pvq.add_argument("--year", type=int, default=None)
+    pvq.add_argument("--form", default=None, choices=FORM_TYPES)
+    pvq.add_argument("--include-irrelevant", action="store_true",
+                     help="also list documents with relevance verdict "
+                          "irrelevant")
+    pvq.set_defaults(func=cmd_validation_queue)
+
+    # -- R4/R6/R7: sync, exclusions, broker CSV (additive; wave-2 workstream F)
+
+    psy = sub.add_parser("sync", help="re-ingest a source dir (idempotent); "
+                                      "mark documents whose source is missing ORPHANED")
+    psy.add_argument("input_dir", nargs="?", default=None,
+                     help="directory to walk (default: configured source_dir)")
+    psy.set_defaults(func=cmd_sync)
+
+    pex = sub.add_parser("exclude", help="record an Operator exclusion for a "
+                                         "document (carryforward guard)")
+    pex.add_argument("doc_id", help="doc_id (prefix ok if unambiguous)")
+    pex.add_argument("--reason", required=True,
+                     help="why this document is excluded (required)")
+    pex.set_defaults(func=cmd_exclude)
+
+    pexl = sub.add_parser("exclusions", help="list recorded exclusions")
+    pexl.set_defaults(func=cmd_exclusions)
+
+    pcs = sub.add_parser("ingest-csv", help="ingest a broker CSV into 1099-B "
+                                            "lot records")
+    pcs.add_argument("--broker", required=True,
+                     help="broker name (see brokercsv.BROKER_MAPS)")
+    pcs.add_argument("--file", required=True, help="CSV file to ingest")
+    pcs.add_argument("--year", type=int, required=True, help="tax year")
+    pcs.set_defaults(func=cmd_ingest_csv)
     return p
 
 

@@ -278,6 +278,57 @@ def test_carryforward_ready_ok(tmp_path):
     _pii_free(r)
 
 
+# -- R3 guard blockers surface through carryforward_ready ---------------
+
+def test_carryforward_ready_reports_guard_blockers(tmp_path):
+    store = _store_with(tmp_path, [
+        _b1099("b1", 2024, "1000.00", "1500.00", "short", status="validated"),
+        _doc("u1", 2024, "UNKNOWN", {}, "validated"),
+    ])
+    r = V.verify_carryforward_ready(store, 2024)
+    assert r["passed"] is False
+    assert "u1(unknown_form)" in r["reason"]
+    _pii_free(r)
+
+
+def test_carryforward_ready_reports_missing_year_and_zero_lots(tmp_path):
+    store = _store_with(tmp_path, [
+        _doc("ny1", None, "W-2", {}, "validated"),
+        _doc("z1", 2024, "1099-B", {}, "validated"),
+    ])
+    r = V.verify_carryforward_ready(store, 2024)
+    assert r["passed"] is False
+    assert "ny1(missing_year)" in r["reason"]
+    assert "z1(zero_lots)" in r["reason"]
+    _pii_free(r)
+
+
+def test_carryforward_ready_exclusion_clears_blocker(tmp_path):
+    from taxprep import exclusions as X
+    store = _store_with(tmp_path, [
+        _doc("u1", 2024, "UNKNOWN", {}, "validated"),
+    ])
+    r = V.verify_carryforward_ready(store, 2024)
+    assert r["passed"] is False
+    X.record_exclusion(store.data_dir, "u1", "operator: superseded by re-scan")
+    r2 = V.verify_carryforward_ready(store, 2024)
+    assert r2 == {"passed": True, "reason": "ready"}
+    _pii_free(r2)
+
+
+def test_verify_all_carryforward_ready_carries_blockers(tmp_path):
+    store = _store_with(tmp_path, [
+        _b1099("b1", 2024, "1000.00", "1500.00", "short", status="validated"),
+        _doc("u1", 2023, "UNKNOWN", {}, "validated"),  # other year: still blocks
+    ])
+    r = V.verify_all(store)
+    assert r["passed"] is False
+    cr = r["checks"]["carryforward_ready:2024"]
+    assert cr["passed"] is False
+    assert "u1(unknown_form)" in cr["reason"]
+    _pii_free(r)
+
+
 # -- verify_all --------------------------------------------------------
 
 def test_verify_all_year_scoping(tmp_path):

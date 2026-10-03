@@ -1,7 +1,8 @@
 """Data model for Phase 1 document records.
 
-A Document is one ingested source file (a PDF, or a .txt OCR sidecar)
-with its classification, extracted fields, and review status.
+A Document is one ingested source (a PDF, a .txt sidecar, an image
+converted to PDF, or one CSV row) with its classification, extracted
+fields, review status, and text provenance.
 """
 
 from __future__ import annotations
@@ -22,10 +23,21 @@ FORM_TYPES = [
     "SCHEDULE_D",
     "WAGE_INCOME_TRANSCRIPT",
     "RETURN_TRANSCRIPT",
+    "ACCOUNT_TRANSCRIPT",
+    "RECORD_OF_ACCOUNT",
     "UNKNOWN",
 ]
 
-STATUSES = ("transcribed", "needs_review", "validated")
+STATUSES = (
+    "transcribed",
+    "needs_review",
+    "validated",
+    # R1: multi-form / blocked / orphaned documents (other workstreams
+    # check these: R2 refuses validation, R3 refuses carryforward).
+    "MULTI_FORM",
+    "BLOCKED",
+    "ORPHANED",
+)
 
 RELEVANCE_VERDICTS = ("unassessed", "relevant", "irrelevant", "needs_human")
 
@@ -41,6 +53,31 @@ class Document:
     status: str = "needs_review"
     validated_at: str | None = None
     relevance: str = "unassessed"
+    # R1: for documents split out of a multi-form file — the 1-based page
+    # range the section came from (e.g. "3-5", or "3" for a single page)
+    # and the id the unsplit source file would have had.
+    page_range: str | None = None
+    parent_doc_id: str | None = None
+    # R4: stable identity — full sha256 of the SOURCE BYTES (the doc_id is
+    # its 16-hex prefix; no filename component anywhere).
+    source_sha256: str | None = None
+    # R4: machine reason accompanying the current status, e.g.
+    # ORPHANED -> "source_missing", BLOCKED -> "encrypted"/"needs-ocr".
+    status_reason: str | None = None
+    # R4: re-ingest disagreed with Operator-validated values -- the
+    # validated values were kept and the doc needs Operator re-review.
+    re_review: bool = False
+    # R5: text provenance -- operational metadata, not taxpayer data, so
+    # these cross the MCP boundary as non-PII keys.
+    # text_source: "native" | "sidecar" | "form-field" | "ocr" |
+    #              "image-pdf" | "broker-csv" | "error" | "blocked"
+    text_source: str | None = None
+    reason_code: str | None = None
+    ocr_engine: str | None = None
+    engine_version: str | None = None
+    ocr_mode: str | None = None          # skip-text | redo-ocr | force-ocr
+    attempts: list = field(default_factory=list)
+    mean_confidence: float | None = None
 
     def __post_init__(self) -> None:
         if self.form_type not in FORM_TYPES:
@@ -65,4 +102,16 @@ class Document:
             status=d.get("status", "needs_review"),
             validated_at=d.get("validated_at"),
             relevance=d.get("relevance", "unassessed"),
+            page_range=d.get("page_range"),
+            parent_doc_id=d.get("parent_doc_id"),
+            source_sha256=d.get("source_sha256"),
+            status_reason=d.get("status_reason"),
+            re_review=d.get("re_review", False),
+            text_source=d.get("text_source"),
+            reason_code=d.get("reason_code"),
+            ocr_engine=d.get("ocr_engine"),
+            engine_version=d.get("engine_version"),
+            ocr_mode=d.get("ocr_mode"),
+            attempts=d.get("attempts") or [],
+            mean_confidence=d.get("mean_confidence"),
         )

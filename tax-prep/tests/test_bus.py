@@ -12,6 +12,7 @@ import pytest
 
 from taxprep import bus
 from taxprep.bus import (
+    code_landed_payload,
     default_tuning_path,
     list_messages,
     load_tuning,
@@ -86,6 +87,33 @@ def test_pii_guard(busdir, tuning_path):
             SESSION_A, bus_dir=busdir, tuning_path=tuning_path)
 
 
+def test_pii_guard_extended_patterns(busdir, tuning_path):
+    """N3: 9-digit runs, masked SSNs (any case), long digit runs, and
+    currency amounts are refused; legitimate shapes still pass."""
+    refused = [
+        ({"note": "ssn 123456789 unhyphenated"}, "9-digit"),
+        ({"note": "XXX-XX-1234"}, "masked-SSN"),
+        ({"note": "xxx-xx-9876"}, "masked-SSN"),
+        ({"note": "XxX-xX-1111"}, "masked-SSN"),
+        ({"acct": "1234567890123456"}, "long digit run"),
+        ({"lot": "9876543210"}, "long digit run"),
+        ({"amt": "$85,000.00"}, "currency amount"),
+        ({"x": "cost $5.00"}, "currency amount"),
+        ({"nested": {"deep": "balance $1,234.56"}}, "currency amount"),
+    ]
+    for payload, kind in refused:
+        with pytest.raises(ValueError, match="refused"):
+            publish("t", "x", payload, SESSION_A,
+                    bus_dir=busdir, tuning_path=tuning_path)
+    # legitimate shapes: years, counts, enums, doc_ids, SHAs, topics
+    publish("t", "x",
+            {"tax_year": 2024, "n_docs": 3, "status": "validated",
+             "form_type": "W-2", "doc_id": "w2-acme-2024-0f7facdd",
+             "commit": "80e342bf12ab", "topics": ["tax-prep.build"],
+             "years": [2023, 2024, 2025, 2026], "n_fields": 10},
+            SESSION_A, bus_dir=busdir, tuning_path=tuning_path)
+
+
 def test_payload_must_be_json_dict(busdir, tuning_path):
     with pytest.raises(TypeError):
         publish("t", "x", ["not", "a", "dict"], SESSION_A,
@@ -124,6 +152,27 @@ def test_topics(busdir, tuning_path):
     publish("tax-prep.ops", "x", {}, SESSION_A, bus_dir=busdir, tuning_path=tuning_path)
     (busdir / "NOT A TOPIC").mkdir()
     assert topics(bus_dir=busdir) == ["tax-prep.build", "tax-prep.ops"]
+
+
+# -- code_landed payload --------------------------------------------------
+
+
+def test_code_landed_payload_exact_keys_and_no_pii_shapes(busdir, tuning_path):
+    p = code_landed_payload("dsys-repo", "build/half1", "80e342bf12ab", 11)
+    assert p == {
+        "repo": "dsys-repo",
+        "branch": "build/half1",
+        "head": "80e342bf12ab",
+        "commits_pushed": 11,
+        "action": "pull build/half1 and re-run verify_all",
+    }
+    # the exact key set the broadcast script relies on
+    assert set(p) == {"repo", "branch", "head", "commits_pushed", "action"}
+    # shapes only: sails through the publish-side PII guard unchanged
+    publish("tax-prep.build", "code_landed", p, SESSION_A,
+            bus_dir=busdir, tuning_path=tuning_path)
+    msgs = list_messages("tax-prep.build", bus_dir=busdir)
+    assert msgs[-1]["payload"] == p
 
 
 # -- poll / cursor ------------------------------------------------------
@@ -291,19 +340,39 @@ def test_tuning_defaults_no_env(tmp_path, monkeypatch):
     assert t["session"]["id"] == ""
 
 
-def test_subscribe_unsubscribe(tuning_path):
+def test_subscribe_unsubscribe(tmp_path, monkeypatch, tuning_path):
+    # isolate from any real dsys-store checkout on this machine
+    monkeypatch.setenv("TAXPREP_BUS_DIR", str(tmp_path / "bus"))
     subscribe("tax-prep.build", tuning_path)
-    # subscribing while tuned to '*' is a no-op (already everything)
-    assert load_tuning(tuning_path)["tuning"]["topics"] == ["*"]
+    # N3: subscribing on top of '*' expands it to the explicit list
+    # (empty bus dir here, so just the new topic) -- no longer a
+    # silent no-op.
+    assert load_tuning(tuning_path)["tuning"]["topics"] == ["tax-prep.build"]
     unsubscribe("tax-prep.ops", tuning_path)
-    # '*' expanded to explicit list on first narrow
-    assert load_tuning(tuning_path)["tuning"]["topics"] == []
-    subscribe("tax-prep.build", tuning_path)
+    assert load_tuning(tuning_path)["tuning"]["topics"] == ["tax-prep.build"]
     subscribe("tax-prep.ops", tuning_path)
     assert load_tuning(tuning_path)["tuning"]["topics"] == [
         "tax-prep.build", "tax-prep.ops"]
     unsubscribe("tax-prep.build", tuning_path)
     assert load_tuning(tuning_path)["tuning"]["topics"] == ["tax-prep.ops"]
+
+
+def test_subscribe_on_star_expands_against_bus_dir(tmp_path, monkeypatch,
+                                                      tuning_path):
+    """N3: tune --topic X on the default '*' expands to the explicit
+    topic list present in the bus dir, then adds X."""
+    busd = tmp_path / "bus"
+    monkeypatch.setenv("TAXPREP_BUS_DIR", str(busd))
+    publish("tax-prep.build", "x", {}, SESSION_A, bus_dir=busd,
+            tuning_path=tuning_path)
+    assert load_tuning(tuning_path)["tuning"]["topics"] == ["*"]
+    subscribe("tax-prep.ops", tuning_path)
+    assert load_tuning(tuning_path)["tuning"]["topics"] == [
+        "tax-prep.build", "tax-prep.ops"]
+    # idempotent: re-tuning an already-listed topic changes nothing
+    subscribe("tax-prep.ops", tuning_path)
+    assert load_tuning(tuning_path)["tuning"]["topics"] == [
+        "tax-prep.build", "tax-prep.ops"]
 
 
 def test_subscribe_rejects_bad_topic(tuning_path):

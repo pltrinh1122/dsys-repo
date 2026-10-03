@@ -3,10 +3,11 @@ name = "taxprep"
 version = "0.1.0"
 description = "Phase 1: local-only CLI to transcribe tax documents (PDF + OCR) into structured digital form for amended-return preparation."
 requires-python = ">=3.11"
-dependencies = ["pypdf", "mcp<2"]
+dependencies = ["pypdf", "mcp<2", "pdf2image"]
 
 [project.optional-dependencies]
 dev = ["pytest", "reportlab"]
+ocr = ["ocrmypdf"]
 
 [project.scripts]
 taxprep = "taxprep.cli:main"

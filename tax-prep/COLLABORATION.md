@@ -24,6 +24,28 @@ Real taxpayer material never leaves the workstation. Concretely:
 - Discrepancy reports travel as *shapes*, not values: "W-2 box 1 regex
   missed a `$` prefix on one employer format" — never the actual numbers.
 
+Why blindness matters: the Workstation is a model-backed session whose
+inputs are retained by its provider, so anything it reads leaves the
+workstation.
+
+## Standing rules (E2–E7, ratified by the Operator 2026-10-03)
+
+- **E2 — data placement and disposal.** Data and sources live outside
+  any git checkout on a 700 filesystem. Disposal after filing is the
+  Operator's decision.
+- **E3 — shape allowlist / denylist.** The blind orchestrator may see:
+  form type, tax year, box/line, layout feature, failure class, doc
+  count, commit SHA. It must never see: SSN/ITIN, EIN, account/lot
+  numbers, names, addresses, DOB, dollar amounts, verbatim text.
+- **E4 — commit-SHA citations.** Every Workstation report cites the
+  commit SHA it ran.
+- **E5 — the Operator decides.** The Operator is the sole decider of
+  filed figures. Carryforward output is a worksheet, not advice.
+- **E6 — counts reconcile.** Files seen = ingested + skipped + errored;
+  before carryforward, no blockers and an empty review queue.
+- **E7 — terminology.** Use "Operator" throughout instead of a personal
+  name.
+
 ## The blind-orchestrator rule
 
 The workstation agent operates **blind**: it must never see PII in its
@@ -100,5 +122,23 @@ its own broadcast echo (tuned out by broadcaster id).
 
 ## Push
 
-Pushing to origin is Peter's separate explicit call (single-use device
-flow). The Workstation session pulls only after a push it was told about.
+Pushing to origin is the Operator's separate explicit call (single-use
+device flow). The Workstation session pulls only after a push it was
+told about.
+
+## Push → broadcast (standing rule)
+
+Every verified push to a remote is followed by a bus broadcast, so
+tuned listeners are informed without hand-carrying. This applies to
+pushes from **any** machine — including the Operator's own
+workstation. Convention: topic `tax-prep.build`, type `code_landed`,
+payload from `taxprep.bus.code_landed_payload` (`{repo, branch, head,
+commits_pushed, action}`); other topics/types as new concerns arise.
+
+`tax-prep/scripts/push-and-broadcast.sh` implements the whole flow:
+GitHub device flow (`repo` scope, single-use token), push the code
+branch (never force), verify the remote head via `ls-remote`, publish
+the broadcast, commit + push the dsys-store checkout (that push IS the
+broadcast delivery — it is not itself announced), verify the store
+head, then destroy the token. On any failure the token is destroyed
+and the script exits non-zero.

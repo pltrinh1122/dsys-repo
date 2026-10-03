@@ -3,13 +3,17 @@
 Local-only CLI to transcribe tax documents (PDFs + OCR text) into structured
 digital form, for amended-return preparation (Form 1040-X).
 
-**Privacy rule:** Phase 1 works exclusively with **synthetic fixture
-documents**. No real PII. No network calls. Everything runs locally.
+**Privacy rule:** real taxpayer material never leaves the operator's
+workstation. See [COLLABORATION.md](COLLABORATION.md) for the two-session
+protocol: the Architect side works with synthetic fixtures only, the
+workstation operates real documents locally under blind orchestration,
+and discrepancy reports travel as shapes, never values. No network
+calls. Everything runs locally.
 
 ## Setup
 
 ```bash
-cd ~/workspace/tax-prep
+cd ~/workspace/dsys/tax-prep
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
@@ -62,6 +66,58 @@ python3 -m venv .venv
 documents flagged `needs_review`. OCR text is stored under
 `data/ocr/<doc_id>.txt`; records live in `data/documents.jsonl`
 (gitignored — never commit taxpayer material).
+
+## End-to-end pipeline (canonical stages)
+
+The pipeline has one ordered stage registry (`taxprep/pipeline.py`;
+`taxprep pipeline stages` prints it). CLI, docs, and accounting all
+reference these names:
+
+| # | stage | kind | what happens |
+|---|-------|------|--------------|
+| 1 | INGESTION | mechanical | `ingest`: intake PDFs / OCR text, native/sidecar/OCR routing, per-file R6 accounting |
+| 2 | CLASSIFICATION | mechanical | form-type per page/section (runs inside ingestion) |
+| 3 | EXTRACTION | mechanical | box-level fields / transcript parsing (runs inside ingestion) |
+| 4 | RELEVANCE | mechanical | `assess_relevance`: relevant / irrelevant / needs_human labels |
+| 5 | REVIEW | **human** | operator reviews each doc against source evidence in `taxprep review` |
+| 6 | VALIDATION | mechanical | apply the operator's recorded corrections → validated |
+| 7 | VERIFICATION | mechanical | `verify_all` gates; fail fast with reason codes |
+| 8 | CARRYFORWARD | mechanical | Schedule D worksheet chain from validated 1099-Bs |
+
+`GAP_ANALYSIS` rides alongside as kind=analysis — it uses transcripts,
+is not a gate, and never blocks the pipeline.
+
+The corrected order puts RELEVANCE (4) *before* REVIEW (5): it needs only
+tax_year/form_type/OCR hash — all available post-extraction — so the
+mechanical triage lands before the human looks at the queue, and
+`irrelevant` documents are hidden from the review queue from the start
+(auditable via `--include-irrelevant`, restorable via
+`relevance-override`). A **validated** document is relevant by
+definition — human judgment dominates mechanical rules; the mechanical
+rules never demote it.
+
+```bash
+# List the canonical stages
+.venv/bin/taxprep pipeline stages
+
+# Run the mechanical stages in order (REVIEW prints an OPERATOR STEP
+# marker and is skipped -- it is never executed by the runner)
+.venv/bin/taxprep pipeline run --data-dir ./data [./fixtures] [--from STAGE] [--to STAGE] [--year Y]
+
+# Explicit operator override of a relevance verdict (recorded with
+# reason + timestamp in relevance_overrides.jsonl; honored on re-runs)
+.venv/bin/taxprep relevance-override <doc_id> relevant|irrelevant|needs_human --reason "..."
+
+# The human validation queue (irrelevants excluded by default)
+.venv/bin/taxprep validation-queue [--year Y] [--form F] [--include-irrelevant]
+```
+
+`pipeline run` prints a banner per stage (`── STAGE 4/8: RELEVANCE ──`)
+plus each stage's own accounting, and stops at the first failure with
+the stage's reason code. `--from`/`--to` slice the sequence
+(case-insensitive stage names). All pipeline output is PII-free
+(stage names, counts, doc_ids, reason codes only); the full
+PII-bearing carryforward report stays operator-local.
 
 ## Review workflow (Phase 2)
 
@@ -270,7 +326,7 @@ A missing store checkout fails fast with the clone command.
 ```bash
 .venv/bin/taxprep bus publish --topic tax-prep.ops --type run-done \
     --payload '{"n_docs": 3}' [--correlation-id C] [--store-dir D]
-.venv/bin/taxprep bus listen [--topic T]... [--timeout S] [--once] [--include-own]
+.venv/bin/taxprep bus listen [--topic T]... [--timeout S] [--once | --wait-first] [--include-own]
 .venv/bin/taxprep bus topics
 .venv/bin/taxprep bus tune --topic tax-prep.build [--off]
 .venv/bin/taxprep bus whoami   # shows resolved store dir
@@ -283,11 +339,15 @@ architect/human: run completions, discrepancy shapes), `tax-prep.review`
 (lowercase alphanumerics, dots, dashes).
 
 - **Shapes only.** `publish` hard-refuses payloads matching SSN
-  (`\d{3}-\d{2}-\d{4}`) or EIN (`\d{2}-\d{7}`) patterns, and the
-  blind-orchestrator rule applies end to end: payloads carry ids,
-  counts, enums, statuses — never values, names, or amounts. Enforced
-  at the publish call, so neither the repo nor any listening agent
-  ever sees PII.
+  (`\d{3}-\d{2}-\d{4}`), EIN (`\d{2}-\d{7}`), unhyphenated 9-digit-run,
+  masked-SSN (`XXX-XX-dddd`, any case), long-digit-run (10+ digits), or
+  currency-amount (`$N.NN`) patterns, and the blind-orchestrator rule
+  applies end to end: payloads carry ids, counts, enums, statuses —
+  never values, names, or amounts. Enforced at the publish call, so
+  neither the repo nor any listening agent ever sees PII.
+- **Wake-on-delivery.** `bus listen --wait-first` blocks until the first
+  delivery arrives, then exits — for waking a background process when a
+  message lands (`--timeout` still bounds the wait).
 - **Session identity + echo tune-out.** Every message carries a unique
   broadcaster id (`<role>-<6 hex>`, e.g. `workstation-a1b2c3`,
   generated on first publish). Listeners exclude their own broadcasts
@@ -319,7 +379,9 @@ Machine-local paths are set once, not passed per command:
 
 Resolution order per key: CLI flag > env var (`TAXPREP_SOURCE_DIR`,
 `TAXPREP_DATA_DIR`, `TAXPREP_SCOPE_YEARS`) > `~/.config/taxprep/config.toml`
-> built-in default. The config file lives outside the repo and is
+> built-in default. `data_dir` has no default — it is required; set it
+once via `taxprep config set data_dir <path>` (paths inside
+site-packages are refused). The config file lives outside the repo and is
 never committed. `taxprep ingest` with no directory argument uses the
 configured `source_dir`; `--data-dir` still overrides everywhere.
 
@@ -328,9 +390,12 @@ configured `source_dir`; `--data-dir` still overrides everywhere.
 `taxprep relevance` triages every document into
 **relevant | irrelevant | needs_human** with deterministic,
 metadata-only rules: tax year outside the configured scope →
-`irrelevant` (`year_out_of_scope`); byte-identical OCR (sha256) →
-`irrelevant` (`duplicate_of:<doc_id>`, first kept); unclassified form
-→ `needs_human` (never auto-dropped). Anything ambiguous lands in
+`irrelevant` (`year_out_of_scope`) — except carryover-seed sources
+(prior-year 1040 / 1040-X, Schedule D, return transcript) dated before
+the scope, which stay `relevant` (`carryover_seed`) so the
+capital-loss chain's prior-year seed is never silently dropped;
+byte-identical OCR (sha256) → `irrelevant` (`duplicate_of:<doc_id>`,
+first kept); unclassified form → `needs_human` (never auto-dropped). Anything ambiguous lands in
 `needs_human` — the human, not the agent, is the arbiter. Verdicts are
 labels persisted on the document (`Document.relevance`, default
 `unassessed`); nothing is ever deleted. `verify_no_silent_drops`
@@ -346,6 +411,27 @@ value is PII-free (form types, counts, report path); per-payer detail
 (names → missing forms) goes only to `data/reports/gaps_*.txt` for the
 operator's eyes. A year with no parsed transcript reports
 `expected_forms=[]` — no ground truth, never a false all-clear.
+
+**Authority rule (adopted):** a *validated* document is relevant by
+definition — `assess_relevance` returns `relevant` with reason code
+`validated_by_operator`, and the mechanical rules (year, duplicates)
+never demote it. Human judgment dominates mechanical rules.
+
+**Explicit override:** `taxprep relevance-override <doc_id>
+<relevant|irrelevant|needs_human> --reason "..."` records an explicit
+operator direction (`{doc_id, verdict, reason, ts}` in the append-only
+`relevance_overrides.jsonl` next to the store); the verdict applies
+immediately and is honored on future `assess_relevance` runs
+(`operator_override`). The mechanical pipeline never calls the override
+path itself. MCP: `relevance_override(doc_id, verdict, reason)`
+(operator-only surface).
+
+**Queue filtering:** the validation queue (CLI `validation-queue`, MCP
+`validation_queue`, and the `taxprep review` UI queue) *excludes*
+`irrelevant` verdicts by default — never in the way, never invisible:
+the excluded count is always noted, irrelevants are listed/auditable
+with their reason codes (`--include-irrelevant`, `?include_irrelevant=1`,
+or the MCP flag), and restorable via `relevance-override`.
 
 MCP tools: `assess_relevance(tax_year?)` → `{n_docs, counts,
 relevant_ids, irrelevant, needs_human}`; `analyze_gaps(tax_year?)` →

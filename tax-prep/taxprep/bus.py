@@ -20,7 +20,8 @@ Well-known topics (free-form otherwise):
 
 PII RULE (hard): payloads are shapes only -- ids, counts, enums,
 status strings. Never values, names, EINs, SSNs, dollar amounts.
-``publish`` refuses payloads matching SSN/EIN patterns. The
+``publish`` refuses payloads matching SSN/EIN, unhyphenated 9-digit
+run, masked-SSN, long-digit-run, and currency-amount patterns. The
 blind-orchestrator contract holds end to end: no listening session
 ever sees PII in its context.
 
@@ -79,6 +80,17 @@ def _check_topic(topic: str) -> str:
 
 _SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 _EIN_RE = re.compile(r"\b\d{2}-\d{7}\b")
+# N3: the guard used to catch only hyphenated SSN/EIN. Extend it:
+#  - \b\d{9}\b            unhyphenated 9-digit runs (SSN without dashes)
+#  - XXX-XX-\d{4}         masked SSNs, any case (XXX, xxx, Xxx, ...)
+#  - \b\d{10,}\b          long digit runs (account / lot numbers)
+#  - \$[\d,]*\.\d{2}      currency amounts ($85,000.00)
+# Legitimate shapes still pass: 4-digit years, small counts, enum
+# strings, doc_ids, commit SHAs -- none match the patterns above.
+_PLAIN_9_RE = re.compile(r"\b\d{9}\b")
+_MASKED_SSN_RE = re.compile(r"\b[xX]{3}-[xX]{2}-\d{4}\b")
+_LONG_DIGITS_RE = re.compile(r"\b\d{10,}\b")
+_CURRENCY_RE = re.compile(r"\$[\d,]*\.\d{2}")
 
 
 def _check_no_pii(serialized: str) -> None:
@@ -90,6 +102,26 @@ def _check_no_pii(serialized: str) -> None:
     if _EIN_RE.search(serialized):
         raise ValueError(
             "payload refused: matches EIN pattern (\\d{2}-\\d{7}); "
+            "the bus carries shapes only, never PII"
+        )
+    if _MASKED_SSN_RE.search(serialized):
+        raise ValueError(
+            "payload refused: matches masked-SSN pattern (XXX-XX-\\d{4}); "
+            "the bus carries shapes only, never PII"
+        )
+    if _PLAIN_9_RE.search(serialized):
+        raise ValueError(
+            "payload refused: matches 9-digit run (unhyphenated SSN?); "
+            "the bus carries shapes only, never PII"
+        )
+    if _LONG_DIGITS_RE.search(serialized):
+        raise ValueError(
+            "payload refused: matches long digit run (account/lot number?); "
+            "the bus carries shapes only, never PII"
+        )
+    if _CURRENCY_RE.search(serialized):
+        raise ValueError(
+            "payload refused: matches currency amount ($N.NN); "
             "the bus carries shapes only, never PII"
         )
 
@@ -291,6 +323,24 @@ def publish(
         raise ValueError(f"refusing to write outside bus dir: {path}")
     path.write_text(json.dumps(message, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+def code_landed_payload(repo: str, branch: str, head: str,
+                        n_commits: int) -> dict:
+    """Payload for a tax-prep.build / code_landed broadcast.
+
+    Exact key set: {"repo", "branch", "head", "commits_pushed", "action"}.
+    Every value is a shape (repo/branch names, commit SHA, count, action
+    string) -- nothing PII-shaped, so it always survives the
+    publish-side PII guard. Used by scripts/push-and-broadcast.sh.
+    """
+    return {
+        "repo": repo,
+        "branch": branch,
+        "head": head,
+        "commits_pushed": n_commits,
+        "action": f"pull {branch} and re-run verify_all",
+    }
 
 
 def _read_message(path: Path) -> dict | None:
@@ -517,13 +567,22 @@ def save_tuning(tuning: dict, path: str | Path | None = None) -> Path:
 
 
 def subscribe(topic: str, path: str | Path | None = None) -> dict:
-    """Tune into a topic. No-op while tuned to '*' (already everything)."""
+    """Tune into a topic.
+
+    N3: tuning into a topic while subscribed to "*" is no longer a
+    silent no-op -- "*" is first expanded to the explicit topic list
+    present in the bus dir (mirroring unsubscribe), then the topic is
+    added, so the tune is visible and a later --off narrows it.
+    """
     _check_topic(topic)
     tuning = load_tuning(path)
     topics_list = tuning["tuning"]["topics"]
-    if topics_list != ["*"] and topic not in topics_list:
-        tuning["tuning"]["topics"] = sorted([*topics_list, topic])
-        save_tuning(tuning, path)
+    if topics_list == ["*"]:
+        topics_list = subscribed_topics(tuning)  # explicit list from bus dir
+    if topic not in topics_list:
+        topics_list = sorted([*topics_list, topic])
+    tuning["tuning"]["topics"] = topics_list
+    save_tuning(tuning, path)
     return tuning
 
 

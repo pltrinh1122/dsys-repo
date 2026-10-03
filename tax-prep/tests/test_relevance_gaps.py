@@ -103,6 +103,62 @@ def test_summarize_shape(store):
     json.dumps(s)
 
 
+# -- N2 carryover seeds ---------------------------------------------------
+
+
+def test_carryover_seed_stays_relevant_below_scope(store):
+    _with_ocr(store, _doc("sched-d-22", 2022, "SCHEDULE_D"), "sched d 2022")
+    _with_ocr(store, _doc("r1040-22", 2022, "1040"), "1040 2022")
+    _with_ocr(store, _doc("x22", 2022, "1040-X"), "1040x 2022")
+    _with_ocr(store, _doc("rt22", 2022, "RETURN_TRANSCRIPT"),
+              "return transcript 2022")
+    _with_ocr(store, _doc("w2-22", 2022, "W-2"), "w2 2022")
+    _with_ocr(store, _doc("wit22", 2022, "WAGE_INCOME_TRANSCRIPT"),
+              "wage transcript 2022")
+    v = R.assess_relevance(store, SCOPE, persist=False)
+    for did in ("sched-d-22", "r1040-22", "x22", "rt22"):
+        assert v[did] == {"verdict": "relevant",
+                          "reasons": ["carryover_seed"]}, did
+    # non-seed forms below the scope are still out of scope
+    assert v["w2-22"]["verdict"] == "irrelevant"
+    assert v["w2-22"]["reasons"] == ["year_out_of_scope"]
+    assert v["wit22"]["reasons"] == ["year_out_of_scope"]
+
+
+def test_seed_form_above_scope_still_out_of_scope(store):
+    _with_ocr(store, _doc("sched-d-27", 2027, "SCHEDULE_D"), "sched d 2027")
+    v = R.assess_relevance(store, SCOPE, persist=False)
+    assert v["sched-d-27"]["verdict"] == "irrelevant"
+    assert v["sched-d-27"]["reasons"] == ["year_out_of_scope"]
+
+
+def test_duplicate_beats_carryover_seed(store):
+    # byte-identical seed docs: the kept copy seeds the chain, the
+    # duplicate is still provably redundant.
+    _with_ocr(store, _doc("b-sched", 2022, "SCHEDULE_D"), "same seed text")
+    _with_ocr(store, _doc("a-sched", 2022, "SCHEDULE_D"), "same seed text")
+    v = R.assess_relevance(store, SCOPE, persist=False)
+    assert v["a-sched"] == {"verdict": "relevant",
+                            "reasons": ["carryover_seed"]}
+    assert v["b-sched"]["verdict"] == "irrelevant"
+    assert v["b-sched"]["reasons"] == ["duplicate_of:a-sched"]
+
+
+def test_carryover_seed_uses_scope_floor(store):
+    # with a narrower scope the floor moves: 2023 becomes a seed year.
+    _with_ocr(store, _doc("sched-d-23", 2023, "SCHEDULE_D"), "sched d 2023")
+    v = R.assess_relevance(store, [2024, 2025, 2026], persist=False)
+    assert v["sched-d-23"] == {"verdict": "relevant",
+                               "reasons": ["carryover_seed"]}
+
+
+def test_carryover_seed_persists_as_label(store):
+    _with_ocr(store, _doc("sched-d-22", 2022, "SCHEDULE_D"), "sched d 2022")
+    R.assess_relevance(store, SCOPE, persist=True)
+    assert (DocumentStore(store.data_dir).get("sched-d-22").relevance
+            == "relevant")
+
+
 # -- verify_no_silent_drops ----------------------------------------------
 
 

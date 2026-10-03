@@ -1,10 +1,18 @@
 """Carryforward engine tests -- all amounts synthetic."""
 
+import re
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
-from taxprep.carryforward import compute_chain, compute_year, from_store
+from taxprep import exclusions
+from taxprep.carryforward import (
+    carryforward_blockers,
+    compute_chain,
+    compute_year,
+    from_store,
+)
 from taxprep.models import Document
 from taxprep.store import DocumentStore
 
@@ -197,3 +205,210 @@ def test_taxable_income_none_warns():
     assert any("taxable income not supplied" in w for w in r["warnings"])
     # assumption path: L4 = L2
     assert r["worksheet_lines"]["L4_used_deduction"] == D("3000")
+
+
+# (h) R3 guard -- carryforward_blockers + from_store refusal.
+#     Stub docs stand in for form/status values the current models.py
+#     enums cannot construct yet (MULTI_FORM, BLOCKED, ORPHANED):
+#     R1/R4/R5 will add them, and the guard must refuse on them the
+#     moment any producer can emit them.
+
+
+class _StubDoc:
+    def __init__(self, doc_id, tax_year, form_type,
+                 status="validated", fields=None):
+        self.doc_id = doc_id
+        self.tax_year = tax_year
+        self.form_type = form_type
+        self.status = status
+        self.fields = fields or {}
+
+
+class _StubStore:
+    def __init__(self, docs, data_dir):
+        self._docs = list(docs)
+        self.data_dir = Path(data_dir)
+
+    def list(self, year=None, form=None):
+        docs = list(self._docs)
+        if year is not None:
+            docs = [d for d in docs if d.tax_year == year]
+        if form is not None:
+            docs = [d for d in docs if d.form_type == form]
+        return docs
+
+
+def _stub_store(tmp_path, docs):
+    dd = tmp_path / "data"
+    dd.mkdir(parents=True, exist_ok=True)
+    return _StubStore(docs, dd)
+
+
+def _real_store(tmp_path, docs):
+    store = DocumentStore(tmp_path / "data")
+    for d in docs:
+        store.upsert(d)
+    return store
+
+
+def _real_doc(doc_id, year, form, fields=None, status="validated"):
+    return Document(
+        doc_id=doc_id,
+        tax_year=year,
+        form_type=form,
+        source_path=f"{doc_id}.pdf",
+        ocr_text_ref=f"ocr/{doc_id}.txt",
+        fields=fields or {},
+        status=status,
+    )
+
+
+def _refusal_message_pii_free(msg):
+    assert not re.search(r"\$\d", msg), f"money leaked: {msg[:80]!r}"
+    assert '"value"' not in msg and '"raw_text"' not in msg
+
+
+def test_guard_refuses_unknown_form(tmp_path):
+    store = _real_store(tmp_path, [_real_doc("u1", 2024, "UNKNOWN")])
+    assert carryforward_blockers(store) == [
+        {"doc_id": "u1", "reason_code": "unknown_form"}]
+    with pytest.raises(ValueError, match=r"u1\(unknown_form\)") as ei:
+        from_store(store, 2024)
+    assert "1 blocker(s)" in str(ei.value)
+    _refusal_message_pii_free(str(ei.value))
+
+
+def test_guard_refuses_multi_form(tmp_path):
+    store = _stub_store(tmp_path, [_StubDoc("m1", 2024, "MULTI_FORM")])
+    assert carryforward_blockers(store) == [
+        {"doc_id": "m1", "reason_code": "multi_form"}]
+    with pytest.raises(ValueError, match=r"m1\(multi_form\)") as ei:
+        from_store(store, 2024)
+    _refusal_message_pii_free(str(ei.value))
+
+
+def test_guard_refuses_blocked(tmp_path):
+    store = _stub_store(tmp_path,
+                        [_StubDoc("b0", 2024, "W-2", status="BLOCKED")])
+    assert carryforward_blockers(store) == [
+        {"doc_id": "b0", "reason_code": "blocked"}]
+    with pytest.raises(ValueError, match=r"b0\(blocked\)"):
+        from_store(store, 2024)
+
+
+def test_guard_refuses_orphaned(tmp_path):
+    store = _stub_store(tmp_path,
+                        [_StubDoc("o1", 2024, "W-2", status="ORPHANED")])
+    assert carryforward_blockers(store) == [
+        {"doc_id": "o1", "reason_code": "orphaned"}]
+    with pytest.raises(ValueError, match=r"o1\(orphaned\)"):
+        from_store(store, 2024)
+
+
+def test_guard_refuses_missing_year(tmp_path):
+    store = _real_store(tmp_path, [_real_doc("ny1", None, "W-2")])
+    assert carryforward_blockers(store) == [
+        {"doc_id": "ny1", "reason_code": "missing_year"}]
+    with pytest.raises(ValueError, match=r"ny1\(missing_year\)"):
+        from_store(store, 2024)
+
+
+def test_guard_refuses_zero_lots_1099b(tmp_path):
+    # validated 1099-B with no lot fields at all: the silent-$0 case
+    store = _real_store(tmp_path, [_real_doc("z1", 2024, "1099-B")])
+    assert carryforward_blockers(store) == [
+        {"doc_id": "z1", "reason_code": "zero_lots"}]
+    with pytest.raises(ValueError, match=r"z1\(zero_lots\)") as ei:
+        from_store(store, 2024)
+    _refusal_message_pii_free(str(ei.value))
+
+
+def test_guard_zero_lots_is_chained_year_scoped(tmp_path):
+    good24 = b1099("g24", 2024, "1000.00", "1500.00", "short")
+    zero23 = _real_doc("z23", 2023, "1099-B")  # no lot fields
+    store = _real_store(tmp_path, [good24, zero23])
+    # the zero-lots doc is in 2023, outside this computation's chain
+    r = from_store(store, 2024)
+    assert r["st_current"] == D("-500")
+    # but the chain-wide scan sees it
+    assert {"doc_id": "z23", "reason_code": "zero_lots"} in \
+        carryforward_blockers(store)
+    assert {"doc_id": "z23", "reason_code": "zero_lots"} in \
+        carryforward_blockers(store, chained_years=[2023, 2024])
+
+
+def test_guard_malformed_lot_keeps_exclude_with_warning(tmp_path):
+    # lot present but term unknown: NOT zero-lots -- the existing
+    # exclude-with-warning path still handles it
+    store = _real_store(tmp_path, [b1099("b3", 2024, "500.00", "400.00",
+                                        None)])
+    assert carryforward_blockers(store) == []
+    r = from_store(store, 2024)
+    assert r["lots_included"] == 0 and r["lots_excluded"] == 1
+    assert any("unknown" in w for w in r["warnings"])
+
+
+def test_guard_scans_whole_store_not_just_year(tmp_path):
+    store = _real_store(tmp_path, [
+        b1099("g24", 2024, "1000.00", "1500.00", "short"),
+        _real_doc("u23", 2023, "UNKNOWN"),
+    ])
+    with pytest.raises(ValueError, match=r"u23\(unknown_form\)"):
+        from_store(store, 2024)
+
+
+def test_guard_blockers_sorted_and_multi_per_doc(tmp_path):
+    store = _real_store(tmp_path, [
+        _real_doc("m2", None, "W-2"),        # missing_year only
+        _real_doc("a1", None, "UNKNOWN"),   # unknown_form + missing_year
+    ])
+    assert carryforward_blockers(store) == [
+        {"doc_id": "a1", "reason_code": "missing_year"},
+        {"doc_id": "a1", "reason_code": "unknown_form"},
+        {"doc_id": "m2", "reason_code": "missing_year"},
+    ]
+
+
+def test_guard_clean_store_has_no_blockers(tmp_path):
+    store = _real_store(tmp_path, [b1099("g24", 2024, "1000.00",
+                                        "1500.00", "short")])
+    assert carryforward_blockers(store) == []
+    r = from_store(store, 2024)
+    assert r["st_current"] == D("-500")
+
+
+def test_guard_exclusion_suppresses_blocker(tmp_path):
+    store = _real_store(tmp_path, [_real_doc("u1", 2024, "UNKNOWN")])
+    with pytest.raises(ValueError, match="unknown_form"):
+        from_store(store, 2024)
+    exclusions.record_exclusion(store.data_dir, "u1",
+                                "operator: superseded by re-scan")
+    assert exclusions.is_excluded(store.data_dir, "u1") is True
+    assert carryforward_blockers(store) == []
+    r = from_store(store, 2024)  # no 1099-Bs at all -> zeros
+    assert r["st_current"] == D("0") and r["lt_current"] == D("0")
+
+
+def test_guard_exclusion_suppresses_zero_lots(tmp_path):
+    store = _real_store(tmp_path, [
+        _real_doc("z1", 2024, "1099-B"),
+        b1099("g24", 2024, "1000.00", "1500.00", "short"),
+    ])
+    with pytest.raises(ValueError, match="zero_lots"):
+        from_store(store, 2024)
+    exclusions.record_exclusion(store.data_dir, "z1",
+                                "operator: informational copy, no lots")
+    r = from_store(store, 2024)
+    assert r["st_current"] == D("-500")  # z1 contributes nothing
+
+
+def test_guard_exclusion_does_not_suppress_unvalidated(tmp_path):
+    # validation is never excludable: the guard clears, the gate still fires
+    store = _real_store(tmp_path, [
+        b1099("b1", 2024, "1000.00", "1500.00", "short",
+              status="transcribed"),
+    ])
+    exclusions.record_exclusion(store.data_dir, "b1",
+                                "operator: should not matter")
+    with pytest.raises(ValueError, match="not yet validated"):
+        from_store(store, 2024)

@@ -318,8 +318,10 @@ def verify_transcript_reconciliation(store, year: int) -> dict:
 def verify_carryforward_ready(store, year: int) -> dict:
     """Wrap carryforward.from_store's loud refusal as a check.
 
-    Returns {passed, reason}: reason is "ready" or the refusal message
-    (doc_ids and counts only -- from_store never puts PII in it).
+    Returns {passed, reason}: reason is "ready" or the refusal message.
+    The R3 guard's blockers surface as doc_id(reason_code) pairs in the
+    message -- doc_ids and reason codes only, never values or names
+    (blind-orchestrator safe).
     """
     from .carryforward import from_store
 

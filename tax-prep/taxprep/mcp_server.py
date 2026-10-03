@@ -17,7 +17,10 @@ Enforcement points (defense in depth):
      has_value}; payer names embedded in transcript field codes
      ("payer1.ACME CORP.1") are redacted to "payer1.[payer].1"; the
      source_path / ocr_text_ref are dropped (local paths can leak
-     usernames and are not needed for box inventory).
+     usernames and are not needed for box inventory). R5 provenance
+     (text_source, reason_code, ocr_engine, engine_version, ocr_mode,
+     attempts, mean_confidence) is operational metadata, not taxpayer
+     data, and is exposed as non-PII keys.
   2. compute_carryforward writes the full PII-bearing report to a
      local file under data/reports/ (gitignored, operator's eyes
      only); the tool returns only {report_path, years_covered,
@@ -64,12 +67,21 @@ def _scrub_code(code: str) -> str:
     return code
 
 
+# R5 provenance keys: operational metadata, not taxpayer data -- safe
+# to expose to the blind orchestrator (no values, names, or paths).
+PROVENANCE_KEYS = ("text_source", "reason_code", "ocr_engine",
+                   "engine_version", "ocr_mode", "attempts",
+                   "mean_confidence")
+
+
 def _scrub_doc(doc_dict: dict) -> dict:
     """Strip PII from a document record for the blind orchestrator.
 
     Every field becomes {box_code, confidence, has_value}; value and
     raw_text are dropped, payer names in transcript field codes are
-    redacted, and source_path / ocr_text_ref are dropped.
+    redacted, and source_path / ocr_text_ref are dropped. The R5
+    provenance keys (PROVENANCE_KEYS) are operational metadata, not
+    taxpayer data, and are passed through.
     """
     fields = {}
     for code, f in (doc_dict.get("fields") or {}).items():
@@ -80,7 +92,7 @@ def _scrub_doc(doc_dict: dict) -> dict:
             "confidence": f.get("confidence"),
             "has_value": v is not None and v != "",
         }
-    return {
+    out = {
         "doc_id": doc_dict.get("doc_id"),
         "tax_year": doc_dict.get("tax_year"),
         "form_type": doc_dict.get("form_type"),
@@ -88,11 +100,15 @@ def _scrub_doc(doc_dict: dict) -> dict:
         "validated_at": doc_dict.get("validated_at"),
         "fields": fields,
     }
+    for key in PROVENANCE_KEYS:
+        out[key] = doc_dict.get(key)
+    return out
 
 
 def _store(data_dir: str | None) -> DocumentStore:
     """Resolve the data dir: explicit arg -> TAXPREP_DATA_DIR env ->
-    config file -> package default."""
+    config file. N1: there is no package default -- an unset data_dir
+    raises (fail closed), and site-packages locations are refused."""
     from . import config as _cfg
     return DocumentStore(_cfg.resolve("data_dir", cli_value=data_dir))
 
@@ -167,18 +183,34 @@ def show_document(doc_id: str, data_dir: str | None = None) -> dict:
         "status": doc.status,
         "validated_at": doc.validated_at,
         "fields": doc.fields,
+        # R5 provenance: operational metadata, not taxpayer data.
+        "text_source": doc.text_source,
+        "reason_code": doc.reason_code,
+        "ocr_engine": doc.ocr_engine,
+        "engine_version": doc.engine_version,
+        "ocr_mode": doc.ocr_mode,
+        "attempts": doc.attempts,
+        "mean_confidence": doc.mean_confidence,
     }))
 
 
 @mcp.tool()
 def validation_queue(tax_year: int | None = None, form_type: str | None = None,
-                     data_dir: str | None = None) -> dict:
+                     data_dir: str | None = None,
+                     include_irrelevant: bool = False) -> dict:
     """The human validation queue: documents with status transcribed or
-    needs_review, optionally filtered. Includes per-year validated/total
+    needs_review, optionally filtered. Documents with relevance verdict
+    ``irrelevant`` are EXCLUDED by default (never in the way, never
+    invisible -- they remain listed/auditable with their reason codes via
+    ``include_irrelevant=True`` and restorable through the
+    ``relevance_override`` tool). Includes per-year validated/total
     progress. Nothing downstream may consume unvalidated documents."""
     store = _store(data_dir)
     queue = [d for d in store.list(year=tax_year, form=form_type)
              if d.status in ("transcribed", "needs_review")]
+    excluded = sum(1 for d in queue if d.relevance == "irrelevant")
+    if not include_irrelevant:
+        queue = [d for d in queue if d.relevance != "irrelevant"]
     years = sorted({d.tax_year for d in store.list() if d.tax_year is not None})
     progress = {}
     for y in years:
@@ -192,6 +224,7 @@ def validation_queue(tax_year: int | None = None, form_type: str | None = None,
                 "tax_year": d.tax_year,
                 "form_type": d.form_type,
                 "status": d.status,
+                "relevance": d.relevance,
                 "n_fields": len(d.fields),
                 "low_confidence_fields": sum(
                     1 for f in d.fields.values()
@@ -199,6 +232,7 @@ def validation_queue(tax_year: int | None = None, form_type: str | None = None,
             }
             for d in queue
         ],
+        "irrelevant_excluded": 0 if include_irrelevant else excluded,
         "progress": progress,
     })
 
@@ -433,8 +467,12 @@ def assess_relevance(tax_year: int | None = None,
     Deterministic metadata-only rules: year outside the configured
     scope -> irrelevant; byte-identical OCR duplicate -> irrelevant
     (first kept); unclassified form -> needs_human (never auto-dropped).
-    Verdicts are persisted as labels on the documents; nothing is
-    deleted. Returns counts and id lists -- no PII."""
+    Authority: a VALIDATED document is relevant by definition
+    (validated_by_operator) -- the mechanical rules never demote it;
+    explicit operator overrides (recorded via relevance_override) are
+    honored for non-validated docs (operator_override). Verdicts are
+    persisted as labels on the documents; nothing is deleted. Returns
+    counts and id lists -- no PII."""
     from . import config as _cfg
     from .relevance import assess_relevance as _a, summarize as _s
 
@@ -443,6 +481,32 @@ def assess_relevance(tax_year: int | None = None,
     docs = store.list(year=tax_year) if tax_year is not None else None
     verdicts = _a(store, scope, docs=docs, persist=True)
     return _jsonable(_s(verdicts))
+
+
+@mcp.tool()
+def relevance_override(doc_id: str, verdict: str, reason: str,
+                       data_dir: str | None = None) -> dict:
+    """Record an explicit operator override of a document's relevance
+    verdict (relevant | irrelevant | needs_human) with a required
+    reason. The override is appended to the audit registry
+    (relevance_overrides.jsonl next to the store) as {doc_id, verdict,
+    reason, ts}, applied to the document, and honored by assess_relevance
+    on future runs (operator_override).
+
+    OPERATOR-ONLY SURFACE: this tool acts ONLY on explicit operator
+    direction. The mechanical pipeline never calls it. A validated
+    document stays relevant even against an override
+    (validated_by_operator dominates; the record is marked suppressed).
+    Restoring an irrelevant document to the review queue is exactly
+    what this tool is for. Returns {record, applied_verdict, suppressed}
+    -- ids and reason codes only, no PII."""
+    from .relevance import relevance_override as _o
+
+    store = _store(data_dir)
+    doc = store.get(doc_id)
+    if doc is None:
+        raise KeyError(f"unknown doc_id: {doc_id}")
+    return _jsonable(_o(store, doc.doc_id, verdict, reason))
 
 
 @mcp.tool()

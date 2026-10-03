@@ -13,14 +13,20 @@ the form was found with high/medium confidence, else ``"needs_review"``.
 
 Supporting helpers
 ------------------
-``classify_form(text)`` — classify OCR text into a ``form_type`` using
-``FORM_KEYWORDS`` plus transcript/schedule return-type detection.
+``classify_form(text)`` — classify text into a ``form_type`` using
+per-section form-title anchors (instruction/notice sections excluded from
+scoring, parenthesized "(Form 1040)" mentions treated as references).
+
+``split_form_sections(pages)`` — split per-page texts into ``FormSection``
+spans at title anchors, for multi-form files (consolidated 1099s, stacked
+scans).
 
 ``detect_tax_year(text)`` — find a 4-digit tax year (2000-2030) near tax-year
 phrases or in a form header line.
 """
 
 import re
+from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -103,12 +109,214 @@ def _box_field(text, label_patterns, box_num, value_transform=None):
 
 
 # ---------------------------------------------------------------------------
-# Form keyword catalog (uppercase phrases) for classification
+# Form-title anchors for classification
 # ---------------------------------------------------------------------------
+#
+# Classification is anchor-based: a form is recognized by its printed title
+# ("Form 1099-B", "Wage and Tax Statement", ...), matched per page/section.
+# Rules (all deterministic, stdlib ``re`` only):
+#
+# - Instruction/notice sections ("Instructions for Recipient",
+#   "Notice to Employee", ...) are cut out before scoring and are never
+#   classified as forms.
+# - Parenthesized "(Form 1040)" mentions are references, not titles.
+# - Bare form names ("Schedule D", "Interest Income", ...) count as anchors
+#   only at the start of a line; "Form NNNN" titles count anywhere. (A Form
+#   1040 that says "attach Schedule D" mid-sentence is not a Schedule D.)
+# - On a page carrying a transcript title (Wage and Income / Tax Return /
+#   Account / Record of Account), inner form mentions are content, not
+#   titles: the transcript anchor suppresses the other anchors on that page.
+#
+# Table entries: (form_type, regex, line_start_only).
 
+_FORM_TITLE_ANCHORS: list[tuple[str, str, bool]] = [
+    ("WAGE_INCOME_TRANSCRIPT", r"WAGE\s+AND\s+INCOME\s+TRANSCRIPT", True),
+    ("RECORD_OF_ACCOUNT", r"RECORD\s+OF\s+ACCOUNT", True),
+    ("ACCOUNT_TRANSCRIPT", r"ACCOUNT\s+TRANSCRIPT\b", True),
+    ("RETURN_TRANSCRIPT", r"TAX\s+RETURN\s+TRANSCRIPT", True),
+    ("1040-X", r"FORM\s+1040-?X\b", False),
+    ("1040-X", r"AMENDED\s+(?:U\.?S\.?\s+)?INDIVIDUAL\s+INCOME\s+TAX\s+RETURN", True),
+    ("1040", r"FORM\s+1040\b", False),
+    ("1040", r"U\.?S\.?\s+INDIVIDUAL\s+INCOME\s+TAX\s+RETURN", True),
+    ("SCHEDULE_D", r"SCHEDULE\s+D\b", True),
+    ("SCHEDULE_D", r"CAPITAL\s+GAINS\s+AND\s+LOSSES", True),
+    ("W-2", r"FORM\s+W-?2\b", False),
+    ("W-2", r"WAGE\s+AND\s+TAX\s+STATEMENT", True),
+    ("1099-B", r"FORM\s+1099-?B\b", False),
+    ("1099-B", r"PROCEEDS\s+FROM\s+BROKER\s+AND\s+BARTER\s+EXCHANGE\s+TRANSACTIONS", True),
+    ("1099-INT", r"FORM\s+1099-?INT\b", False),
+    ("1099-INT", r"INTEREST\s+INCOME", True),
+    ("1099-DIV", r"FORM\s+1099-?DIV\b", False),
+    ("1099-DIV", r"DIVIDENDS\s+AND\s+DISTRIBUTIONS", True),
+    ("1099-NEC", r"FORM\s+1099-?NEC\b", False),
+    ("1099-NEC", r"NONEMPLOYEE\s+COMPENSATION", True),
+    ("1099-R", r"FORM\s+1099-?R\b", False),
+    ("1099-R", r"DISTRIBUTIONS\s+FROM\s+PENSIONS", True),
+    ("1099-MISC", r"FORM\s+1099-?MISC\b", False),
+    ("1099-MISC", r"MISCELLANEOUS\s+INFORMATION", True),
+    ("1098", r"FORM\s+1098\b", False),
+    ("1098", r"MORTGAGE\s+INTEREST\s+STATEMENT", True),
+]
+
+_TRANSCRIPT_TYPES = frozenset({
+    "WAGE_INCOME_TRANSCRIPT",
+    "RETURN_TRANSCRIPT",
+    "ACCOUNT_TRANSCRIPT",
+    "RECORD_OF_ACCOUNT",
+})
+
+
+def _compile_anchor(pattern: str, line_start_only: bool) -> re.Pattern:
+    if line_start_only:
+        pattern = r"(?m)^[ \t]*" + pattern
+    return re.compile(pattern, re.IGNORECASE)
+
+
+_ANCHOR_RES: list[tuple[str, re.Pattern]] = [
+    (form_type, _compile_anchor(pattern, line_start_only))
+    for form_type, pattern, line_start_only in _FORM_TITLE_ANCHORS
+]
+
+# Instruction/notice headings. A heading must be followed by a colon or end
+# of line so that mid-sentence mentions ("see Notice to Employee for
+# details") do not cut the page.
+_EXCLUDED_HEADING_RE = re.compile(
+    r"(?:INSTRUCTIONS\s+FOR\s+(?:RECIPIENT|PAYER)"
+    r"|NOTICE\s+TO\s+EMPLOYEE"
+    r"|(?:GENERAL|SPECIFIC)\s+INSTRUCTIONS"
+    r"|INSTRUCTIONS\s+FOR\s+FORM)"
+    r"(?=\s*(?::|$))",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Parenthesized form mentions, e.g. "Schedule D (Form 1040)": references,
+# never titles.
+_FORM_REFERENCE_RE = re.compile(
+    r"\(\s*[^()]*\bFORM\s+1040\b[^()]*\)", re.IGNORECASE
+)
+
+
+def _strip_form_references(text: str) -> str:
+    """Remove parenthesized "(Form 1040)"-style mentions."""
+    return _FORM_REFERENCE_RE.sub(" ", text)
+
+
+def _find_title_anchors(text: str) -> list[tuple[int, int, str]]:
+    """All (start, end, form_type) title-anchor matches, in position order.
+
+    Overlaps resolve to the earliest start, then the longest match, then
+    table order (so "Form 1040-X" beats "Form 1040" at the same start).
+    """
+    cands: list[tuple[int, int, str]] = []
+    order = {ft: i for i, (ft, _p, _l) in enumerate(_FORM_TITLE_ANCHORS)}
+    for form_type, rx in _ANCHOR_RES:
+        for m in rx.finditer(text):
+            cands.append((m.start(), m.end(), form_type))
+    # Bare "RETURN TRANSCRIPT" counts as a transcript title only with 1040
+    # nearby (legacy rule, kept).
+    if "1040" in text.upper() and not re.search(
+        r"TAX\s+RETURN\s+TRANSCRIPT", text, re.IGNORECASE
+    ):
+        for m in re.finditer(r"\bRETURN\s+TRANSCRIPT\b", text, re.IGNORECASE):
+            cands.append((m.start(), m.end(), "RETURN_TRANSCRIPT"))
+    cands.sort(key=lambda c: (c[0], -(c[1] - c[0]), order[c[2]]))
+    kept: list[tuple[int, int, str]] = []
+    for start, end, form_type in cands:
+        if all(end <= ks or start >= ke for ks, ke, _ in kept):
+            kept.append((start, end, form_type))
+    # "Record of Account Transcript" contains "Account Transcript": the
+    # Record-of-Account anchor wins; drop the shadowed Account anchor.
+    if any(c[2] == "RECORD_OF_ACCOUNT" for c in kept):
+        kept = [
+            c for c in kept
+            if c[2] != "ACCOUNT_TRANSCRIPT"
+            or not any(
+                rs <= c[0] < re_ + 24
+                for rs, re_, rt in kept
+                if rt == "RECORD_OF_ACCOUNT"
+            )
+        ]
+    # A transcript title dominates its page: inner form mentions ("Form
+    # W-2", "Form 1099-INT" inside a Wage & Income transcript) are content,
+    # not titles.
+    if any(c[2] in _TRANSCRIPT_TYPES for c in kept):
+        kept = [c for c in kept if c[2] in _TRANSCRIPT_TYPES]
+    return kept
+
+
+@dataclass
+class FormSection:
+    """One anchor-delimited span of a document's text.
+
+    ``form_type`` is None for untyped spans (no title anchor) and for
+    excluded instruction/notice sections. ``page_start``/``page_end`` are
+    1-based, inclusive.
+    """
+
+    form_type: str | None
+    text: str
+    page_start: int
+    page_end: int
+    excluded: bool = False
+
+
+def split_form_sections(pages: list[str]) -> list[FormSection]:
+    """Split per-page texts into form sections at title anchors.
+
+    - A section starts at each title anchor; consecutive anchors of the same
+      form_type are one section (title + subtitle of a single form).
+    - Text from an instruction/notice heading to the end of its page is an
+      excluded section: never scored, never classified as a form.
+    - A page (or leading span) with no anchor is an untyped section; it is
+      attached to the preceding section as a continuation (e.g. page 2 of a
+      form whose title is on page 1).
+    """
+    sections: list[FormSection] = []
+    for pageno, page in enumerate(pages, start=1):
+        text = _strip_form_references(page)
+        head, tail = text, ""
+        m = _EXCLUDED_HEADING_RE.search(text)
+        if m:
+            head, tail = text[: m.start()], text[m.start():]
+        anchors = _find_title_anchors(head)
+        cur_type: str | None = None
+        cur_start = 0
+        for start, _end, form_type in anchors:
+            if form_type != cur_type:
+                chunk = head[cur_start:start]
+                if cur_type is not None or chunk.strip():
+                    sections.append(
+                        FormSection(cur_type, chunk, pageno, pageno)
+                    )
+                cur_type, cur_start = form_type, start
+        rest = head[cur_start:]
+        if cur_type is not None or rest.strip():
+            sections.append(FormSection(cur_type, rest, pageno, pageno))
+        if tail.strip():
+            sections.append(
+                FormSection(None, tail, pageno, pageno, excluded=True)
+            )
+    merged: list[FormSection] = []
+    for sec in sections:
+        if (
+            not sec.excluded
+            and sec.form_type is None
+            and merged
+            and not merged[-1].excluded
+        ):
+            prev = merged[-1]
+            prev.text += sec.text
+            prev.page_end = sec.page_end
+        else:
+            merged.append(sec)
+    return merged
+
+
+# Legacy keyword catalog: fallback only, for anchor-less text. Instruction
+# and notice sections are never scored.
 FORM_KEYWORDS: dict[str, list[str]] = {
     "W-2": ["W-2", "WAGE AND TAX STATEMENT", "WAGES, TIPS, OTHER COMPENSATION"],
-    "1099-B": ["1099-B", "PROCEEDS FROM BROKER", "BROKER TRANSACTIONS"],
+    "1099-B": ["1099-B", "PROCEEDS FROM BROKER", "BARTER EXCHANGE"],
     "1099-INT": ["1099-INT", "INTEREST INCOME", "INTEREST"],
     "1099-DIV": ["1099-DIV", "DIVIDENDS AND DISTRIBUTIONS", "DIVIDENDS"],
     "1099-NEC": ["1099-NEC", "NONEMPLOYEE COMPENSATION"],
@@ -119,33 +327,62 @@ FORM_KEYWORDS: dict[str, list[str]] = {
 }
 
 
-def classify_form(text: str) -> str:
-    """Classify OCR text into a form_type.
-
-    Transcript / return types are checked first, then the 1040-X-before-1040
-    order rule applies, then FORM_KEYWORDS matching.
-    """
+def _keyword_fallback(text: str) -> str:
+    """Old substring scoring, kept as a fallback for anchor-less text."""
     upper = text.upper()
-    if "WAGE AND INCOME TRANSCRIPT" in upper:
-        return "WAGE_INCOME_TRANSCRIPT"
-    if "TAX RETURN TRANSCRIPT" in upper or (
-        "RETURN TRANSCRIPT" in upper and "1040" in upper
-    ):
-        return "RETURN_TRANSCRIPT"
-    if "SCHEDULE D" in upper:
-        return "SCHEDULE_D"
-    # Order matters: 1040-X before 1040.
-    if "FORM 1040-X" in upper:
-        return "1040-X"
-    if "FORM 1040" in upper:
-        return "1040"
-
     best, best_score = "UNKNOWN", 0
     for form_type, keywords in FORM_KEYWORDS.items():
         score = sum(1 for kw in keywords if kw in upper)
         if score > best_score:
             best, best_score = form_type, score
     return best
+
+
+def classify_form(text: str) -> str:
+    """Classify text into a form_type using per-section title anchors.
+
+    Instruction/notice sections are excluded from scoring (never classified
+    as forms) and parenthesized "(Form 1040)" mentions are references, not
+    titles. Returns "UNKNOWN" when no section carries a title anchor, and
+    also when sections carry two or more distinct form types: a multi-form
+    input is never collapsed to a single form_type (use
+    split_form_sections for the per-section detail).
+    """
+    sections = split_form_sections([text])
+    ordered: list[str] = []
+    for sec in sections:
+        if not sec.excluded and sec.form_type and sec.form_type not in ordered:
+            ordered.append(sec.form_type)
+    if len(ordered) == 1:
+        return ordered[0]
+    if not ordered:
+        joined = " ".join(s.text for s in sections if not s.excluded)
+        return _keyword_fallback(joined)
+    return "UNKNOWN"
+
+
+_LEADING_ANCHOR_RES: dict[str, re.Pattern] = {}
+
+
+def _leading_anchor_re(form_type: str) -> re.Pattern:
+    rx = _LEADING_ANCHOR_RES.get(form_type)
+    if rx is None:
+        pats = [pat for ft, pat, _line in _FORM_TITLE_ANCHORS if ft == form_type]
+        rx = re.compile(r"\s*(?:" + "|".join(pats) + ")", re.IGNORECASE)
+        _LEADING_ANCHOR_RES[form_type] = rx
+    return rx
+
+
+def section_has_content(text: str, form_type: str) -> bool:
+    """True if a form section holds text beyond its leading title anchor.
+
+    Decides split-vs-block for multi-form files: bare title mentions with
+    no content are blocked as MULTI_FORM rather than fanned out into empty
+    child documents.
+    """
+    m = _leading_anchor_re(form_type).match(text)
+    rest = text[m.end():] if m else text
+    return bool(rest.strip())
 
 
 def detect_tax_year(text: str) -> int | None:

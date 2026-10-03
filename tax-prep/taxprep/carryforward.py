@@ -72,8 +72,29 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from . import exclusions
+
 ANNUAL_LIMIT = Decimal("3000")
 ANNUAL_LIMIT_MFS = Decimal("1500")
+
+# Reason codes for the R3 carryforward guard. Form/status codes are
+# checked defensively: MULTI_FORM, BLOCKED and ORPHANED are not in the
+# current models.py enums (R1/R4/R5 add them), but the guard must
+# refuse on them the moment any producer can emit them.
+REASON_UNKNOWN_FORM = "unknown_form"
+REASON_MULTI_FORM = "multi_form"
+REASON_BLOCKED = "blocked"
+REASON_ORPHANED = "orphaned"
+REASON_MISSING_YEAR = "missing_year"
+REASON_ZERO_LOTS = "zero_lots"
+REASON_CODES = (
+    REASON_UNKNOWN_FORM,
+    REASON_MULTI_FORM,
+    REASON_BLOCKED,
+    REASON_ORPHANED,
+    REASON_MISSING_YEAR,
+    REASON_ZERO_LOTS,
+)
 
 # canonical filing statuses -> annual limit is only status-sensitive for MFS
 _STATUS_ALIASES = {
@@ -384,13 +405,121 @@ def _parse_money_opt(value: Any) -> Decimal | None:
     return _coerce("1099-B box", value)
 
 
+def _field_value(fields: dict, code: str) -> Any:
+    """One field's value, tolerating both the {"value": ...} record
+    shape and bare values."""
+    f = (fields or {}).get(code)
+    return f.get("value") if isinstance(f, dict) else f
+
+
+# Field codes that constitute a lot record on a 1099-B. A document with
+# none of these present carries zero lots; a document with some of them
+# has a (possibly malformed) lot that from_store's existing
+# include/exclude-with-warning logic handles.
+_LOT_FIELD_CODES = ("1d_proceeds", "1e_basis", "term",
+                    "date_acquired", "date_sold")
+
+
+def _has_lot_record(doc: Any) -> bool:
+    """True when this 1099-B carries at least one lot field.
+
+    A lot that is present but malformed (unknown term, missing
+    proceeds/basis) is NOT zero-lots: from_store already excludes it
+    with a loud warning. Zero lots means the document has no lot data
+    at all -- the case that used to contribute a silent $0.
+    """
+    fields = getattr(doc, "fields", None) or {}
+    for code in _LOT_FIELD_CODES:
+        v = _field_value(fields, code)
+        if v is not None and (not isinstance(v, str) or v.strip()):
+            return True
+    return False
+
+
+def carryforward_blockers(store: Any, chained_years: list[int] | None = None) -> list[dict]:
+    """R3 guard: PII-free blocker list [{"doc_id", "reason_code"}].
+
+    Refuses (via the caller raising) while ANY document in the store is
+    UNKNOWN, MULTI_FORM, BLOCKED, or ORPHANED, or has tax_year None, or
+    while any 1099-B in a chained year carries no lot record at all
+    (see _has_lot_record -- present-but-malformed lots keep the
+    existing exclude-with-warning path) -- unless the Operator recorded
+    an exclusion with a reason for that doc_id (taxprep.exclusions).
+    The scan is store-wide for document-level blockers; the zero-lots
+    check covers ``chained_years`` (defaults to every year present in
+    the store).
+
+    A document can carry several blocker entries (e.g. UNKNOWN form AND
+    missing year); the list is sorted by (doc_id, reason_code) for
+    determinism. Only doc_ids and fixed reason codes appear -- never
+    values, names, or exclusion reasons.
+    """
+    docs = store.list()
+    data_dir = getattr(store, "data_dir", None)
+    excluded: set[str] = set()
+    if data_dir is not None:
+        excluded = {e["doc_id"] for e in exclusions.list_exclusions(data_dir)}
+
+    blockers: list[dict] = []
+    for d in docs:
+        if d.doc_id in excluded:
+            continue
+        form_type = getattr(d, "form_type", None)
+        status = getattr(d, "status", None)
+        if form_type == "UNKNOWN":
+            blockers.append({"doc_id": d.doc_id,
+                             "reason_code": REASON_UNKNOWN_FORM})
+        elif form_type == "MULTI_FORM":
+            blockers.append({"doc_id": d.doc_id,
+                             "reason_code": REASON_MULTI_FORM})
+        if status == "BLOCKED":
+            blockers.append({"doc_id": d.doc_id,
+                             "reason_code": REASON_BLOCKED})
+        elif status == "ORPHANED":
+            blockers.append({"doc_id": d.doc_id,
+                             "reason_code": REASON_ORPHANED})
+        if getattr(d, "tax_year", None) is None:
+            blockers.append({"doc_id": d.doc_id,
+                             "reason_code": REASON_MISSING_YEAR})
+
+    if chained_years is None:
+        chained_years = sorted({d.tax_year for d in docs
+                                if getattr(d, "tax_year", None) is not None})
+    for y in chained_years:
+        for d in store.list(year=y, form="1099-B"):
+            if d.doc_id in excluded:
+                continue
+            if not _has_lot_record(d):
+                blockers.append({"doc_id": d.doc_id,
+                                 "reason_code": REASON_ZERO_LOTS})
+
+    blockers.sort(key=lambda b: (b["doc_id"], b["reason_code"]))
+    return blockers
+
+
 def from_store(store: Any, year: int) -> dict:
     """Sum validated 1099-B lots for ``year`` into signed ST/LT currents.
 
-    Refuses loudly if any 1099-B for the year is not yet validated.
+    Refuses loudly (R3 guard) if ANY document in the store is UNKNOWN,
+    MULTI_FORM, BLOCKED, or ORPHANED, or has tax_year None, or if any
+    1099-B for the year has zero lots -- unless the Operator recorded
+    an exclusion with a reason for that document. Also refuses if any
+    1099-B for the year is not yet validated (validation is never
+    excludable).
+
     Lots with unknown term or missing proceeds/basis are EXCLUDED and
     reported in ``warnings`` -- never guessed.
     """
+    blockers = carryforward_blockers(store, chained_years=[year])
+    if blockers:
+        items = ", ".join(f"{b['doc_id']}({b['reason_code']})"
+                          for b in blockers)
+        raise ValueError(
+            f"cannot compute carryforward for {year}: "
+            f"{len(blockers)} blocker(s): {items} -- resolve each blocker "
+            "or record an Operator exclusion with a reason for it "
+            "(`taxprep exclude <doc_id> --reason <reason>`), then retry"
+        )
     docs = store.list(year=year, form="1099-B")
     unvalidated = [d.doc_id for d in docs if d.status != "validated"]
     if unvalidated:
