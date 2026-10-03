@@ -117,8 +117,45 @@ def test_bus_tune_and_whoami(iso, capsys):
     out = capsys.readouterr().out
     assert "session_id:" in out and "subscribed:" in out
     assert "bus_dir:" in out and "tuning:" in out and "cursor:" in out
-    assert "never committed" in out
+    assert "store_dir:" in out and "dsys-store" in out
     assert str(iso["bus"]) in out
+
+
+def test_bus_publish_via_store_dir(tmp_path, monkeypatch, capsys):
+    # TAXPREP_BUS_DIR unset: the bus accretes to the dsys-store checkout.
+    import subprocess
+    store = tmp_path / "dsys-store"
+    store.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(store)],
+                   capture_output=True, check=True)
+    cfg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg))
+    monkeypatch.delenv("TAXPREP_BUS_DIR", raising=False)
+    monkeypatch.setenv("TAXPREP_STORE_DIR", str(store))
+    monkeypatch.delenv("TAXPREP_SESSION_ID", raising=False)
+    assert _run("bus", "publish", "--topic", "tax-prep.ops",
+                "--type", "run-done",
+                "--payload", '{"n_docs": 1}') == 0
+    out = capsys.readouterr().out
+    assert "dsys-store" in out  # broadcast reminder names the store repo
+    assert (store / "bus" / "tax-prep.ops").is_dir()
+    # nothing landed in the code repo
+    assert not (Path(__file__).resolve().parent.parent / "bus" / "tax-prep.ops").exists()
+
+    assert _run("bus", "whoami") == 0
+    assert f"store_dir:   {store}" in capsys.readouterr().out
+
+
+def test_bus_publish_missing_store_errors(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg))
+    monkeypatch.delenv("TAXPREP_BUS_DIR", raising=False)
+    monkeypatch.setenv("TAXPREP_STORE_DIR", str(tmp_path / "no-store"))
+    rc = _run("bus", "publish", "--topic", "t", "--type", "x",
+              "--payload", '{"a": 1}')
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "git clone https://github.com/pltrinh1122/dsys-store" in err
 
 
 # -- config ------------------------------------------------------------------
@@ -147,6 +184,12 @@ def test_config_set_scope_years(iso, capsys):
     assert _run("config", "set", "scope_years", "2024,2025") == 0
     assert _run("config", "show") == 0
     assert "scope_years  = [2024, 2025]" in capsys.readouterr().out
+
+
+def test_config_set_store_dir(iso, capsys):
+    assert _run("config", "set", "store_dir", "/tmp/somewhere-store") == 0
+    assert _run("config", "show") == 0
+    assert "store_dir    = /tmp/somewhere-store" in capsys.readouterr().out
 
 
 def test_ingest_no_source_dir_errors(iso, capsys):

@@ -30,15 +30,6 @@ def _store(data_dir: str | None) -> DocumentStore:
     return DocumentStore(taxprep_config.resolve("data_dir", cli_value=data_dir))
 
 
-def _git_root(start: str | Path) -> Path | None:
-    """Nearest ancestor containing .git; None when not in a repo."""
-    p = Path(start).resolve()
-    for parent in (p, *p.parents):
-        if (parent / ".git").exists():
-            return parent
-    return None
-
-
 def cmd_ingest(args: argparse.Namespace) -> int:
     input_dir = args.input_dir or taxprep_config.resolve("source_dir")
     if not input_dir:
@@ -222,28 +213,33 @@ def cmd_bus_publish(args: argparse.Namespace) -> int:
             args.topic, args.type, payload,
             correlation_id=args.correlation_id,
             bus_dir=args.bus_dir,
+            store_dir=args.store_dir,
             tuning_path=args.tuning,
         )
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, FileNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(path)
-    print("Broadcasting = commit + push the bus/ directory; "
-          "listeners pick it up on their next pull.")
+    print("Broadcasting = commit + push the dsys-store repo (not the code "
+          "repo); listeners pick it up on their next pull.")
     return 0
 
 
 def cmd_bus_listen(args: argparse.Namespace) -> int:
     tuning = bus_mod.load_tuning(args.tuning)
     topics = list(args.topic) or bus_mod.subscribed_topics(
-        tuning, bus_dir=args.bus_dir)
+        tuning, bus_dir=args.bus_dir, store_dir=args.store_dir)
     if not topics:
         print("no topics to listen on: `taxprep bus tune --topic <t>` "
               "or publish first", file=sys.stderr)
         return 1
     exclude = None if args.include_own else (tuning["session"]["id"] or None)
-    bus_dir = bus_mod.resolve_bus_dir(args.bus_dir)
-    repo = _git_root(bus_dir)
+    try:
+        bus_dir = bus_mod.resolve_bus_dir(args.bus_dir, store_dir=args.store_dir)
+        repo = bus_mod.resolve_pull_target(args.bus_dir, store_dir=args.store_dir)
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if repo is None:
         print("warning: bus dir is not inside a git repo; "
               "reading local messages only", file=sys.stderr)
@@ -294,10 +290,19 @@ def cmd_bus_whoami(args: argparse.Namespace) -> int:
     sid = tuning["session"]["id"] or "(not set -- generated on first publish)"
     print(f"session_id:  {sid}")
     print("subscribed:  " +
-          ", ".join(bus_mod.subscribed_topics(tuning, bus_dir=args.bus_dir)))
-    print(f"bus_dir:     {bus_mod.resolve_bus_dir(args.bus_dir)}")
+          ", ".join(bus_mod.subscribed_topics(
+              tuning, bus_dir=args.bus_dir, store_dir=args.store_dir)))
+    try:
+        store = bus_mod.resolve_store_dir(args.store_dir)
+        bus_dir = bus_mod.resolve_bus_dir(args.bus_dir, store_dir=args.store_dir)
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"store_dir:   (unresolved: {exc})")
+        return 0
+    print(f"store_dir:   {store}  (dsys-store checkout)")
+    print(f"bus_dir:     {bus_dir}")
     print(f"tuning:      {bus_mod.default_tuning_path() if args.tuning is None else args.tuning}")
     print(f"cursor:      {bus_mod.default_cursor_path()}")
+    return 0
     print("(tuning and cursor are local-only; never committed)")
     return 0
 
@@ -320,7 +325,7 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     path = taxprep_config.default_config_path()
     print(f"config file: {path}  "
           f"({'present' if path.is_file() else 'missing -- defaults apply'})")
-    for key in ("source_dir", "data_dir", "scope_years"):
+    for key in ("source_dir", "data_dir", "scope_years", "store_dir"):
         print(f"{key:12} = {taxprep_config.resolve(key)}")
     print("(machine-local; never committed)")
     return 0
@@ -418,9 +423,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="restrict per-year checks to one year (default: all years)")
     pv.set_defaults(func=cmd_verify)
 
-    pb = sub.add_parser("bus", help="git-backed broadcast message bus for sessions")
+    pb = sub.add_parser("bus", help="broadcast message bus for sessions (accretes to dsys-store)")
     pb.add_argument("--bus-dir", default=None,
-                    help="bus directory (default: <repo>/tax-prep/bus or TAXPREP_BUS_DIR)")
+                    help="bus directory (default: <dsys-store>/bus or TAXPREP_BUS_DIR)")
+    pb.add_argument("--store-dir", default=None,
+                    help="dsys-store checkout (default: TAXPREP_STORE_DIR, config, or ~/workspace/dsys-store)")
     pb.add_argument("--tuning", default=None,
                     help="tuning file (default: ~/.config/taxprep/bus.toml)")
     bsub = pb.add_subparsers(dest="bus_cmd", required=True)
@@ -457,7 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pcfg = sub.add_parser("config", help="machine-local workstation config (never committed)")
     csub = pcfg.add_subparsers(dest="config_cmd", required=True)
-    cset = csub.add_parser("set", help="set one key: source_dir | data_dir | scope_years")
+    cset = csub.add_parser("set", help="set one key: source_dir | data_dir | scope_years | store_dir")
     cset.add_argument("key")
     cset.add_argument("value")
     cset.set_defaults(func=cmd_config_set)

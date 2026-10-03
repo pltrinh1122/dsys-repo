@@ -10,6 +10,8 @@ Keys:
     data_dir     TAXPREP_DATA_DIR      default: ./data under the package
     scope_years  TAXPREP_SCOPE_YEARS   default: 2023,2024,2025,2026
                  (comma-separated in env/file)
+    store_dir    TAXPREP_STORE_DIR     default: ~/workspace/dsys-store
+                 (the dsys-store git checkout the message bus accretes to)
 
 The config file lives OUTSIDE the repo and must never be committed: it
 holds machine-local paths. The repo is public; this file is not part of
@@ -24,16 +26,18 @@ from pathlib import Path
 
 PACKAGE_DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
-_KEYS = ("source_dir", "data_dir", "scope_years")
+_KEYS = ("source_dir", "data_dir", "scope_years", "store_dir")
 _ENV = {
     "source_dir": "TAXPREP_SOURCE_DIR",
     "data_dir": "TAXPREP_DATA_DIR",
     "scope_years": "TAXPREP_SCOPE_YEARS",
+    "store_dir": "TAXPREP_STORE_DIR",
 }
 _DEFAULTS = {
     "source_dir": None,
     "data_dir": str(PACKAGE_DEFAULT_DATA_DIR),
     "scope_years": [2023, 2024, 2025, 2026],
+    "store_dir": str(Path.home() / "workspace" / "dsys-store"),
 }
 
 

@@ -97,14 +97,6 @@ def _store(data_dir: str | None) -> DocumentStore:
     return DocumentStore(_cfg.resolve("data_dir", cli_value=data_dir))
 
 
-def _git_root(start: str | Path) -> Path | None:
-    p = Path(start).resolve()
-    for parent in (p, *p.parents):
-        if (parent / ".git").exists():
-            return parent
-    return None
-
-
 def _jsonable(v):
     """Recursively convert to JSON-safe values. Decimals become strings --
     raw Decimals must never leak into tool output (MCP serializes to JSON)."""
@@ -361,9 +353,9 @@ def verify_all(tax_year: int | None = None,
 @mcp.tool()
 def bus_publish(topic: str, type: str, payload: dict,
                 correlation_id: str | None = None) -> dict:
-    """Publish one message to the git-backed broadcast bus. Broadcasting
-    itself is commit + push of the bus/ directory (the session's job
-    after this call).
+    """Publish one message to the broadcast bus (accretes to dsys-store).
+    Broadcasting itself is commit + push of the dsys-store repo (the
+    session's job after this call).
 
     Payloads go through bus.publish's PII guard -- SSN/EIN patterns are
     refused, and the shapes-only rule applies: ids, counts, statuses,
@@ -401,8 +393,12 @@ def bus_poll(topic: str | None = None, timeout_seconds: float = 0) -> dict:
     tuning = _bus.load_tuning()
     topics = [topic] if topic else _bus.subscribed_topics(tuning)
     exclude = tuning["session"]["id"] or None
-    bus_dir = _bus.resolve_bus_dir()
-    repo = _git_root(bus_dir)
+    try:
+        bus_dir = _bus.resolve_bus_dir()
+        repo = _bus.resolve_pull_target()
+    except (FileNotFoundError, ValueError) as exc:
+        return _jsonable({"messages": [], "warnings": [f"bus unavailable: {exc}"],
+                          "topics": topics})
     interval = int(tuning["tuning"].get("poll_interval_seconds", 30))
     timeout = max(0.0, min(float(timeout_seconds), 300.0))
 

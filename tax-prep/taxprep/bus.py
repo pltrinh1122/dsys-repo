@@ -1,9 +1,14 @@
 """Git-backed broadcast message bus for multi-session collaboration.
 
-Transport is the git repo itself: publishing writes a JSON file,
-broadcasting is commit + push (the existing flow), listening is
-``git pull`` + read. Poll-scale latency (tens of seconds) fits build
-notifications and discrepancy reports.
+Transport is a SEPARATE git repo, dsys-store
+(github.com/pltrinh1122/dsys-store): publishing writes a JSON file
+under ``<store>/bus/<topic>/``, broadcasting is commit + push of the
+store repo, listening is ``git pull`` + read. Poll-scale latency (tens
+of seconds) fits build notifications and discrepancy reports.
+
+Two-repo topology: dsys-repo is software (code, specs, tests); dsys-store
+is the append-only accretion medium for broadcast messages. The code repo
+never carries message files.
 
 Broadcast model: listeners tune in by topic. Topic names are
 lowercase alphanumerics, dots and dashes only.
@@ -13,10 +18,11 @@ Well-known topics (free-form otherwise):
     tax-prep.ops      workstation -> architect/human: run completions, discrepancy shapes
     tax-prep.review   human -> all: decisions / approvals
 
-PII RULE (hard): the repo carrying the bus is PUBLIC. Payloads are
-shapes only -- ids, counts, enums, status strings. Never values,
-names, EINs, SSNs, dollar amounts. ``publish`` refuses payloads
-matching SSN/EIN patterns.
+PII RULE (hard): payloads are shapes only -- ids, counts, enums,
+status strings. Never values, names, EINs, SSNs, dollar amounts.
+``publish`` refuses payloads matching SSN/EIN patterns. The
+blind-orchestrator contract holds end to end: no listening session
+ever sees PII in its context.
 
 SESSION IDENTITY: every message carries a unique per-session-instance
 id in ``from``: ``<role>-<6 hex>`` (e.g. ``workstation-a1b2c3``).
@@ -34,8 +40,14 @@ session listens to, poll interval) lives in
 the listen cursor in ``~/.config/taxprep/bus_cursor.json``. The cursor
 file is keyed by session id inside -- ``{"sessions": {sid: {topic:
 last_msg_id}}}`` -- so N listeners on one machine each keep an
-independent position. Neither file is ever committed -- the repo
+independent position. Neither file is ever committed -- the store repo
 carries messages, never listener state.
+
+On a new machine, clone the store repo first::
+
+    git clone https://github.com/pltrinh1122/dsys-store ~/workspace/dsys-store
+
+then ``taxprep bus whoami`` to confirm the resolved store dir.
 """
 
 from __future__ import annotations
@@ -84,32 +96,92 @@ def _check_no_pii(serialized: str) -> None:
 
 # -- path resolution ---------------------------------------------------
 
-def _find_repo_root() -> Path | None:
-    """Walk up from this module looking for a ``tax-prep`` dir with pyproject.toml."""
-    here = Path(__file__).resolve()
-    for parent in [here.parent, *here.parent.parents]:
-        if (parent / "tax-prep" / "pyproject.toml").is_file():
-            return parent
-        if parent.name == "tax-prep" and (parent / "pyproject.toml").is_file():
-            return parent.parent
-    return None
+_STORE_CLONE_HINT = "git clone https://github.com/pltrinh1122/dsys-store"
 
 
-def resolve_bus_dir(bus_dir: str | Path | None = None) -> Path:
-    """bus_dir param -> TAXPREP_BUS_DIR env -> <repo>/tax-prep/bus."""
+def _default_store_dir() -> Path:
+    return Path.home() / "workspace" / "dsys-store"
+
+
+def resolve_store_dir(store_dir: str | Path | None = None) -> Path:
+    """Resolve the dsys-store checkout location (no existence check).
+
+    store_dir param > TAXPREP_STORE_DIR env > config.toml ``store_dir`` >
+    ``~/workspace/dsys-store``.
+    """
+    if store_dir is not None:
+        return Path(store_dir)
+    env = os.environ.get("TAXPREP_STORE_DIR")
+    if env:
+        return Path(env)
+    try:
+        from . import config as config_mod
+
+        file_value = config_mod.load_file().get("store_dir")
+    except Exception:
+        file_value = None
+    if file_value:
+        return Path(os.path.expanduser(str(file_value)))
+    return _default_store_dir()
+
+
+def _require_store_checkout(store_dir: str | Path | None = None) -> Path:
+    """Resolve the store dir and require it to be a git checkout.
+
+    Raises FileNotFoundError (missing) or ValueError (not a git
+    checkout), both naming the expected clone command.
+    """
+    d = resolve_store_dir(store_dir)
+    if not d.is_dir():
+        raise FileNotFoundError(
+            f"dsys-store checkout not found at {d}; clone it with:\n"
+            f"  {_STORE_CLONE_HINT} {d}"
+        )
+    if not (d / ".git").is_dir():
+        raise ValueError(
+            f"{d} exists but is not a git checkout; the bus accretes to "
+            f"dsys-store -- clone it with:\n  {_STORE_CLONE_HINT} {d}"
+        )
+    return d
+
+
+def resolve_bus_dir(
+    bus_dir: str | Path | None = None,
+    store_dir: str | Path | None = None,
+) -> Path:
+    """Resolve the bus directory.
+
+    Resolution order: explicit bus_dir param > TAXPREP_BUS_DIR env >
+    ``<dsys-store>/bus`` (the store checkout is required to exist and
+    be a git checkout -- see _require_store_checkout). Writes never
+    escape the resolved dir.
+    """
     if bus_dir is not None:
         return Path(bus_dir)
     env = os.environ.get("TAXPREP_BUS_DIR")
     if env:
         return Path(env)
-    root = _find_repo_root()
-    if root is None:
-        raise FileNotFoundError(
-            "cannot resolve bus dir: set bus_dir or TAXPREP_BUS_DIR "
-            "(no tax-prep repo found above this module)"
-        )
-    taxprep_dir = root / "tax-prep" if (root / "tax-prep").is_dir() else root
-    return taxprep_dir / "bus"
+    return _require_store_checkout(store_dir) / "bus"
+
+
+def resolve_pull_target(
+    bus_dir: str | Path | None = None,
+    store_dir: str | Path | None = None,
+) -> Path | None:
+    """Git checkout to ``git pull`` when listening, or None for local-only.
+
+    Store-derived bus dirs pull the store checkout itself; an
+    explicitly-provided bus dir (param or TAXPREP_BUS_DIR) pulls its
+    enclosing git root, or None when there is none.
+    """
+    explicit = bus_dir is not None or os.environ.get("TAXPREP_BUS_DIR")
+    if not explicit:
+        return _require_store_checkout(store_dir)
+    root = resolve_bus_dir(bus_dir, store_dir)
+    for parent in [root, *root.parents]:
+        if (parent / ".git").is_dir():
+            return parent
+    return None
 
 
 def _config_dir() -> Path:
@@ -167,6 +239,7 @@ def publish(
     from_id: str | None = None,
     correlation_id: str | None = None,
     bus_dir: str | Path | None = None,
+    store_dir: str | Path | None = None,
     tuning_path: str | Path | None = None,
 ) -> Path:
     """Write one message file to the bus. Returns the file path.
@@ -208,7 +281,7 @@ def publish(
         "correlation_id": correlation_id,
         "payload": json.loads(serialized),
     }
-    topic_dir = resolve_bus_dir(bus_dir) / topic
+    topic_dir = resolve_bus_dir(bus_dir, store_dir) / topic
     topic_dir.mkdir(parents=True, exist_ok=True)
     fname = f"{now.strftime('%Y%m%dT%H%M%S%f')}-{msg_id}.json"
     path = topic_dir / fname
@@ -237,6 +310,7 @@ def list_messages(
     topic: str,
     since_id: str | None = None,
     bus_dir: str | Path | None = None,
+    store_dir: str | Path | None = None,
     exclude_from: str | None = None,
 ) -> list[dict]:
     """All messages in a topic, sorted by (ts, id).
@@ -247,7 +321,7 @@ def list_messages(
     its own broadcast echo.
     """
     _check_topic(topic)
-    topic_dir = resolve_bus_dir(bus_dir) / topic
+    topic_dir = resolve_bus_dir(bus_dir, store_dir) / topic
     messages: list[dict] = []
     if topic_dir.is_dir():
         for path in sorted(topic_dir.glob("*.json")):
@@ -265,9 +339,12 @@ def list_messages(
     return messages
 
 
-def topics(bus_dir: str | Path | None = None) -> list[str]:
+def topics(
+    bus_dir: str | Path | None = None,
+    store_dir: str | Path | None = None,
+) -> list[str]:
     """Topic names with at least one message file."""
-    root = resolve_bus_dir(bus_dir)
+    root = resolve_bus_dir(bus_dir, store_dir)
     if not root.is_dir():
         return []
     return sorted(
@@ -303,12 +380,16 @@ def poll_once(
     topic: str,
     repo_dir: str | Path,
     bus_dir: str | Path | None = None,
+    store_dir: str | Path | None = None,
     cursor_path: str | Path | None = None,
     do_pull: bool = True,
     exclude_from: str | None = None,
     tuning_path: str | Path | None = None,
 ) -> _PollResult:
     """Pull (unless do_pull=False), then return messages newer than the cursor.
+
+    ``repo_dir`` is the dsys-store checkout (kept the param name to avoid
+    churning callers): ``git pull --ff-only`` runs there.
 
     The cursor lives at cursor_path (default
     ~/.config/taxprep/bus_cursor.json, never committed) and is keyed by
@@ -356,7 +437,7 @@ def poll_once(
         mine = {}
     messages = list_messages(
         topic, since_id=mine.get(topic), bus_dir=bus_dir,
-        exclude_from=exclude_from,
+        store_dir=store_dir, exclude_from=exclude_from,
     )
     if messages:
         mine[topic] = messages[-1]["id"]
@@ -454,7 +535,7 @@ def unsubscribe(topic: str, path: str | Path | None = None) -> dict:
     if topics_list == ["*"]:
         try:
             explicit = topics()
-        except FileNotFoundError:
+        except (FileNotFoundError, ValueError):
             explicit = []
         topics_list = sorted(explicit)
     tuning["tuning"]["topics"] = [t for t in topics_list if t != topic]
@@ -470,13 +551,15 @@ def set_session_id(sid: str, path: str | Path | None = None) -> dict:
 
 
 def subscribed_topics(
-    tuning: dict, bus_dir: str | Path | None = None
+    tuning: dict,
+    bus_dir: str | Path | None = None,
+    store_dir: str | Path | None = None,
 ) -> list[str]:
     """Resolve '*' against topics actually present in the bus dir."""
     topics_list = tuning.get("tuning", {}).get("topics", ["*"])
     if topics_list == ["*"]:
         try:
-            return topics(bus_dir=bus_dir)
-        except FileNotFoundError:
+            return topics(bus_dir=bus_dir, store_dir=store_dir)
+        except (FileNotFoundError, ValueError):
             return []
     return list(topics_list)

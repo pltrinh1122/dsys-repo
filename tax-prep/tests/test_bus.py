@@ -153,35 +153,113 @@ def test_poll_once_pull_failure_warns(tmp_path, busdir, tuning_path):
 
 
 def test_broadcast_end_to_end_git(tmp_path, tuning_path):
-    origin = tmp_path / "origin.git"
+    # New topology: messages accrete to a separate dsys-store repo.
+    # Temp bare "origin" stands in for github.com/pltrinh1122/dsys-store;
+    # the code repo is out of the picture.
+    origin = tmp_path / "store-origin.git"
     subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)],
                    capture_output=True, check=True)
-    a = tmp_path / "A"
+    a = tmp_path / "store-A"
     subprocess.run(["git", "clone", str(origin), str(a)],
                    capture_output=True, check=True)
     git("commit", "--allow-empty", "-m", "seed", cwd=a)
     git("push", "-u", "origin", "HEAD:main", cwd=a)
-    b = tmp_path / "B"
+    b = tmp_path / "store-B"
     subprocess.run(["git", "clone", str(origin), str(b)],
                    capture_output=True, check=True)
 
-    bus_a = a / "bus"
     publish("tax-prep.build", "code-landed", {"commit": "deadbee", "n_files": 7},
-            SESSION_A, bus_dir=bus_a, tuning_path=tuning_path)
+            SESSION_A, store_dir=a, tuning_path=tuning_path)
     git("add", "bus", cwd=a)
     git("commit", "-m", "bus: code-landed", cwd=a)
     git("push", cwd=a)
 
-    bus_b = b / "bus"
     cursor = tmp_path / "cursor.json"
-    got = poll_once("tax-prep.build", b, bus_dir=bus_b, cursor_path=cursor, do_pull=True, tuning_path=tuning_path)
+    got = poll_once("tax-prep.build", b, store_dir=b, cursor_path=cursor,
+                    do_pull=True, tuning_path=tuning_path)
     assert not got.warnings, got.warnings
     assert len(got) == 1
     assert got[0]["payload"] == {"commit": "deadbee", "n_files": 7}
     assert got[0]["from"] == SESSION_A
     # second poll: cursor advanced, nothing new
-    again = poll_once("tax-prep.build", b, bus_dir=bus_b, cursor_path=cursor, do_pull=True, tuning_path=tuning_path)
+    again = poll_once("tax-prep.build", b, store_dir=b, cursor_path=cursor,
+                      do_pull=True, tuning_path=tuning_path)
     assert again == []
+
+
+def _git_store(tmp_path, name="store"):
+    """A real git checkout standing in for the dsys-store clone."""
+    d = tmp_path / name
+    d.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(d)],
+                   capture_output=True, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t.t", "-c", "user.name=t",
+                    "commit", "--allow-empty", "-m", "seed"],
+                   cwd=str(d), capture_output=True, check=True)
+    return d
+
+
+def test_resolve_bus_dir_defaults_to_store(tmp_path, tuning_path):
+    store = _git_store(tmp_path)
+    assert bus.resolve_bus_dir(store_dir=store) == store / "bus"
+
+
+def test_resolve_bus_dir_env_store_dir(tmp_path, monkeypatch):
+    store = _git_store(tmp_path)
+    monkeypatch.setenv("TAXPREP_STORE_DIR", str(store))
+    monkeypatch.delenv("TAXPREP_BUS_DIR", raising=False)
+    assert bus.resolve_bus_dir() == store / "bus"
+
+
+def test_resolve_bus_dir_param_beats_env(tmp_path, monkeypatch, tuning_path):
+    store = _git_store(tmp_path, "env-store")
+    other = _git_store(tmp_path, "param-store")
+    monkeypatch.setenv("TAXPREP_STORE_DIR", str(store))
+    monkeypatch.delenv("TAXPREP_BUS_DIR", raising=False)
+    assert bus.resolve_bus_dir(store_dir=other) == other / "bus"
+
+
+def test_resolve_bus_dir_bus_dir_beats_store(tmp_path, monkeypatch, tuning_path):
+    store = _git_store(tmp_path)
+    explicit = tmp_path / "explicit-bus"
+    explicit.mkdir()
+    monkeypatch.setenv("TAXPREP_STORE_DIR", str(store))
+    monkeypatch.setenv("TAXPREP_BUS_DIR", str(explicit))
+    assert bus.resolve_bus_dir() == explicit
+
+
+def test_missing_store_checkout_raises(tmp_path):
+    missing = tmp_path / "no-such-store"
+    with pytest.raises(FileNotFoundError) as excinfo:
+        bus.resolve_bus_dir(store_dir=missing)
+    assert "git clone https://github.com/pltrinh1122/dsys-store" in str(excinfo.value)
+
+
+def test_non_git_store_dir_raises(tmp_path):
+    plain = tmp_path / "plain-dir"
+    plain.mkdir()
+    with pytest.raises(ValueError) as excinfo:
+        bus.resolve_bus_dir(store_dir=plain)
+    assert "not a git checkout" in str(excinfo.value)
+    assert "github.com/pltrinh1122/dsys-store" in str(excinfo.value)
+
+
+def test_resolve_pull_target_store_checkout(tmp_path):
+    store = _git_store(tmp_path)
+    assert bus.resolve_pull_target(store_dir=store) == store
+
+
+def test_resolve_pull_target_explicit_bus_dir(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)],
+                   capture_output=True, check=True)
+    busd = repo / "bus"
+    busd.mkdir()
+    assert bus.resolve_pull_target(bus_dir=busd) == repo
+    lone = tmp_path / "lone-bus"
+    lone.mkdir()
+    assert bus.resolve_pull_target(bus_dir=lone) is None
 
 
 # -- tuning (local-only) -------------------------------------------------

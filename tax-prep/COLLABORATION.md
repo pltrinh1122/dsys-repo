@@ -52,9 +52,17 @@ amounts, no names, no EINs, no addresses. Concretely:
 ## The bus replaces hand-carried prompts
 
 The Architect and Workstation sessions no longer relay through Peter.
-They publish to the git-backed broadcast bus (`tax-prep/bus/<topic>/`;
-see README "Message bus"). Broadcast = commit + push; listening = pull
-+ read.
+They publish to the broadcast bus, which accretes to the separate
+**dsys-store** repo (`https://github.com/pltrinh1122/dsys-store`) under
+`bus/<topic>/` — never to dsys-repo. Two-repo topology: dsys-repo is
+software (code, specs, tests); dsys-store is the append-only accretion
+medium for session messages. Broadcast = commit + push the store repo;
+listening = pull + read. On a new machine, clone it first:
+
+    git clone https://github.com/pltrinh1122/dsys-store ~/workspace/dsys-store
+
+then `taxprep bus whoami` to confirm the resolved store dir
+(`taxprep config set store_dir <path>` or `TAXPREP_STORE_DIR` moves it).
 
 Who publishes what, on which topic:
 

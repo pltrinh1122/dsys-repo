@@ -245,19 +245,35 @@ claude mcp add taxprep -- /path/to/tax-prep/.venv/bin/taxprep mcp --data-dir /pa
 
 ## Message bus (multi-session collaboration)
 
-Sessions collaborate through a git-backed broadcast bus instead of
-hand-carried prompts: publishing writes a JSON file under
-`tax-prep/bus/<topic>/`, **broadcasting** is commit + push, listening
-is pull + read. Poll-scale latency (tens of seconds) fits build
-notifications and discrepancy reports. Listeners tune in by topic.
+Sessions collaborate through a broadcast bus instead of hand-carried
+prompts. **Two-repo topology:** dsys-repo is software (code, specs,
+tests); broadcast messages accrete to a separate repo,
+**dsys-store** (`https://github.com/pltrinh1122/dsys-store`), under
+`bus/<topic>/`. The code repo never carries message files.
+
+Publishing writes a JSON file under `<dsys-store>/bus/<topic>/`,
+**broadcasting** is commit + push of the store repo, listening is pull
++ read. Poll-scale latency (tens of seconds) fits build notifications
+and discrepancy reports. Listeners tune in by topic.
+
+On a new machine, clone the store repo first:
+
+```bash
+git clone https://github.com/pltrinh1122/dsys-store ~/workspace/dsys-store
+```
+
+Bus dir resolution: `--bus-dir` > `TAXPREP_BUS_DIR` >
+`<store>/bus`, where the store checkout resolves as `--store-dir` >
+`TAXPREP_STORE_DIR` > config `store_dir` > `~/workspace/dsys-store`.
+A missing store checkout fails fast with the clone command.
 
 ```bash
 .venv/bin/taxprep bus publish --topic tax-prep.ops --type run-done \
-    --payload '{"n_docs": 3}' [--correlation-id C]
+    --payload '{"n_docs": 3}' [--correlation-id C] [--store-dir D]
 .venv/bin/taxprep bus listen [--topic T]... [--timeout S] [--once] [--include-own]
 .venv/bin/taxprep bus topics
 .venv/bin/taxprep bus tune --topic tax-prep.build [--off]
-.venv/bin/taxprep bus whoami
+.venv/bin/taxprep bus whoami   # shows resolved store dir
 ```
 
 Well-known topics: `tax-prep.build` (architect → workstation/human:
@@ -266,11 +282,12 @@ architect/human: run completions, discrepancy shapes), `tax-prep.review`
 (human → all: decisions/approvals). Topics are otherwise free-form
 (lowercase alphanumerics, dots, dashes).
 
-- **Shapes only.** The repo is public, so `publish` hard-refuses
-  payloads matching SSN (`\d{3}-\d{2}-\d{4}`) or EIN (`\d{2}-\d{7}`)
-  patterns. Payloads carry ids, counts, enums, statuses — never values,
-  names, or amounts. This is the same blind-orchestrator guarantee as
-  the MCP boundary, enforced at the publish call.
+- **Shapes only.** `publish` hard-refuses payloads matching SSN
+  (`\d{3}-\d{2}-\d{4}`) or EIN (`\d{2}-\d{7}`) patterns, and the
+  blind-orchestrator rule applies end to end: payloads carry ids,
+  counts, enums, statuses — never values, names, or amounts. Enforced
+  at the publish call, so neither the repo nor any listening agent
+  ever sees PII.
 - **Session identity + echo tune-out.** Every message carries a unique
   broadcaster id (`<role>-<6 hex>`, e.g. `workstation-a1b2c3`,
   generated on first publish). Listeners exclude their own broadcasts
