@@ -40,6 +40,22 @@ python3 -m venv .venv
 
 # Mechanical verification (PII-free output for the blind orchestrator)
 .venv/bin/taxprep verify --data-dir ./data [--year 2024]
+
+# Relevance triage (labels only: relevant | irrelevant | needs_human)
+.venv/bin/taxprep relevance [--year 2024]
+
+# Gap analysis: transcript expectations vs ingested docs (+ local report)
+.venv/bin/taxprep gaps [--year 2024]
+
+# Machine-local config (set once; never committed)
+.venv/bin/taxprep config set source_dir ~/tax-docs
+.venv/bin/taxprep config show
+
+# Message bus: publish / listen / tune (broadcast = commit + push)
+.venv/bin/taxprep bus publish --topic tax-prep.ops --type run-done --payload '{"n_docs": 3}'
+.venv/bin/taxprep bus listen --once
+.venv/bin/taxprep bus tune --topic tax-prep.build
+.venv/bin/taxprep bus whoami
 ```
 
 `ingest` prints a summary table (counts by form × year) plus the list of
@@ -202,7 +218,15 @@ Tools (blind-orchestrator contract — see below):
 - `verify_completeness()` / `verify_validation_gate(tax_year?)` /
   `verify_lot_integrity(tax_year)` /
   `verify_transcript_reconciliation(tax_year)` / `verify_all(tax_year?)`
-  — mechanical checks; counts/ids/booleans only.
+  — mechanical checks; counts/ids/booleans only. `verify_all` also runs
+  `no_silent_drops` (every doc carries an explicit relevance verdict).
+- `bus_publish(topic, type, payload, correlation_id?)` — publish one
+  bus message; the PII guard (SSN/EIN patterns refused, shapes only)
+  is enforced here. Returns `{message_id, path, topic, from}`.
+- `bus_poll(topic?, timeout_seconds?)` — poll subscribed topics (local
+  tuning), always excluding this session's own broadcasts.
+- `assess_relevance(tax_year?)` — relevance triage; counts/id lists.
+- `analyze_gaps(tax_year?)` — gap shapes + local report path.
 
 There is deliberately **no** `validate_document` tool. Validation is
 human-only in the localhost review UI: an agent that cannot see
@@ -218,3 +242,95 @@ claude mcp add taxprep -- /path/to/tax-prep/.venv/bin/taxprep mcp --data-dir /pa
 ```
 
 `--data-dir` may also be supplied via the `TAXPREP_DATA_DIR` env var.
+
+## Message bus (multi-session collaboration)
+
+Sessions collaborate through a git-backed broadcast bus instead of
+hand-carried prompts: publishing writes a JSON file under
+`tax-prep/bus/<topic>/`, **broadcasting** is commit + push, listening
+is pull + read. Poll-scale latency (tens of seconds) fits build
+notifications and discrepancy reports. Listeners tune in by topic.
+
+```bash
+.venv/bin/taxprep bus publish --topic tax-prep.ops --type run-done \
+    --payload '{"n_docs": 3}' [--correlation-id C]
+.venv/bin/taxprep bus listen [--topic T]... [--timeout S] [--once] [--include-own]
+.venv/bin/taxprep bus topics
+.venv/bin/taxprep bus tune --topic tax-prep.build [--off]
+.venv/bin/taxprep bus whoami
+```
+
+Well-known topics: `tax-prep.build` (architect → workstation/human:
+code landed, pull and re-run), `tax-prep.ops` (workstation →
+architect/human: run completions, discrepancy shapes), `tax-prep.review`
+(human → all: decisions/approvals). Topics are otherwise free-form
+(lowercase alphanumerics, dots, dashes).
+
+- **Shapes only.** The repo is public, so `publish` hard-refuses
+  payloads matching SSN (`\d{3}-\d{2}-\d{4}`) or EIN (`\d{2}-\d{7}`)
+  patterns. Payloads carry ids, counts, enums, statuses — never values,
+  names, or amounts. This is the same blind-orchestrator guarantee as
+  the MCP boundary, enforced at the publish call.
+- **Session identity + echo tune-out.** Every message carries a unique
+  broadcaster id (`<role>-<6 hex>`, e.g. `workstation-a1b2c3`,
+  generated on first publish). Listeners exclude their own broadcasts
+  by default (`--include-own` opts back in).
+- **Local-only tuning (never committed).** Session id, subscribed
+  topics, and poll interval live in `~/.config/taxprep/bus.toml`
+  (`XDG_CONFIG_HOME` respected); the listen cursor in
+  `~/.config/taxprep/bus_cursor.json`, keyed by session id inside the
+  file so N listeners on one machine each keep an independent position
+  and every broadcast reaches every listener. The repo carries
+  messages, never listener state.
+
+MCP tools: `bus_publish(topic, type, payload, correlation_id?)` →
+`{message_id, path, topic, from}`; `bus_poll(topic?, timeout_seconds?)`
+→ `{messages, warnings, topics}` honoring the local tuning
+(subscribed topics, echo exclusion). `timeout_seconds=0` (default) is a
+single pass; positive values long-poll up to 300s.
+
+## Local workstation config
+
+Machine-local paths are set once, not passed per command:
+
+```bash
+.venv/bin/taxprep config set source_dir ~/tax-documents
+.venv/bin/taxprep config set data_dir ~/.local/share/taxprep
+.venv/bin/taxprep config set scope_years 2023,2024,2025,2026
+.venv/bin/taxprep config show
+```
+
+Resolution order per key: CLI flag > env var (`TAXPREP_SOURCE_DIR`,
+`TAXPREP_DATA_DIR`, `TAXPREP_SCOPE_YEARS`) > `~/.config/taxprep/config.toml`
+> built-in default. The config file lives outside the repo and is
+never committed. `taxprep ingest` with no directory argument uses the
+configured `source_dir`; `--data-dir` still overrides everywhere.
+
+## Relevance & gap intelligence
+
+`taxprep relevance` triages every document into
+**relevant | irrelevant | needs_human** with deterministic,
+metadata-only rules: tax year outside the configured scope →
+`irrelevant` (`year_out_of_scope`); byte-identical OCR (sha256) →
+`irrelevant` (`duplicate_of:<doc_id>`, first kept); unclassified form
+→ `needs_human` (never auto-dropped). Anything ambiguous lands in
+`needs_human` — the human, not the agent, is the arbiter. Verdicts are
+labels persisted on the document (`Document.relevance`, default
+`unassessed`); nothing is ever deleted. `verify_no_silent_drops`
+(fails until every doc carries a verdict) is wired into `verify_all`,
+so the triage can never be silently skipped.
+
+`taxprep gaps` cross-checks the IRS wage & income transcript against
+ingested documents per year: expected form types come from transcript
+payer blocks plus schedule mentions in the return transcript
+(Schedule D → 1099-B, B → 1099-INT/DIV, C → 1099-NEC/MISC); missing =
+expected forms with zero ingested docs that year. The CLI/MCP return
+value is PII-free (form types, counts, report path); per-payer detail
+(names → missing forms) goes only to `data/reports/gaps_*.txt` for the
+operator's eyes. A year with no parsed transcript reports
+`expected_forms=[]` — no ground truth, never a false all-clear.
+
+MCP tools: `assess_relevance(tax_year?)` → `{n_docs, counts,
+relevant_ids, irrelevant, needs_human}`; `analyze_gaps(tax_year?)` →
+per-year shapes + `report_path`. Both are covered by the recursive
+PII sweep in `tests/test_mcp_server.py`.

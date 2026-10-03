@@ -9,8 +9,9 @@ Two sessions share this repo. This file is the contract between them.
   asks for, or receives real taxpayer documents, SSNs, or account numbers.
 - **Workstation session** (Claude Code on Peter's Linux workstation):
   operates the agent against the **real** ~100 documents locally: runs
-  `ingest`, drives the `review` UI, runs `carryforward`, and reports
-  discrepancies back through Peter.
+  `ingest`, drives the `review` UI, runs `carryforward`, and publishes
+  completions and discrepancy reports to the message bus
+  (`tax-prep.ops` topic) — no longer hand-carried through Peter.
 
 ## The golden rule
 
@@ -47,6 +48,30 @@ amounts, no names, no EINs, no addresses. Concretely:
   `TAXPREP_BLIND=1` exported, which redacts field values in
   `taxprep show`. The MCP tool boundary is the primary guarantee; the
   env flag is the backstop.
+
+## The bus replaces hand-carried prompts
+
+The Architect and Workstation sessions no longer relay through Peter.
+They publish to the git-backed broadcast bus (`tax-prep/bus/<topic>/`;
+see README "Message bus"). Broadcast = commit + push; listening = pull
++ read.
+
+Who publishes what, on which topic:
+
+- **Architect → `tax-prep.build`**: code landed. Payload shape:
+  `{commit, branch, summary, n_tests}` — "pull `build/half1` and
+  re-run `taxprep verify`". Nothing PII-bearing is ever in a payload;
+  the publish-side PII guard refuses SSN/EIN patterns.
+- **Workstation → `tax-prep.ops`**: run completions and discrepancy
+  reports. Payload shapes: `{check, passed, failed_ids, n_failed}`,
+  `{stage, n_docs, needs_review_ids}` — shapes, never values.
+- **Human (Peter) → `tax-prep.review`**: decisions and approvals,
+  e.g. `{decision: "ratified", subject}`.
+
+Each session tunes in locally (`taxprep bus tune`, `bus whoami`):
+session identity, subscriptions, and the listen cursor live in
+`~/.config/taxprep/` and are never committed. A session never hears
+its own broadcast echo (tuned out by broadcaster id).
 
 ## Branch discipline
 

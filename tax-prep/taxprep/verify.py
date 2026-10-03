@@ -330,10 +330,33 @@ def verify_carryforward_ready(store, year: int) -> dict:
     return {"passed": True, "reason": "ready"}
 
 
+def verify_no_silent_drops(store) -> dict:
+    """Every ingested document carries an explicit relevance verdict.
+
+    The relevance triage never deletes anything, so the mechanical
+    counterpart is: no document may sit unassessed. A FAILED check
+    means "run `taxprep relevance`", not "something is wrong".
+    """
+    docs = store.list()
+    unassessed_ids = sorted(
+        d.doc_id for d in docs
+        if getattr(d, "relevance", "unassessed") == "unassessed")
+    return {
+        "passed": not unassessed_ids,
+        "n_docs": len(docs),
+        "n_unassessed": len(unassessed_ids),
+        "unassessed_ids": unassessed_ids,
+    }
+
+
 def verify_all(store, year: int | None = None) -> dict:
     """Run every check. With year=None, per-year checks run for each year
-    present in the store (keyed "name:year"); completeness is global."""
-    checks: dict[str, dict] = {"completeness": verify_completeness(store)}
+    present in the store (keyed "name:year"); completeness and
+    no_silent_drops are global."""
+    checks: dict[str, dict] = {
+        "completeness": verify_completeness(store),
+        "no_silent_drops": verify_no_silent_drops(store),
+    }
     if year is not None:
         years = [year]
         keyed = False

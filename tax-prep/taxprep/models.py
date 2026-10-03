@@ -27,6 +27,8 @@ FORM_TYPES = [
 
 STATUSES = ("transcribed", "needs_review", "validated")
 
+RELEVANCE_VERDICTS = ("unassessed", "relevant", "irrelevant", "needs_human")
+
 
 @dataclass
 class Document:
@@ -38,12 +40,15 @@ class Document:
     fields: dict = field(default_factory=dict)
     status: str = "needs_review"
     validated_at: str | None = None
+    relevance: str = "unassessed"
 
     def __post_init__(self) -> None:
         if self.form_type not in FORM_TYPES:
             raise ValueError(f"unknown form_type: {self.form_type!r}")
         if self.status not in STATUSES:
             raise ValueError(f"unknown status: {self.status!r}")
+        if self.relevance not in RELEVANCE_VERDICTS:
+            raise ValueError(f"unknown relevance: {self.relevance!r}")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -59,4 +64,5 @@ class Document:
             fields=d.get("fields", {}),
             status=d.get("status", "needs_review"),
             validated_at=d.get("validated_at"),
+            relevance=d.get("relevance", "unassessed"),
         )

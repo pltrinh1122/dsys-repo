@@ -1,0 +1,482 @@
+"""Git-backed broadcast message bus for multi-session collaboration.
+
+Transport is the git repo itself: publishing writes a JSON file,
+broadcasting is commit + push (the existing flow), listening is
+``git pull`` + read. Poll-scale latency (tens of seconds) fits build
+notifications and discrepancy reports.
+
+Broadcast model: listeners tune in by topic. Topic names are
+lowercase alphanumerics, dots and dashes only.
+
+Well-known topics (free-form otherwise):
+    tax-prep.build    architect -> workstation/human: code landed, pull and re-run
+    tax-prep.ops      workstation -> architect/human: run completions, discrepancy shapes
+    tax-prep.review   human -> all: decisions / approvals
+
+PII RULE (hard): the repo carrying the bus is PUBLIC. Payloads are
+shapes only -- ids, counts, enums, status strings. Never values,
+names, EINs, SSNs, dollar amounts. ``publish`` refuses payloads
+matching SSN/EIN patterns.
+
+SESSION IDENTITY: every message carries a unique per-session-instance
+id in ``from``: ``<role>-<6 hex>`` (e.g. ``workstation-a1b2c3``).
+``publish`` defaults ``from_id`` to the tuned session id from the
+local tuning config, generating and persisting one (role from
+TAXPREP_SESSION_ID env, else "session") when none exists yet.
+Listeners tune OUT their own broadcasts: pass your own session id as
+``exclude_from`` to ``list_messages``/``poll_once`` so a session never
+hears its own echo. (The later ``taxprep bus listen`` wiring will
+default this to the tuned session id with an opt-out flag.)
+
+LOCAL-ONLY STATE: per-session tuning (session id, which topics a
+session listens to, poll interval) lives in
+``~/.config/taxprep/bus.toml`` (``XDG_CONFIG_HOME`` respected) and
+the listen cursor in ``~/.config/taxprep/bus_cursor.json``. The cursor
+file is keyed by session id inside -- ``{"sessions": {sid: {topic:
+last_msg_id}}}`` -- so N listeners on one machine each keep an
+independent position. Neither file is ever committed -- the repo
+carries messages, never listener state.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import subprocess
+import tomllib
+from datetime import datetime, timezone
+from pathlib import Path
+
+# -- topic validation ------------------------------------------------
+
+_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]*$")
+
+
+def _check_topic(topic: str) -> str:
+    if not isinstance(topic, str) or not _TOPIC_RE.match(topic):
+        raise ValueError(
+            f"invalid topic {topic!r}: lowercase alphanumerics, dots and "
+            "dashes only, must start with an alphanumeric"
+        )
+    return topic
+
+
+# -- PII guard --------------------------------------------------------
+
+_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_EIN_RE = re.compile(r"\b\d{2}-\d{7}\b")
+
+
+def _check_no_pii(serialized: str) -> None:
+    if _SSN_RE.search(serialized):
+        raise ValueError(
+            "payload refused: matches SSN pattern (\\d{3}-\\d{2}-\\d{4}); "
+            "the bus carries shapes only, never PII"
+        )
+    if _EIN_RE.search(serialized):
+        raise ValueError(
+            "payload refused: matches EIN pattern (\\d{2}-\\d{7}); "
+            "the bus carries shapes only, never PII"
+        )
+
+
+# -- path resolution ---------------------------------------------------
+
+def _find_repo_root() -> Path | None:
+    """Walk up from this module looking for a ``tax-prep`` dir with pyproject.toml."""
+    here = Path(__file__).resolve()
+    for parent in [here.parent, *here.parent.parents]:
+        if (parent / "tax-prep" / "pyproject.toml").is_file():
+            return parent
+        if parent.name == "tax-prep" and (parent / "pyproject.toml").is_file():
+            return parent.parent
+    return None
+
+
+def resolve_bus_dir(bus_dir: str | Path | None = None) -> Path:
+    """bus_dir param -> TAXPREP_BUS_DIR env -> <repo>/tax-prep/bus."""
+    if bus_dir is not None:
+        return Path(bus_dir)
+    env = os.environ.get("TAXPREP_BUS_DIR")
+    if env:
+        return Path(env)
+    root = _find_repo_root()
+    if root is None:
+        raise FileNotFoundError(
+            "cannot resolve bus dir: set bus_dir or TAXPREP_BUS_DIR "
+            "(no tax-prep repo found above this module)"
+        )
+    taxprep_dir = root / "tax-prep" if (root / "tax-prep").is_dir() else root
+    return taxprep_dir / "bus"
+
+
+def _config_dir() -> Path:
+    """Local-only config dir. Never inside the git repo."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "taxprep"
+
+
+def default_cursor_path() -> Path:
+    return _config_dir() / "bus_cursor.json"
+
+
+def default_tuning_path() -> Path:
+    return _config_dir() / "bus.toml"
+
+
+# -- publish / list ----------------------------------------------------
+
+_SESSION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]*-[0-9a-f]{6}$")
+
+
+def _sanitize_role(role: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9-]", "", role.strip().lower())
+    return cleaned or "session"
+
+
+def _default_session_id(tuning_path: str | Path | None = None) -> str:
+    """Tuned session id, generating (<role>-<6 hex>) and persisting it first.
+
+    A tuned id is reused only if it already has the <role>-<6 hex>
+    shape; a bare TAXPREP_SESSION_ID value is treated as the *role*,
+    not the id.
+    """
+    tuning = load_tuning(tuning_path)
+    sid = tuning.get("session", {}).get("id", "")
+    if sid and _SESSION_ID_RE.match(sid):
+        return sid
+    role = _sanitize_role(sid or os.environ.get("TAXPREP_SESSION_ID", ""))
+    new_id = f"{role}-{secrets.token_hex(3)}"
+    set_session_id(new_id, tuning_path)
+    return new_id
+
+_REQUIRED_FIELDS = ("id", "ts", "from", "topic", "type", "payload")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def publish(
+    topic: str,
+    msg_type: str,
+    payload: dict,
+    from_id: str | None = None,
+    correlation_id: str | None = None,
+    bus_dir: str | Path | None = None,
+    tuning_path: str | Path | None = None,
+) -> Path:
+    """Write one message file to the bus. Returns the file path.
+
+    Payload must be a JSON-serializable dict (TypeError otherwise) and
+    must not match SSN/EIN patterns (ValueError otherwise).
+
+    ``from_id`` defaults to the tuned session id from the local tuning
+    config; when the config has no session id yet, one is generated
+    (``<role>-<6 hex>``, role from TAXPREP_SESSION_ID env else
+    "session") and persisted via the tuning save path. NOTE: this makes
+    publish write the tuning file on first use.
+    """
+    _check_topic(topic)
+    if from_id is None:
+        from_id = _default_session_id(tuning_path)
+    if not isinstance(from_id, str) or not from_id:
+        raise ValueError("from_id must be a non-empty string")
+    if not isinstance(msg_type, str) or not msg_type:
+        raise ValueError("msg_type must be a non-empty string")
+    if not isinstance(payload, dict):
+        raise TypeError(
+            f"payload must be a dict, got {type(payload).__name__}"
+        )
+    try:
+        serialized = json.dumps(payload, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"payload is not JSON-serializable: {exc}") from exc
+    _check_no_pii(serialized)
+
+    now = _utc_now()
+    msg_id = f"msg_{secrets.token_hex(6)}"
+    message = {
+        "id": msg_id,
+        "ts": now.isoformat(),
+        "from": from_id,
+        "topic": topic,
+        "type": msg_type,
+        "correlation_id": correlation_id,
+        "payload": json.loads(serialized),
+    }
+    topic_dir = resolve_bus_dir(bus_dir) / topic
+    topic_dir.mkdir(parents=True, exist_ok=True)
+    fname = f"{now.strftime('%Y%m%dT%H%M%S%f')}-{msg_id}.json"
+    path = topic_dir / fname
+    # Never write outside the resolved bus dir (topic names cannot
+    # contain '/', but belt-and-braces against traversal).
+    if path.resolve().parent != topic_dir.resolve():
+        raise ValueError(f"refusing to write outside bus dir: {path}")
+    path.write_text(json.dumps(message, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _read_message(path: Path) -> dict | None:
+    """Parse one message file; None if invalid (torn write mid-pull)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if any(f not in data for f in _REQUIRED_FIELDS):
+        return None
+    return data
+
+
+def list_messages(
+    topic: str,
+    since_id: str | None = None,
+    bus_dir: str | Path | None = None,
+    exclude_from: str | None = None,
+) -> list[dict]:
+    """All messages in a topic, sorted by (ts, id).
+
+    ``since_id`` keeps strictly newer messages (unknown id -> everything,
+    i.e. catch up). ``exclude_from`` skips messages whose ``from`` equals
+    it -- listeners pass their own session id so a session never hears
+    its own broadcast echo.
+    """
+    _check_topic(topic)
+    topic_dir = resolve_bus_dir(bus_dir) / topic
+    messages: list[dict] = []
+    if topic_dir.is_dir():
+        for path in sorted(topic_dir.glob("*.json")):
+            msg = _read_message(path)
+            if msg is not None:
+                messages.append(msg)
+    messages.sort(key=lambda m: (m["ts"], m["id"]))
+    if since_id is not None:
+        ids = [m["id"] for m in messages]
+        if since_id in ids:
+            messages = messages[ids.index(since_id) + 1 :]
+        # unknown cursor -> return everything (catch up)
+    if exclude_from is not None:
+        messages = [m for m in messages if m.get("from") != exclude_from]
+    return messages
+
+
+def topics(bus_dir: str | Path | None = None) -> list[str]:
+    """Topic names with at least one message file."""
+    root = resolve_bus_dir(bus_dir)
+    if not root.is_dir():
+        return []
+    return sorted(
+        d.name for d in root.iterdir() if d.is_dir() and _TOPIC_RE.match(d.name)
+    )
+
+
+# -- listen ------------------------------------------------------------
+
+
+class _PollResult(list):
+    """list[dict] of new messages, with a .warnings list attached."""
+
+    def __init__(self, messages: list[dict], warnings: list[str] | None = None):
+        super().__init__(messages)
+        self.warnings: list[str] = warnings or []
+
+
+def _load_cursor(cursor_path: Path) -> dict:
+    try:
+        data = json.loads(cursor_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_cursor(cursor_path: Path, cursor: dict) -> None:
+    cursor_path.parent.mkdir(parents=True, exist_ok=True)
+    cursor_path.write_text(json.dumps(cursor, indent=2) + "\n", encoding="utf-8")
+
+
+def poll_once(
+    topic: str,
+    repo_dir: str | Path,
+    bus_dir: str | Path | None = None,
+    cursor_path: str | Path | None = None,
+    do_pull: bool = True,
+    exclude_from: str | None = None,
+    tuning_path: str | Path | None = None,
+) -> _PollResult:
+    """Pull (unless do_pull=False), then return messages newer than the cursor.
+
+    The cursor lives at cursor_path (default
+    ~/.config/taxprep/bus_cursor.json, never committed) and is keyed by
+    session id inside the file::
+
+        {"sessions": {"<session-id>": {"<topic>": "<last-msg-id>"}}}
+
+    so N listeners on one machine each hold an independent position and
+    every broadcast reaches every listener. The active session id comes
+    from the tuning config -- the same source ``publish`` uses, generating
+    and persisting one on first use. A legacy flat-format cursor file
+    (no "sessions" key) is treated as unknown: the session starts at the
+    beginning (catch-up), same as today's unknown-cursor behavior. The
+    cursor advances to the newest *delivered* message id; other sessions'
+    sections are untouched. A failed ``git pull --ff-only`` records a
+    warning in the result instead of crashing -- offline work still
+    reads local messages.
+
+    ``exclude_from`` skips messages whose ``from`` equals it (pass your
+    own session id to tune out your own broadcast echo); excluded
+    messages do not advance the cursor.
+    """
+    _check_topic(topic)
+    warnings: list[str] = []
+    if do_pull:
+        try:
+            subprocess.run(
+                ["git", "pull", "--ff-only"],
+                cwd=str(repo_dir),
+                capture_output=True,
+                timeout=60,
+                check=True,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            warnings.append(f"git pull --ff-only failed in {repo_dir}: {exc}")
+
+    session_id = _default_session_id(tuning_path)
+    cpath = Path(cursor_path) if cursor_path is not None else default_cursor_path()
+    raw = _load_cursor(cpath)
+    sessions = raw.get("sessions")
+    if not isinstance(sessions, dict):
+        sessions = {}
+    mine = sessions.get(session_id)
+    if not isinstance(mine, dict):
+        mine = {}
+    messages = list_messages(
+        topic, since_id=mine.get(topic), bus_dir=bus_dir,
+        exclude_from=exclude_from,
+    )
+    if messages:
+        mine[topic] = messages[-1]["id"]
+        sessions[session_id] = mine
+        _save_cursor(cpath, {"sessions": sessions})
+    return _PollResult(messages, warnings)
+
+
+# -- per-session tuning (local-only, never committed) -------------------
+
+_DEFAULT_TUNING = {
+    "session": {"id": ""},
+    "tuning": {"topics": ["*"], "poll_interval_seconds": 30},
+    "paths": {},
+}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    out = dict(base)
+    for key, value in override.items():
+        if (
+            key in out
+            and isinstance(out[key], dict)
+            and isinstance(value, dict)
+        ):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_tuning(path: str | Path | None = None) -> dict:
+    """Read tuning TOML; missing file -> defaults. Merges file over defaults."""
+    p = Path(path) if path is not None else default_tuning_path()
+    tuning = json.loads(json.dumps(_DEFAULT_TUNING))  # deep copy
+    tuning["session"]["id"] = os.environ.get("TAXPREP_SESSION_ID", "")
+    if not p.is_file():
+        return tuning
+    with p.open("rb") as fh:
+        data = tomllib.load(fh)
+    if not isinstance(data, dict):
+        return tuning
+    return _deep_merge(tuning, data)
+
+
+def _toml_str(value: str) -> str:
+    # JSON string escaping is valid TOML basic-string escaping for our values.
+    return json.dumps(value)
+
+
+def _write_tuning_toml(tuning: dict, path: Path) -> None:
+    session = tuning.get("session", {}) or {}
+    tune = tuning.get("tuning", {}) or {}
+    paths = tuning.get("paths", {}) or {}
+    lines = ["[session]"]
+    lines.append(f"id = {_toml_str(str(session.get('id', '')))}")
+    lines.append("")
+    lines.append("[tuning]")
+    topics = tune.get("topics", ["*"])
+    lines.append(
+        "topics = [" + ", ".join(_toml_str(str(t)) for t in topics) + "]"
+    )
+    lines.append(f"poll_interval_seconds = {int(tune.get('poll_interval_seconds', 30))}")
+    lines.append("")
+    lines.append("[paths]")
+    for key, value in paths.items():
+        lines.append(f"{key} = {_toml_str(str(value))}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def save_tuning(tuning: dict, path: str | Path | None = None) -> Path:
+    """Write tuning TOML, creating parent dirs. Returns the path."""
+    p = Path(path) if path is not None else default_tuning_path()
+    _write_tuning_toml(tuning, p)
+    return p
+
+
+def subscribe(topic: str, path: str | Path | None = None) -> dict:
+    """Tune into a topic. No-op while tuned to '*' (already everything)."""
+    _check_topic(topic)
+    tuning = load_tuning(path)
+    topics_list = tuning["tuning"]["topics"]
+    if topics_list != ["*"] and topic not in topics_list:
+        tuning["tuning"]["topics"] = sorted([*topics_list, topic])
+        save_tuning(tuning, path)
+    return tuning
+
+
+def unsubscribe(topic: str, path: str | Path | None = None) -> dict:
+    """Tune out of a topic. '*' expands to the explicit bus topic list first."""
+    _check_topic(topic)
+    tuning = load_tuning(path)
+    topics_list = tuning["tuning"]["topics"]
+    if topics_list == ["*"]:
+        try:
+            explicit = topics()
+        except FileNotFoundError:
+            explicit = []
+        topics_list = sorted(explicit)
+    tuning["tuning"]["topics"] = [t for t in topics_list if t != topic]
+    save_tuning(tuning, path)
+    return tuning
+
+
+def set_session_id(sid: str, path: str | Path | None = None) -> dict:
+    tuning = load_tuning(path)
+    tuning["session"]["id"] = sid
+    save_tuning(tuning, path)
+    return tuning
+
+
+def subscribed_topics(
+    tuning: dict, bus_dir: str | Path | None = None
+) -> list[str]:
+    """Resolve '*' against topics actually present in the bus dir."""
+    topics_list = tuning.get("tuning", {}).get("topics", ["*"])
+    if topics_list == ["*"]:
+        try:
+            return topics(bus_dir=bus_dir)
+        except FileNotFoundError:
+            return []
+    return list(topics_list)

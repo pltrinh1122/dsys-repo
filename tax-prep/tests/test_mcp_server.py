@@ -30,6 +30,10 @@ EXPECTED_TOOLS = {
     "verify_lot_integrity",
     "verify_transcript_reconciliation",
     "verify_all",
+    "bus_publish",
+    "bus_poll",
+    "assess_relevance",
+    "analyze_gaps",
 }
 
 
@@ -82,7 +86,7 @@ def _pii_free(obj):
         assert not re.search(r"\$\d", obj), f"money leaked: {obj[:60]!r}"
 
 
-def test_all_ten_tools_registered():
+def test_all_fourteen_tools_registered():
     async def names():
         return {t.name for t in await mcp.list_tools()}
 
@@ -242,8 +246,12 @@ def test_verify_tools_registered_and_pii_free(tmp_path):
         _pii_free(out)
 
 
-def test_pii_sweep_all_tools(tmp_path):
+def test_pii_sweep_all_tools(tmp_path, monkeypatch):
     """Every tool's output, recursively: no value/raw_text keys, no $N."""
+    # isolate bus side effects (tuning file, bus dir) from the real home
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("TAXPREP_BUS_DIR", str(tmp_path / "bus"))
+    monkeypatch.delenv("TAXPREP_SESSION_ID", raising=False)
     store = _store_with(tmp_path, [
         _doc("w2-a", 2024, "W-2",
              {"1": _field("$85,000.00", "high", "Box 1 $85,000.00"),
@@ -263,7 +271,69 @@ def test_pii_sweep_all_tools(tmp_path):
         mcp_server.verify_transcript_reconciliation(tax_year=2024,
                                                     data_dir=dd),
         mcp_server.verify_all(tax_year=2024, data_dir=dd),
+        mcp_server.bus_publish(topic="tax-prep.ops", type="run-done",
+                               payload={"n_docs": 2, "status": "ok"}),
+        mcp_server.bus_poll(topic="tax-prep.ops"),
+        mcp_server.assess_relevance(data_dir=dd),
+        mcp_server.analyze_gaps(tax_year=2024, data_dir=dd),
     ]
     for out in outputs:
         json.dumps(out)
         _pii_free(out)
+
+
+def test_new_mcp_tools_shapes(tmp_path, monkeypatch):
+    """bus_publish / bus_poll / assess_relevance / analyze_gaps behavior."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("TAXPREP_BUS_DIR", str(tmp_path / "bus"))
+    monkeypatch.delenv("TAXPREP_SESSION_ID", raising=False)
+    store = _store_with(tmp_path, [
+        _doc("w2-a", 2024, "W-2",
+             {"1": _field("$85,000.00", "high", "Box 1 $85,000.00")},
+             "validated"),
+    ])
+    dd = str(store.data_dir)
+
+    pub = mcp_server.bus_publish(topic="tax-prep.ops", type="run-done",
+                                 payload={"n_docs": 1},
+                                 correlation_id="corr-1")
+    assert set(pub) == {"message_id", "path", "topic", "from"}
+    assert pub["message_id"].startswith("msg_")
+    assert Path(pub["path"]).is_file()
+    json.dumps(pub)
+    _pii_free(pub)
+
+    # the publishing session's own broadcast is tuned out of its poll
+    polled = mcp_server.bus_poll(topic="tax-prep.ops")
+    assert polled["messages"] == [] and polled["topics"] == ["tax-prep.ops"]
+    # another session's message IS delivered
+    from taxprep import bus as _bus
+    _bus.publish("tax-prep.ops", "run-done", {"n_docs": 5},
+                 from_id="workstation-abcdef")
+    polled2 = mcp_server.bus_poll(topic="tax-prep.ops")
+    assert len(polled2["messages"]) == 1
+    assert polled2["messages"][0]["from"] == "workstation-abcdef"
+    assert polled2["messages"][0]["payload"] == {"n_docs": 5}
+    _pii_free(polled2)
+
+    # payload PII guard is the enforcement point
+    with pytest.raises(ValueError, match="refused"):
+        mcp_server.bus_publish(topic="t", type="x",
+                               payload={"note": "12-3456789"})
+    with pytest.raises(TypeError):
+        mcp_server.bus_publish(topic="t", type="x", payload=["nope"])
+
+    rel = mcp_server.assess_relevance(tax_year=2024, data_dir=dd)
+    assert rel["counts"] == {"relevant": 1, "irrelevant": 0, "needs_human": 0}
+    assert rel["relevant_ids"] == ["w2-a"]
+    # persisted as a label on the document
+    assert DocumentStore(store.data_dir).get("w2-a").relevance == "relevant"
+    json.dumps(rel)
+    _pii_free(rel)
+
+    gaps = mcp_server.analyze_gaps(tax_year=2024, data_dir=dd)
+    assert gaps["2024"]["has_transcript"] is False
+    assert gaps["2024"]["expected_forms"] == []
+    assert Path(gaps["report_path"]).is_file()
+    json.dumps(gaps)
+    _pii_free(gaps)

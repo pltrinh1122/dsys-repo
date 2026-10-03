@@ -40,7 +40,6 @@ real taxpayer material only ever on the operator's own machine, and
 
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime
 from decimal import Decimal
@@ -52,8 +51,6 @@ from .ingest import ingest_dir
 from .store import DocumentStore
 
 mcp = FastMCP("taxprep")
-
-PACKAGE_DEFAULT_DATA_DIR = str(Path(__file__).resolve().parent.parent / "data")
 
 # Transcript field codes embed the payer name: "payer1.ACME CORP.1".
 # Redact the name segment so PII never leaks through a key.
@@ -94,9 +91,18 @@ def _scrub_doc(doc_dict: dict) -> dict:
 
 
 def _store(data_dir: str | None) -> DocumentStore:
-    """Resolve the data dir: explicit arg -> TAXPREP_DATA_DIR env -> package default."""
-    return DocumentStore(data_dir or os.environ.get("TAXPREP_DATA_DIR")
-                         or PACKAGE_DEFAULT_DATA_DIR)
+    """Resolve the data dir: explicit arg -> TAXPREP_DATA_DIR env ->
+    config file -> package default."""
+    from . import config as _cfg
+    return DocumentStore(_cfg.resolve("data_dir", cli_value=data_dir))
+
+
+def _git_root(start: str | Path) -> Path | None:
+    p = Path(start).resolve()
+    for parent in (p, *p.parents):
+        if (parent / ".git").exists():
+            return parent
+    return None
 
 
 def _jsonable(v):
@@ -347,3 +353,117 @@ def verify_all(tax_year: int | None = None,
     all PII-free."""
     from .verify import verify_all as _v
     return _jsonable(_v(_store(data_dir), tax_year))
+
+
+# -- message bus tools (blind-orchestrator safe) ------------------------
+
+
+@mcp.tool()
+def bus_publish(topic: str, type: str, payload: dict,
+                correlation_id: str | None = None) -> dict:
+    """Publish one message to the git-backed broadcast bus. Broadcasting
+    itself is commit + push of the bus/ directory (the session's job
+    after this call).
+
+    Payloads go through bus.publish's PII guard -- SSN/EIN patterns are
+    refused, and the shapes-only rule applies: ids, counts, statuses,
+    never values or names. Returns {message_id, path, topic, from}."""
+    import json as _json
+    from . import bus as _bus
+    if not isinstance(payload, dict):
+        raise TypeError("payload must be a JSON object (dict)")
+    path = _bus.publish(topic, type, payload, correlation_id=correlation_id)
+    msg = _json.loads(path.read_text(encoding="utf-8"))
+    return _jsonable({
+        "message_id": msg["id"],
+        "path": str(path),
+        "topic": msg["topic"],
+        "from": msg["from"],
+    })
+
+
+@mcp.tool()
+def bus_poll(topic: str | None = None, timeout_seconds: float = 0) -> dict:
+    """Poll the broadcast bus for new messages.
+
+    With no topic, polls this session's subscribed topics (local tuning).
+    This session's own broadcasts are always excluded (tune-out). A
+    failed git pull records a warning instead of failing -- offline
+    work still reads local messages.
+
+    timeout_seconds=0 (default): single pass, return immediately.
+    timeout_seconds>0: keep polling until the timeout (capped at 300s).
+    Returns {messages, warnings, topics}. Messages are full message
+    dicts -- their payloads are shapes-only by the publish-side guard."""
+    import time as _time
+    from . import bus as _bus
+
+    tuning = _bus.load_tuning()
+    topics = [topic] if topic else _bus.subscribed_topics(tuning)
+    exclude = tuning["session"]["id"] or None
+    bus_dir = _bus.resolve_bus_dir()
+    repo = _git_root(bus_dir)
+    interval = int(tuning["tuning"].get("poll_interval_seconds", 30))
+    timeout = max(0.0, min(float(timeout_seconds), 300.0))
+
+    messages: list = []
+    warnings: list = []
+    start = _time.monotonic()
+    first_pass = True
+    while True:
+        for i, t in enumerate(topics):
+            result = _bus.poll_once(
+                t, repo or bus_dir, bus_dir=bus_dir,
+                do_pull=repo is not None and i == 0,  # one pull per pass
+                exclude_from=exclude)
+            messages.extend(result)
+            warnings.extend(result.warnings)
+        if not first_pass or (_time.monotonic() - start) >= timeout:
+            break
+        first_pass = False
+        _time.sleep(min(interval, max(1, timeout - (_time.monotonic() - start))))
+    return _jsonable({"messages": messages, "warnings": warnings,
+                      "topics": topics})
+
+
+# -- relevance + gap intelligence (blind-orchestrator safe) -------------
+
+
+@mcp.tool()
+def assess_relevance(tax_year: int | None = None,
+                     data_dir: str | None = None) -> dict:
+    """Triage documents: relevant | irrelevant | needs_human.
+
+    Deterministic metadata-only rules: year outside the configured
+    scope -> irrelevant; byte-identical OCR duplicate -> irrelevant
+    (first kept); unclassified form -> needs_human (never auto-dropped).
+    Verdicts are persisted as labels on the documents; nothing is
+    deleted. Returns counts and id lists -- no PII."""
+    from . import config as _cfg
+    from .relevance import assess_relevance as _a, summarize as _s
+
+    store = _store(data_dir)
+    scope = _cfg.resolve("scope_years")
+    docs = store.list(year=tax_year) if tax_year is not None else None
+    verdicts = _a(store, scope, docs=docs, persist=True)
+    return _jsonable(_s(verdicts))
+
+
+@mcp.tool()
+def analyze_gaps(tax_year: int | None = None,
+                 data_dir: str | None = None) -> dict:
+    """Gap analysis: IRS wage & income transcript expectations vs
+    ingested documents, per year.
+
+    Returns PII-free shapes: {year: {expected_forms, missing_forms,
+    n_transcript_payers, n_document_payers, transcript_forms,
+    schedules_seen, n_docs, has_transcript}, report_path}. Per-payer
+    detail (names) goes ONLY to the local report file for the
+    operator's eyes. A year with no parsed transcript reports
+    expected_forms=[] -- no ground truth, never a false all-clear."""
+    from . import config as _cfg
+    from .gaps import analyze_gaps as _g
+
+    store = _store(data_dir)
+    scope = _cfg.resolve("scope_years")
+    return _jsonable(_g(store, scope, year=tax_year))

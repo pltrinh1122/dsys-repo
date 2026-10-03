@@ -286,8 +286,9 @@ def test_verify_all_year_scoping(tmp_path):
         _doc("w2", 2023, "W-2", {"1": _field(1)}, "transcribed"),
     ])
     r = V.verify_all(store, 2024)
-    assert set(r["checks"]) == {"completeness", "validation_gate",
-                                "lot_integrity", "transcript_reconciliation",
+    assert set(r["checks"]) == {"completeness", "no_silent_drops",
+                                "validation_gate", "lot_integrity",
+                                "transcript_reconciliation",
                                 "carryforward_ready"}
     assert r["checks"]["validation_gate"]["passed"] is True
     assert r["passed"] is False  # reconciliation: no transcript doc
