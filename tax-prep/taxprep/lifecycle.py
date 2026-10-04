@@ -138,6 +138,18 @@ TERMINAL_STATES = frozenset({EXCLUDED, ORPHANED})
 # operator-visible exactly as they were as needs_review.
 UNVALIDATED_EXTRACTED = frozenset({TRANSCRIBED, NEEDS_REVIEW, ERRORED})
 
+# Machine exclude-reason codes: status_reason values the machine may set
+# on an exclude transition (operator-driven, never silent). They join the
+# EXISTING status_reason taxonomy ("operator-excluded", "source-missing",
+# "extraction-disagrees", ...) rather than a parallel mechanism. Free-text
+# operator reasons keep the standing "operator-excluded" code, with the
+# operator's own words in the exclusions record.
+MACHINE_EXCLUDE_REASONS = frozenset({
+    # R21a: per-person scope filter -- the document's owner is outside the
+    # Operator's declared scope. The document is never deleted.
+    "out-of-scope-person",
+})
+
 # Events.
 SCAN = "scan"
 SELECT = "select"
@@ -458,7 +470,13 @@ def _apply_effects(doc: Document, event: str, to_state: str,
     elif to_state == EXCLUDED:
         # The operator's free-text reason lives in the exclusions
         # record (local data dir); the doc carries the stable code.
-        doc.status_reason = "operator-excluded"
+        # Machine reason codes (R21a scope filter) carry their own
+        # stable code so the reason survives as queryable metadata.
+        if (isinstance(inp, ExcludeInput) and inp.reason
+                and inp.reason.strip() in MACHINE_EXCLUDE_REASONS):
+            doc.status_reason = inp.reason.strip()
+        else:
+            doc.status_reason = "operator-excluded"
     elif to_state == ORPHANED:
         doc.status_reason = "source-missing"
     elif to_state == REREVIEW and isinstance(inp, ReextractInput):

@@ -70,8 +70,13 @@ from datetime import datetime, timezone
 SALT_ID = "v1"
 
 # Conflict classes (contract section 3 + R16a requirement 2).
+# R21a adds "allocation": a joint/multi-owner document raised to the
+# Operator for owner allocation (per-artifact or per-doc). The options
+# are opaque person ids; the Operator disposes via choose_conflict or
+# per-artifact owner assignment. Never mechanically split.
 CONFLICT_CLASSES = frozenset({
     "duplicate", "corroboration", "reextract", "ocr", "parser", "supersedes",
+    "allocation",
 })
 
 # Duplicate group classes (contract section 3).

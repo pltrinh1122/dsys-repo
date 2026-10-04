@@ -90,6 +90,18 @@ class Document:
     # Operational metadata, not taxpayer data -- crosses the MCP boundary
     # alongside text_source/ocr_engine (blind-orchestrator safe).
     encryption: str | None = None
+    # R21a: per-person scoping. owner_person_id is an opaque "person-N" id
+    # from the store's person registry (taxprep/persons.py), assigned by
+    # the OPERATOR ONLY -- the system never infers it silently.
+    # owner_suggestion is a system-derived suggestion (derivation basis in
+    # owner_suggestion_basis); it is shown to the Operator and NEVER
+    # auto-applied. A suggestion is "un-disposed" exactly while
+    # owner_person_id is None; the Operator's assignment (which may accept
+    # or override the suggestion) consumes it. Both are operational
+    # metadata -- opaque ids cross the MCP boundary; names never do.
+    owner_person_id: str | None = None
+    owner_suggestion: str | None = None
+    owner_suggestion_basis: str | None = None
 
     def __post_init__(self) -> None:
         if self.form_type not in FORM_TYPES:
@@ -127,4 +139,7 @@ class Document:
             attempts=d.get("attempts") or [],
             mean_confidence=d.get("mean_confidence"),
             encryption=d.get("encryption"),
+            owner_person_id=d.get("owner_person_id"),
+            owner_suggestion=d.get("owner_suggestion"),
+            owner_suggestion_basis=d.get("owner_suggestion_basis"),
         )

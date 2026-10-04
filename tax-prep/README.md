@@ -74,6 +74,17 @@ on `sys.path`.
 .venv/bin/taxprep bus listen --once
 .venv/bin/taxprep bus tune --topic tax-prep.build
 .venv/bin/taxprep bus whoami
+
+# Per-person scoping (R21a): opaque person ids; names stay local
+.venv/bin/taxprep person register "Alex Rivera"          # -> person-1
+.venv/bin/taxprep owner suggest <doc_id>                  # shown, never auto-applied
+.venv/bin/taxprep owner set <doc_id> person-1
+.venv/bin/taxprep scope apply --in-scope person-1,person-2
+.venv/bin/taxprep return assign <doc_id> person-1 joint|own|election
+.venv/bin/taxprep show <doc_id> --meta                    # PII-free metadata
+
+# 1040-X column-A builder (R21b): read-model over validated docs
+.venv/bin/taxprep column-a --year 2023
 ```
 
 `ingest` prints a summary table (counts by form × year) plus the list of
@@ -246,9 +257,10 @@ must never see PII in its context. Enforcement is layered:
 
 The agent may see: doc_ids, tax_year, form_type, box codes, confidence
 levels, has_value flags, counts, statuses, pass/fail results, report
-file paths, refusal messages. It must never see: field values,
+file paths, refusal messages, opaque owner ids (`person-1..n`, R21a).
+It must never see: field values,
 raw_text, OCR text, dollar amounts, payer/employer names, EINs,
-addresses.
+addresses, or person (owner) names.
 
 ## Layout
 
@@ -307,6 +319,15 @@ taxprep/
                  conflict raising; explicit-only rule_on_group /
                  choose_conflict; blind-safe open_groups/open_conflicts
                  counts
+  persons.py     R21a per-person scoping: person registry (opaque
+                 person-1..n ids, names local-only), owner assignment +
+                 suggestions (shown, never auto-applied), out-of-scope
+                 exclusion filter, joint-allocation conflicts, return
+                 assignments
+  column_a.py    R21b 1040-X column-A builder: read-model over validated
+                 transcripts/originals; MISSING is first-class output;
+                 2025 original-vs-transcript disagreements raise
+                 corroboration conflicts
   verify.py      mechanical verification suite (blind-safe): completeness,
                  validation gate, 1099-B lot integrity, transcript
                  reconciliation (EIN/name/1:1 matching, 1-cent tolerance),
@@ -538,6 +559,64 @@ docstring for the full statement):
 - Out of scope (flagged via warnings when indicated): unrecaptured
   section 1250 gain (25%), 28% collectibles rate,
   qualified-dividend interactions. State rules not modeled.
+
+## Per-person scoping (R21a)
+
+A document set can span several household members. The Operator assigns
+each document an owner on `/console/sources` and in review (CLI:
+`taxprep person register <name>` → opaque `person-N`; `taxprep owner set
+<doc> <person-N>`; `taxprep owner suggest <doc>` derives a suggestion
+from recipient text). Rules:
+
+- **The system never infers the owner silently.** `owner_suggestion` is
+  shown to the Operator and never auto-applied (R16a rule); a suggestion
+  is "un-disposed" exactly while `owner_person_id` is unset, and the
+  Operator's assignment consumes it (logged as `owner_assignment` in
+  the decision log, with whether the suggestion was accepted).
+- **Scope filter.** `taxprep scope apply --in-scope person-1,person-2`
+  routes every document whose owner is outside the scope through the
+  R13 lifecycle `exclude` event with the machine reason
+  `out-of-scope-person` — the existing `status_reason` taxonomy, not a
+  parallel mechanism. Excluded documents are never deleted, and the
+  gold gate already treats `excluded` as exempt.
+- **Joint / multi-owner items** are raised to the Operator for
+  allocation via the R16a conflict pattern (class `allocation`,
+  options = opaque person ids) and are **never mechanically split**.
+  Per-artifact owners (`taxprep owner` allocation per artifact) let the
+  Operator allocate a joint document piece by piece; allocations survive
+  re-derivation.
+- **Return assignment.** `taxprep return assign <doc> <person-N>
+  joint|own|election` records, as an Operator decision
+  (`return_assignment` in the decision log), which return each in-scope
+  person's documents feed.
+- **Opaque-id discipline.** Agent surfaces (MCP tools, `taxprep show
+  --meta`, bus payloads) carry `person-1..n` ids and counts only. Names
+  live solely in the local `<data_dir>/persons.json` registry and never
+  cross the boundary — pinned by the blind sweep in
+  `tests/test_values_plane.py`.
+
+## 1040-X column-A builder (R21b)
+
+`taxprep column-a --year 2023` builds the "original amount" (column A)
+lines for Form 1040-X as a read-model over validated documents plus
+transcripts — it never mutates gold or the document store.
+
+- **Sources of record.** 2023/2024: the IRS Tax Return Transcript (plus
+  Record of Account) — the Operator has no original returns. 2025: the
+  original 1040 (R20 box/line extraction; designed for its absence)
+  corroborated with the 2025 transcripts.
+- Each line carries its source (`return_transcript` /
+  `record_of_account` / `original_return`), the source doc id, and R15
+  field provenance plus an R19 evidence-pane link (`evidence_ref`).
+- **MISSING is first-class output.** Return-transcript line coverage is
+  small, so most column-A lines are MISSING on real-shaped data — that
+  is correct behavior, never defaulted, never zero-filled, and computed
+  lines (L8/L19/L21) are never derived.
+- **2025 corroboration.** An original-return line and a transcript line
+  that disagree raise an R16a `corroboration` conflict to the Operator;
+  the entry is flagged CONFLICT and carries no chosen value. (The
+  conflict raise is the builder's only write; everything else is
+  read-only — pinned by a digest-identity test.)
 
 ## Phase 6 — local MCP server (stdio only)
 

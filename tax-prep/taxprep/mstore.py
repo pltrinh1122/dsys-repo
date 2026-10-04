@@ -84,6 +84,10 @@ _DECISION_KINDS = frozenset({
     # {event, from, to, reason_code} (metadata only) -- the append-only
     # event log the lifecycle state machine replays.
     "lifecycle",
+    # R21a: the Operator's owner assignment {person_id, previous} and
+    # return assignment {person_id, assignment} -- opaque ids only.
+    "owner_assignment",
+    "return_assignment",
 })
 
 # Columns hashed by db_digest(), per table. Volatile bookkeeping columns
@@ -103,10 +107,16 @@ _DIGEST_COLS = {
                    "status", "status_reason", "page_range", "parent_doc_id",
                    "relevance", "validated_at", "re_review",
                    "derivation_version", "config_hash", "derivation_digest",
-                   "fields_json"],
+                   "fields_json",
+                   # R21a: operator-assigned owner metadata (opaque ids only,
+                   # PII-free for the blind sweep).
+                   "owner_person_id", "owner_suggestion",
+                   "owner_suggestion_basis"],
     "silver_artifact": ["artifact_id", "doc_id", "bronze_hash", "page",
                         "artifact_type", "anchor", "value_json",
-                        "offsets_json", "derivation_version", "config_hash"],
+                        "offsets_json", "derivation_version", "config_hash",
+                        # R21a: per-artifact owner (joint allocation).
+                        "owner_person_id", "owner_suggestion"],
     "decision_log": ["actor", "kind", "artifact_id", "doc_id", "group_id",
                      "payload_json"],
     "dup_group": ["group_id", "class", "status", "disposed_at"],
@@ -256,6 +266,16 @@ class MedallionStore:
     _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
         ("bronze", "source_relpath", "TEXT"),     # R15 source identity
         ("bronze", "source_mtime", "INTEGER"),    # R15 source identity
+        # R21a: per-person scoping -- opaque operator-assigned owner id +
+        # system-derived (never auto-applied) suggestion. NULL = unassigned.
+        ("silver_doc", "owner_person_id", "TEXT"),
+        ("silver_doc", "owner_suggestion", "TEXT"),
+        ("silver_doc", "owner_suggestion_basis", "TEXT"),
+        # R21a: artifact-level owner for documents covering several people
+        # (joint/multi-owner items are allocated per artifact by the
+        # Operator; never mechanically split).
+        ("silver_artifact", "owner_person_id", "TEXT"),
+        ("silver_artifact", "owner_suggestion", "TEXT"),
     )
 
     def _migrate_columns(self) -> None:
@@ -284,6 +304,10 @@ class MedallionStore:
             self._conn.execute("PRAGMA journal_mode=DELETE;")
             self._conn.execute("PRAGMA foreign_keys=ON;")
             self._init_schema()
+            # Column migrations must run before the JSONL migration: the
+            # migration's writes go through upsert_silver_doc /
+            # replace_artifacts, which reference the migrated columns.
+            self._migrate_columns()
             self._migrate_jsonl()
         finally:
             self._conn.close()
@@ -589,8 +613,10 @@ class MedallionStore:
                 "(doc_id, bronze_hash, form_type, tax_year, status, "
                 " status_reason, page_range, parent_doc_id, relevance, "
                 " validated_at, re_review, derivation_version, config_hash, "
-                " derivation_digest, fields_json, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                " derivation_digest, fields_json, created_at, updated_at, "
+                " owner_person_id, owner_suggestion, owner_suggestion_basis) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                " ?, ?, ?) "
                 "ON CONFLICT(doc_id) DO UPDATE SET "
                 "bronze_hash = excluded.bronze_hash, "
                 "form_type = excluded.form_type, "
@@ -606,6 +632,9 @@ class MedallionStore:
                 "config_hash = excluded.config_hash, "
                 "derivation_digest = excluded.derivation_digest, "
                 "fields_json = excluded.fields_json, "
+                "owner_person_id = excluded.owner_person_id, "
+                "owner_suggestion = excluded.owner_suggestion, "
+                "owner_suggestion_basis = excluded.owner_suggestion_basis, "
                 "updated_at = excluded.updated_at",
                 (
                     doc.doc_id,
@@ -625,6 +654,9 @@ class MedallionStore:
                     _canon(doc.fields),
                     now,
                     now,
+                    doc.owner_person_id,
+                    doc.owner_suggestion,
+                    doc.owner_suggestion_basis,
                 ),
             )
             # Doc-level text provenance (R5; W1's doc_provenance table).
@@ -663,6 +695,11 @@ class MedallionStore:
         inserted. Each artifact dict carries artifact_id/page/
         artifact_type/anchor/value_json/offsets_json/derivation_version/
         config_hash.
+
+        R21a: per-artifact owner assignments (Operator decisions) are
+        preserved across the replace: an artifact_id that survives the
+        re-derivation keeps its owner_person_id/owner_suggestion;
+        incoming dicts may also carry them explicitly (explicit wins).
         """
         now = _utcnow()
         with self.txn():
@@ -673,17 +710,29 @@ class MedallionStore:
             if row is None:
                 raise KeyError(f"no silver_doc for {doc_id!r}")
             bronze_hash = row["bronze_hash"]
+            carried = {
+                r["artifact_id"]: (r["owner_person_id"], r["owner_suggestion"])
+                for r in self._conn.execute(
+                    "SELECT artifact_id, owner_person_id, owner_suggestion "
+                    "FROM silver_artifact WHERE doc_id = ?",
+                    (doc_id,),
+                )
+            }
             self._conn.execute(
                 "DELETE FROM silver_artifact WHERE doc_id = ?",
                 (doc_id,),
             )
             for a in artifacts:
+                old_pid, old_sug = carried.get(a["artifact_id"], (None, None))
+                owner_person_id = a.get("owner_person_id", old_pid)
+                owner_suggestion = a.get("owner_suggestion", old_sug)
                 self._conn.execute(
                     "INSERT INTO silver_artifact "
                     "(artifact_id, doc_id, bronze_hash, page, artifact_type, "
                     " anchor, value_json, offsets_json, derivation_version, "
-                    " config_hash, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " config_hash, created_at, updated_at, "
+                    " owner_person_id, owner_suggestion) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         a["artifact_id"],
                         doc_id,
@@ -697,6 +746,8 @@ class MedallionStore:
                         a["config_hash"],
                         now,
                         now,
+                        owner_person_id,
+                        owner_suggestion,
                     ),
                 )
 
@@ -876,12 +927,57 @@ class MedallionStore:
                                   _FACADE_CONFIG_HASH),
             )
 
+    # -- R21a: per-person scoping --------------------------------------
+    def set_doc_owner(self, doc_id: str, *, owner_person_id: str | None,
+                      owner_suggestion: str | None = None,
+                      owner_suggestion_basis: str | None = None) -> None:
+        """Targeted write of the R21a owner columns on silver_doc.
+
+        Used for Operator owner assignment and system suggestion writes;
+        unlike upsert() it touches nothing else (no artifact rebuild, no
+        derivation restamp). Raises KeyError for an unknown doc_id.
+        """
+        with self.txn():
+            row = self._conn.execute(
+                "SELECT doc_id FROM silver_doc WHERE doc_id = ?",
+                (doc_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"no silver_doc for {doc_id!r}")
+            self._conn.execute(
+                "UPDATE silver_doc SET owner_person_id = ?, "
+                "owner_suggestion = ?, owner_suggestion_basis = ?, "
+                "updated_at = ? WHERE doc_id = ?",
+                (owner_person_id, owner_suggestion, owner_suggestion_basis,
+                 _utcnow(), doc_id),
+            )
+
+    def set_artifact_owner(self, artifact_id: str, *,
+                           owner_person_id: str | None,
+                           owner_suggestion: str | None = None) -> None:
+        """Targeted write of the R21a owner columns on one artifact row.
+
+        Per-artifact owners exist for documents covering several people:
+        the Operator allocates joint/multi-owner items per artifact (never
+        mechanically split). Raises KeyError for an unknown artifact_id.
+        """
+        with self.txn():
+            row = self._conn.execute(
+                "SELECT artifact_id FROM silver_artifact WHERE artifact_id = ?",
+                (artifact_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"no silver_artifact for {artifact_id!r}")
+            self._conn.execute(
+                "UPDATE silver_artifact SET owner_person_id = ?, "
+                "owner_suggestion = ?, updated_at = ? WHERE artifact_id = ?",
+                (owner_person_id, owner_suggestion, _utcnow(), artifact_id),
+            )
+
     # silver_doc + bronze (encryption, blocked_reason) + doc_provenance,
     # so the facade reconstructs the full Document record.
     _DOC_SELECT = (
         "SELECT s.*, b.encryption AS bronze_encryption, b.blocked_reason, "
         "p.text_source, p.reason_code, p.ocr_engine, p.engine_version, "
-        "p.ocr_mode, p.attempts_json, p.mean_confidence "
+        "p.ocr_mode, p.attempts_json, p.mean_confidence "  # R15/R5 doc provenance
         "FROM silver_doc s "
         "JOIN bronze b ON b.hash = s.bronze_hash "
         "LEFT JOIN doc_provenance p ON p.doc_id = s.doc_id"
@@ -919,6 +1015,9 @@ class MedallionStore:
             attempts=json.loads(row["attempts_json"] or "[]"),
             mean_confidence=row["mean_confidence"],
             encryption=row["bronze_encryption"],
+            owner_person_id=row["owner_person_id"],
+            owner_suggestion=row["owner_suggestion"],
+            owner_suggestion_basis=row["owner_suggestion_basis"],
         )
 
     def get(self, doc_id: str) -> Document | None:

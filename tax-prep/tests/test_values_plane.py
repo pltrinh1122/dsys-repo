@@ -22,6 +22,7 @@ import pytest
 from taxprep import bus as _bus
 from taxprep import console as _console
 from taxprep import mcp_server
+from taxprep import persons as _persons
 from taxprep.models import Document
 from taxprep.store import DocumentStore
 
@@ -29,6 +30,9 @@ SECRET_PATH = "/home/op/secret-vault/w2-acme-corp.pdf"
 SECRET_NAME = "w2-acme-corp.pdf"
 SECRET_AMOUNT = "85000.00"
 SECRET_SSN = "000-00-1234"
+# R21a: owner names are PII -- they must never cross the agent boundary.
+# Only opaque ids (person-1..n) plus counts may appear.
+SECRET_OWNER_NAME = "Alex Rivera"
 
 
 def _pii_doc():
@@ -116,6 +120,50 @@ def test_bus_poll_metadata_only(tmp_path):
     assert len(msgs) == 1
     _assert_no_values_plane_leak(msgs, "bus_poll")
     assert msgs[0]["payload"] == {"doc_count": 3, "status": "ok"}
+
+
+def _assert_no_owner_name_leak(obj, label: str):
+    blob = _blob(obj)
+    assert SECRET_OWNER_NAME not in blob, f"{label}: owner name leaked"
+    assert "Alex" not in blob, f"{label}: owner name fragment leaked"
+
+
+def test_owner_names_never_cross_agent_boundary(pii_store, tmp_path):
+    """R21a blind sweep: the person registry holds names; every agent
+    surface (MCP tools, CLI --meta, bus payloads) carries opaque ids
+    and counts only."""
+    from taxprep.cli import main as _cli_main
+    store = pii_store
+    pid = _persons.register_person(store.data_dir, SECRET_OWNER_NAME)
+    assert pid == "person-1"
+    _persons.assign_owner(store, "w2-pii-2024", "person-1")
+
+    out = mcp_server.show_document("w2-pii-2024",
+                                   data_dir=str(store.data_dir))
+    _assert_no_values_plane_leak(out, "show_document")
+    _assert_no_owner_name_leak(out, "show_document")
+    assert out["owner_person_id"] == "person-1"  # id crosses, name doesn't
+
+    listed = mcp_server.list_documents(data_dir=str(store.data_dir))
+    _assert_no_owner_name_leak(listed, "list_documents")
+    assert listed[0]["owner_person_id"] == "person-1"
+
+    payload = _persons.scope_payload(store, {"person-1"})
+    _assert_no_owner_name_leak(payload, "scope_payload")
+    assert payload["doc_counts"] == {"person-1": 1}
+    bus_dir = tmp_path / "bus"
+    _bus.publish("tax-prep.ops", "scope", payload, bus_dir=str(bus_dir),
+                 from_id="op-1")
+    msgs = _bus.list_messages("tax-prep.ops", bus_dir=str(bus_dir))
+    _assert_no_owner_name_leak(msgs, "bus scope message")
+
+    # The registry itself stays local: digest + table counts are clean.
+    blob = json.dumps(store.db_digest()) + json.dumps(store.table_counts())
+    _assert_no_owner_name_leak({"blob": blob}, "db_digest")
+
+    # CLI --meta output: ids, never names.
+    assert _cli_main(["--data-dir", str(store.data_dir), "show",
+                      "w2-pii-2024", "--meta"]) == 0
 
 
 def test_console_bus_view_renders_keys_never_values(tmp_path):

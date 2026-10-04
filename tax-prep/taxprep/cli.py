@@ -39,6 +39,23 @@ def _store(data_dir: str | None) -> DocumentStore:
         raise SystemExit(2)
 
 
+def _resolve_doc(store: DocumentStore, doc_id: str):
+    """Resolve a doc_id (prefix ok if unambiguous); None + message if not."""
+    doc = store.get(doc_id)
+    if doc is not None:
+        return doc
+    matches = [d for d in store.list() if d.doc_id.startswith(doc_id)]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        print(f"Ambiguous prefix; {len(matches)} matches:")
+        for m in matches:
+            print(f"  {m.doc_id}")
+    else:
+        print(f"No document: {doc_id}")
+    return None
+
+
 def cmd_ingest(args: argparse.Namespace) -> int:
     input_dir = args.input_dir or taxprep_config.resolve("source_dir")
     if not input_dir:
@@ -105,24 +122,26 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_show(args: argparse.Namespace) -> int:
     store = _store(args.data_dir)
-    doc = store.get(args.doc_id)
+    doc = _resolve_doc(store, args.doc_id)
     if doc is None:
-        # allow prefix match
-        matches = [d for d in store.list() if d.doc_id.startswith(args.doc_id)]
-        if len(matches) == 1:
-            doc = matches[0]
-        elif matches:
-            print(f"Ambiguous prefix; {len(matches)} matches:")
-            for m in matches:
-                print(f"  {m.doc_id}")
-            return 1
-        else:
-            print(f"No document: {args.doc_id}")
-            return 1
+        return 1
+    if args.meta:
+        # R21a: metadata-only output -- the same scrubbed shape the MCP
+        # boundary uses. Opaque owner ids cross; names never do.
+        from .mcp_server import _scrub_doc
+        print(json.dumps(_scrub_doc(doc.to_dict()), indent=2,
+                         sort_keys=True))
+        return 0
     print(f"doc_id:      {doc.doc_id}")
     print(f"form_type:   {doc.form_type}")
     print(f"tax_year:    {doc.tax_year}")
     print(f"status:      {doc.status}")
+    # R21a: owner is opaque metadata -- shown in both modes.
+    owner_line = f"owner:       {doc.owner_person_id or '(unassigned)'}"
+    if doc.owner_suggestion and not doc.owner_person_id:
+        owner_line += (f"  [suggestion pending: {doc.owner_suggestion} "
+                       f"({doc.owner_suggestion_basis}) -- Operator disposes]")
+    print(owner_line)
     if BLIND:
         # R8: reuse the MCP scrub helper -- transcript field codes embed
         # payer names ("payer1.ACME CORP.1"); they must be redacted here
@@ -143,6 +162,125 @@ def cmd_show(args: argparse.Namespace) -> int:
         if isinstance(val, list) and len(val) > 5:
             val = f"<{len(val)} items>"
         print(f"  {code:28} = {val!r}  [{f.get('confidence')}]")
+    return 0
+
+
+# -- R21a: per-person scoping ------------------------------------------
+
+def cmd_person_register(args: argparse.Namespace) -> int:
+    from . import persons
+    store = _store(args.data_dir)
+    try:
+        pid = persons.register_person(store.data_dir, args.name)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"registered {pid}")
+    return 0
+
+
+def cmd_owner_set(args: argparse.Namespace) -> int:
+    from . import persons
+    store = _store(args.data_dir)
+    doc = _resolve_doc(store, args.doc_id)
+    if doc is None:
+        return 1
+    try:
+        res = persons.assign_owner(store, doc.doc_id, args.person_id)
+    except (ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    prev = f" (was {res['previous']})" if res["previous"] else ""
+    acc = " [accepted suggestion]" if res["accepted_suggestion"] else ""
+    print(f"{res['doc_id']}: owner = {res['owner_person_id']}{prev}{acc}")
+    return 0
+
+
+def cmd_owner_suggest(args: argparse.Namespace) -> int:
+    from . import persons
+    store = _store(args.data_dir)
+    doc = _resolve_doc(store, args.doc_id)
+    if doc is None:
+        return 1
+    try:
+        res = persons.suggest_owner_for_doc(store, doc.doc_id)
+    except (ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if res is None:
+        print(f"{doc.doc_id}: no suggestion (no recipient text matched a "
+              "registered person)")
+        return 0
+    print(f"{doc.doc_id}: suggested owner {res['owner_suggestion']} "
+          f"({res['basis']}) -- UN-DISPOSED: the Operator assigns it with "
+          "`taxprep owner set`")
+    return 0
+
+
+def cmd_scope_apply(args: argparse.Namespace) -> int:
+    from . import persons
+    store = _store(args.data_dir)
+    in_scope = {p.strip() for p in args.in_scope.split(",") if p.strip()}
+    if not in_scope:
+        print("error: --in-scope needs at least one person id",
+              file=sys.stderr)
+        return 1
+    try:
+        applied = persons.apply_scope_filter(store, in_scope)
+    except (ValueError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    for r in applied:
+        print(f"excluded {r['doc_id']} (owner {r['owner_person_id']}: "
+              "out-of-scope-person)")
+    print(f"{len(applied)} document(s) excluded; in scope: "
+          f"{', '.join(sorted(in_scope))}")
+    return 0
+
+
+def cmd_return_assign(args: argparse.Namespace) -> int:
+    from . import persons
+    store = _store(args.data_dir)
+    doc = _resolve_doc(store, args.doc_id)
+    if doc is None:
+        return 1
+    try:
+        res = persons.record_return_assignment(
+            store, doc.doc_id, args.person_id, args.assignment)
+    except (ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"{res['doc_id']}: {res['person_id']} -> {res['assignment']} "
+          f"(decision {res['decision_seq']})")
+    return 0
+
+
+# -- R21b: 1040-X column-A builder --------------------------------------
+
+def cmd_column_a(args: argparse.Namespace) -> int:
+    from . import column_a
+    store = _store(args.data_dir)
+    result = column_a.build_column_a(store, args.year)
+    cov = result["coverage"]
+    print(f"1040-X column A -- tax year {args.year} "
+          f"({cov['n_present']} present, {cov['n_missing']} MISSING, "
+          f"{cov['n_conflict']} CONFLICT; {cov['n_source_docs']} source docs)")
+    for e in result["lines"]:
+        if BLIND:
+            val = "[redacted: TAXPREP_BLIND=1]" if e["value"] else "-"
+        else:
+            val = e["value"] if e["value"] is not None else "-"
+        src = e["source"] or "-"
+        flag = "" if e["status"] == "present" else f"  [{e['status']}]"
+        print(f"  {e['line']:4} {e['label']:52} {val:>14}  {src}{flag}")
+        for alt in e["also_seen"]:
+            mark = "agrees" if alt.get("agrees") else "DIFFERS"
+            print(f"         also seen: {alt['source']} {alt['source_doc_id']} "
+                  f"= {alt['value']} ({mark})")
+    for c in result["conflicts_raised"]:
+        print(f"CONFLICT raised for {c['line']}: {c['conflict_id']} "
+              f"(transcript {c['transcript_doc']} vs original "
+              f"{c['original_doc']}) -- Operator disposes")
     return 0
 
 
@@ -712,6 +850,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     ps = sub.add_parser("show", help="show one document's extracted fields")
     ps.add_argument("doc_id", help="doc_id (prefix ok if unambiguous)")
+    ps.add_argument("--meta", action="store_true",
+                    help="R21a: print PII-free metadata only (MCP-scrubbed "
+                         "shape; opaque owner ids, never names)")
     ps.set_defaults(func=cmd_show)
 
     pr = sub.add_parser("review", help="serve the visual validation UI (localhost only)")
@@ -869,6 +1010,55 @@ def build_parser() -> argparse.ArgumentParser:
     pcs.add_argument("--file", required=True, help="CSV file to ingest")
     pcs.add_argument("--year", type=int, required=True, help="tax year")
     pcs.set_defaults(func=cmd_ingest_csv)
+
+    # -- R21a: per-person scoping ---------------------------------------
+
+    pper = sub.add_parser("person", help="R21a: person registry (opaque ids)")
+    ppersub = pper.add_subparsers(dest="person_cmd", required=True)
+    ppreg = ppersub.add_parser("register", help="register a person by name "
+                                               "(local only; returns "
+                                               "person-N)")
+    ppreg.add_argument("name", help="person's name (PII: local registry only)")
+    ppreg.set_defaults(func=cmd_person_register)
+
+    pown = sub.add_parser("owner", help="R21a: assign / suggest document owners")
+    pownsub = pown.add_subparsers(dest="owner_cmd", required=True)
+    poset = pownsub.add_parser("set", help="Operator assigns a document's "
+                                          "owner (disposes any suggestion)")
+    poset.add_argument("doc_id", help="doc_id (prefix ok if unambiguous)")
+    poset.add_argument("person_id", help="opaque person id (person-N)")
+    poset.set_defaults(func=cmd_owner_set)
+    posug = pownsub.add_parser("suggest", help="derive an owner suggestion "
+                                              "from recipient text "
+                                              "(shown, never auto-applied)")
+    posug.add_argument("doc_id", help="doc_id (prefix ok if unambiguous)")
+    posug.set_defaults(func=cmd_owner_suggest)
+
+    psc = sub.add_parser("scope", help="R21a: apply the Operator's person scope")
+    pscsub = psc.add_subparsers(dest="scope_cmd", required=True)
+    pscap = pscsub.add_parser("apply", help="exclude out-of-scope-owned docs "
+                                            "with reason out-of-scope-person")
+    pscap.add_argument("--in-scope", required=True,
+                       help="comma-separated opaque person ids in scope")
+    pscap.set_defaults(func=cmd_scope_apply)
+
+    pret = sub.add_parser("return", help="R21a: record return assignments")
+    pretsub = pret.add_subparsers(dest="return_cmd", required=True)
+    pra = pretsub.add_parser("assign", help="Operator decision: which return "
+                                            "this person's documents feed")
+    pra.add_argument("doc_id", help="doc_id (prefix ok if unambiguous)")
+    pra.add_argument("person_id", help="opaque person id (person-N)")
+    pra.add_argument("assignment", choices=["joint", "own", "election"],
+                     help="joint = the joint return; own = the person's own "
+                          "return; election = per-election")
+    pra.set_defaults(func=cmd_return_assign)
+
+    # -- R21b: 1040-X column-A builder ----------------------------------
+
+    pca = sub.add_parser("column-a", help="R21b: build 1040-X column-A lines "
+                                          "for a tax year (read-model)")
+    pca.add_argument("--year", type=int, required=True, help="tax year")
+    pca.set_defaults(func=cmd_column_a)
     return p
 
 

@@ -125,7 +125,10 @@ def test_list_documents_shape_and_json(tmp_path):
     assert rows[0]["doc_id"] == "b1-a"  # sorted by form then id
     for r in rows:
         assert set(r) == {"doc_id", "tax_year", "form_type", "status",
-                          "n_fields"}
+                          "n_fields",
+                          # R21a: opaque owner id (None here); names never
+                          # cross this boundary.
+                          "owner_person_id"}
     json.dumps(rows)  # Decimal-free
     _pii_free(rows)
     only_w2 = mcp_server.list_documents(form_type="W-2",

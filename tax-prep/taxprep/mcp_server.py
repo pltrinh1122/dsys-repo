@@ -73,6 +73,12 @@ PROVENANCE_KEYS = ("text_source", "reason_code", "ocr_engine",
                    "engine_version", "ocr_mode", "attempts",
                    "mean_confidence", "encryption")
 
+# R21a owner keys: opaque person ids are operational metadata, safe for
+# the blind orchestrator. Names are NEVER on the Document record (they
+# live only in the local persons.json registry), so they cannot leak
+# through this boundary.
+OWNER_KEYS = ("owner_person_id", "owner_suggestion")
+
 
 def _scrub_doc(doc_dict: dict) -> dict:
     """Strip PII from a document record for the blind orchestrator.
@@ -101,6 +107,9 @@ def _scrub_doc(doc_dict: dict) -> dict:
         "fields": fields,
     }
     for key in PROVENANCE_KEYS:
+        out[key] = doc_dict.get(key)
+    # R21a: opaque owner ids only -- person names never reach this dict.
+    for key in OWNER_KEYS:
         out[key] = doc_dict.get(key)
     return out
 
@@ -161,6 +170,8 @@ def list_documents(tax_year: int | None = None, form_type: str | None = None,
             "form_type": d.form_type,
             "status": d.status,
             "n_fields": len(d.fields),
+            # R21a: opaque owner id only (names never cross this boundary).
+            "owner_person_id": d.owner_person_id,
         }
         for d in store.list(year=tax_year, form=form_type)
     ])
@@ -191,6 +202,9 @@ def show_document(doc_id: str, data_dir: str | None = None) -> dict:
         "ocr_mode": doc.ocr_mode,
         "attempts": doc.attempts,
         "mean_confidence": doc.mean_confidence,
+        # R21a: opaque owner ids (operational metadata, blind-safe).
+        "owner_person_id": doc.owner_person_id,
+        "owner_suggestion": doc.owner_suggestion,
     }))
 
 
@@ -230,6 +244,8 @@ def validation_queue(tax_year: int | None = None, form_type: str | None = None,
                 "low_confidence_fields": sum(
                     1 for f in d.fields.values()
                     if isinstance(f, dict) and f.get("confidence") == "low"),
+                # R21a: opaque owner id only (names never cross).
+                "owner_person_id": d.owner_person_id,
             }
             for d in queue
         ],

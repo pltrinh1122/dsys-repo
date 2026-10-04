@@ -105,7 +105,9 @@ CREATE TABLE decision_log (           -- append-only (I6); never UPDATE/DELETE
     actor TEXT NOT NULL,              -- operator|system
     kind TEXT NOT NULL,               -- validate|edit|exclude|duplicate_ruling|
                                       -- supersedes_ruling|conflict_choice|
-                                      -- relevance_override
+                                      -- relevance_override|verify_original|
+                                      -- lifecycle|owner_assignment|
+                                      -- return_assignment
     artifact_id TEXT,
     doc_id TEXT,
     group_id TEXT,
