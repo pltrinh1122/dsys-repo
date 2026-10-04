@@ -130,6 +130,13 @@ TAXPREP_STORE_DIR="$STORE_DIR" \
 
 # --- 3. commit + push the store checkout (this push IS the delivery) ---
 cd "$STORE_DIR" || fail "store checkout not found: $STORE_DIR"
+# Rebase our broadcast onto any listener messages that landed while the
+# device flow was waiting (sibling commits, independent files -- safe).
+# Identity is repo-local so the rebase can finalize without a global config.
+git config user.name "taxprep-bus" 2>/dev/null || true
+git config user.email "taxprep-bus@local" 2>/dev/null || true
+GIT_EDITOR=true git -c credential.helper= pull --rebase 2>/dev/null \
+  || fail "store pull --rebase (resolve manually in $STORE_DIR)"
 git add bus/ || fail "store git add"
 git -c user.name="taxprep-bus" -c user.email="taxprep-bus@local" \
     -c credential.helper= commit -q \

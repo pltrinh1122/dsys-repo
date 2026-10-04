@@ -27,13 +27,15 @@ _PRIMARY_BOX: dict[str, str] = {
     "1099-NEC": "1",
     "1099-R": "1",
     "1099-MISC": "1",
-    "1099-B": "1d_proceeds",
+    # 1099-B headline = the lot table; the doc-side amount is the sum of
+    # lot proceeds (the transcript's 1d is the payer's total proceeds).
+    "1099-B": "lots",
 }
 # ...and the corresponding box key inside a transcript payer block.
 _TRANSCRIPT_BOX: dict[str, str] = {
     "1": "1",
     "1a": "1a",
-    "1d_proceeds": "1d",
+    "lots": "1d",
 }
 
 _AMOUNT_TOLERANCE = Decimal("0.01")
@@ -70,6 +72,13 @@ def _to_decimal(v: Any) -> Decimal | None:
 def _field_value(doc, code: str) -> Any:
     f = (doc.fields or {}).get(code)
     return f.get("value") if isinstance(f, dict) else None
+
+
+def _doc_lots(doc) -> list[dict]:
+    """The 1099-B lot table as a list of per-lot dicts (possibly empty)."""
+    lots = (doc.fields or {}).get("lots")
+    v = lots.get("value") if isinstance(lots, dict) else None
+    return [l for l in v if isinstance(l, dict)] if isinstance(v, list) else []
 
 
 def _norm_ein(s: Any) -> str | None:
@@ -127,45 +136,60 @@ _LOT_CHECKS = (
 
 
 def _lot_check_results(doc) -> dict[str, bool]:
-    """Per-check booleans for one 1099-B document. No values escape."""
-    proceeds = _field_value(doc, "1d_proceeds")
-    basis = _field_value(doc, "1e_basis")
-    term = _field_value(doc, "term")
-    d_acq = _field_value(doc, "date_acquired")
-    d_sold = _field_value(doc, "date_sold")
+    """Per-check booleans for one 1099-B document, over ALL its lots.
+
+    A document passes a check iff it has at least one lot and every lot
+    passes that check. A document with no lots fails every check (the
+    old "missing fields" behavior). No values escape.
+    """
+    results = {c: True for c in _LOT_CHECKS}
+    lots = _doc_lots(doc)
+    if not lots:
+        return {c: False for c in _LOT_CHECKS}
 
     def present(v):
         return v is not None and (not isinstance(v, str) or v.strip() != "")
-
-    p_dec = _to_decimal(proceeds)
-    b_dec = _to_decimal(basis)
 
     def date_ok(v):
         if not present(v):
             return True  # absent dates are not a failure; presence is optional
         return bool(_DATE_RE.match(str(v).strip()))
 
-    return {
-        "proceeds_present": present(proceeds),
-        "basis_present": present(basis),
-        "proceeds_nonnegative": p_dec is not None and p_dec >= 0,
-        "basis_nonnegative": b_dec is not None and b_dec >= 0,
-        "term_valid": term in ("short", "long"),
-        "dates_parseable": date_ok(d_acq) and date_ok(d_sold),
-    }
+    for lot in lots:
+        proceeds = lot.get("proceeds_1d")
+        basis = lot.get("basis_1e")
+        term = lot.get("term")
+        d_acq = lot.get("date_acquired")
+        d_sold = lot.get("date_sold")
+        p_dec = _to_decimal(proceeds)
+        b_dec = _to_decimal(basis)
+        lot_results = {
+            "proceeds_present": present(proceeds),
+            "basis_present": present(basis),
+            "proceeds_nonnegative": p_dec is not None and p_dec >= 0,
+            "basis_nonnegative": b_dec is not None and b_dec >= 0,
+            "term_valid": term in ("short", "long"),
+            "dates_parseable": date_ok(d_acq) and date_ok(d_sold),
+        }
+        for c, ok in lot_results.items():
+            results[c] = results[c] and ok
+    return results
 
 
 def verify_lot_integrity(store, year: int) -> dict:
     """Structural checks on 1099-B lots for a year.
 
-    Checks per document: proceeds/basis present and non-negative, term in
+    Checks per lot: proceeds/basis present and non-negative, term in
     {short, long}, dates parseable when present. Reports counts and the
     doc_ids that failed >= 1 check -- never the offending values.
     """
     docs = store.list(year=year, form="1099-B")
     failed_ids: list[str] = []
     failed_by_check: dict[str, int] = {c: 0 for c in _LOT_CHECKS}
+    n_lots = 0
     for d in docs:
+        lots = _doc_lots(d)
+        n_lots += len(lots) or 1  # a lot-less doc still runs one check row
         results = _lot_check_results(d)
         bad = [c for c, ok in results.items() if not ok]
         if bad:
@@ -174,10 +198,70 @@ def verify_lot_integrity(store, year: int) -> dict:
                 failed_by_check[c] += 1
     return {
         "passed": not failed_ids,
-        "n_checks": len(docs) * len(_LOT_CHECKS),
+        "n_lots": n_lots,
+        "n_checks": n_lots * len(_LOT_CHECKS),
         "n_failed": sum(failed_by_check.values()),
         "failed_ids": sorted(failed_ids),
         "failed_by_check": failed_by_check,
+    }
+
+
+def _sum_lot_money(lots: list[dict], term: str,
+                   key: str) -> Decimal | None:
+    """Sum one money key over lots of a term. None when any lot's amount
+    is missing or unparseable (cannot confirm -- never guessed)."""
+    total = Decimal("0")
+    for lot in lots:
+        if lot.get("term") != term:
+            continue
+        d = _to_decimal(lot.get(key))
+        if d is None:
+            return None
+        total += d
+    return total
+
+
+def verify_summary_reconciliation(store, year: int) -> dict:
+    """Lot sums vs statement summary totals for 1099-B docs (F1).
+
+    For each term category present in BOTH the lot table and the
+    statement's summary_totals, compare summed lot proceeds/basis
+    against the statement totals within 1 cent. Returns doc_ids only
+    (blind-safe). A document whose statement shows no summary totals
+    is SKIPPED -- never failed.
+    """
+    docs = store.list(year=year, form="1099-B")
+    passed_ids: list[str] = []
+    failed_ids: list[str] = []
+    skipped_ids: list[str] = []
+    n_compared = 0
+    for d in docs:
+        raw_totals = ((d.fields or {}).get("summary_totals") or {}).get("value")
+        totals = {c: v for c, v in (raw_totals or {}).items()
+                  if isinstance(v, dict) and v} \
+            if isinstance(raw_totals, dict) else {}
+        if not totals:
+            skipped_ids.append(d.doc_id)
+            continue
+        lots = _doc_lots(d)
+        ok = True
+        for cat in ("short", "long"):
+            tcat = totals.get(cat) or {}
+            for key in ("proceeds_1d", "basis_1e"):
+                tv = _to_decimal(tcat.get(key))
+                if tv is None:
+                    continue  # summary kind absent: nothing to compare
+                n_compared += 1
+                lv = _sum_lot_money(lots, cat, key)
+                if lv is None or abs(lv - tv) > _AMOUNT_TOLERANCE:
+                    ok = False
+        (passed_ids if ok else failed_ids).append(d.doc_id)
+    return {
+        "passed": not failed_ids,
+        "n_compared": n_compared,
+        "passed_ids": sorted(passed_ids),
+        "failed_ids": sorted(failed_ids),
+        "skipped_ids": sorted(skipped_ids),
     }
 
 
@@ -292,8 +376,18 @@ def verify_transcript_reconciliation(store, year: int) -> dict:
         d = doc_by_id[doc_id]
         p = payers[pi]
         n_matched += 1
-        doc_amt = _to_decimal(_field_value(d, _PRIMARY_BOX[d.form_type]))
-        txn_key = _TRANSCRIPT_BOX[_PRIMARY_BOX[d.form_type]]
+        doc_box = _PRIMARY_BOX[d.form_type]
+        if doc_box == "lots":
+            # 1099-B headline = sum of lot proceeds (the transcript's 1d
+            # is the payer's total proceeds); None when any lot's
+            # proceeds are missing/unparseable -- cannot confirm.
+            doc_amt = _sum_lot_money(_doc_lots(d), "short", "proceeds_1d")
+            doc_amt_lt = _sum_lot_money(_doc_lots(d), "long", "proceeds_1d")
+            doc_amt = (None if doc_amt is None or doc_amt_lt is None
+                       else doc_amt + doc_amt_lt)
+        else:
+            doc_amt = _to_decimal(_field_value(d, doc_box))
+        txn_key = _TRANSCRIPT_BOX[doc_box]
         txn_amt = _to_decimal(p["boxes"].get(txn_key))
         if doc_amt is None or txn_amt is None:
             mismatched_ids.append(doc_id)  # cannot confirm -- needs eyes
@@ -370,6 +464,7 @@ def verify_all(store, year: int | None = None) -> dict:
         sub = {
             "validation_gate": verify_validation_gate(store, y),
             "lot_integrity": verify_lot_integrity(store, y),
+            "summary_reconciliation": verify_summary_reconciliation(store, y),
             "transcript_reconciliation": verify_transcript_reconciliation(store, y),
             "carryforward_ready": verify_carryforward_ready(store, y),
         }

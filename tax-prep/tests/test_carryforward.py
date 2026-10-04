@@ -19,7 +19,30 @@ from taxprep.store import DocumentStore
 D = Decimal
 
 
-def b1099(doc_id, year, proceeds, basis, term, status="validated"):
+def _lot(proceeds=None, basis=None, term=None, wash_1g=None,
+         fed_withheld_1f=None, description=None,
+         date_acquired="01/15/2024", date_sold="06/20/2024"):
+    return {
+        "description": description,
+        "date_acquired": date_acquired,
+        "date_sold": date_sold,
+        "proceeds_1d": proceeds,
+        "basis_1e": basis,
+        "wash_1g": wash_1g,
+        "fed_withheld_1f": fed_withheld_1f,
+        "term": term,
+        "covered": None,
+    }
+
+
+def b1099(doc_id, year, proceeds, basis, term, status="validated",
+          wash_1g=None, fed_withheld_1f=None, lots=None):
+    """Single- (or multi-) lot 1099-B fixture on the lot-table shape.
+
+    ``lots`` overrides the single lot built from proceeds/basis/term.
+    """
+    if lots is None:
+        lots = [_lot(proceeds, basis, term, wash_1g, fed_withheld_1f)]
     return Document(
         doc_id=doc_id,
         tax_year=year,
@@ -27,10 +50,9 @@ def b1099(doc_id, year, proceeds, basis, term, status="validated"):
         source_path=f"{doc_id}.pdf",
         ocr_text_ref=f"ocr/{doc_id}.txt",
         fields={
-            "1d_proceeds": {"value": proceeds, "confidence": "high", "raw_text": ""},
-            "1e_basis": {"value": basis, "confidence": "high", "raw_text": ""},
-            "term": {"value": term, "confidence": "high", "raw_text": ""},
-            "broker": {"value": "Synthetic Broker", "confidence": "high", "raw_text": ""},
+            "lots": {"value": lots, "confidence": "high", "raw_text": ""},
+            "broker": {"value": "Synthetic Broker", "confidence": "high",
+                       "raw_text": ""},
         },
         status=status,
     )
@@ -149,6 +171,86 @@ def test_from_store_sums_and_excludes_unknown_term(tmp_path):
     assert r["lots_included"] == 2
     assert r["lots_excluded"] == 1
     assert any("unknown" in w for w in r["warnings"])
+
+
+def test_from_store_wash_sale_1g_added_back(tmp_path):
+    # F3 / workstation probe: per-lot gain/loss = 1d - 1e + 1g.
+    # (-500) + (-600 + 300) + (+100) = -700 ST exactly.
+    lots = [
+        _lot("1000.00", "1500.00", "short", wash_1g="0.00"),
+        _lot("2000.00", "2600.00", "short", wash_1g="300.00"),
+        _lot("500.00", "400.00", "short", wash_1g="0.00"),
+    ]
+    store = DocumentStore(tmp_path / "data")
+    store.upsert(b1099("w1", 2024, None, None, None, lots=lots))
+    r = from_store(store, 2024)
+    assert r["st_current"] == D("-700.00")
+    assert r["lt_current"] == D("0")
+    assert r["lots_included"] == 3 and r["lots_excluded"] == 0
+
+
+def test_from_store_multi_lot_sums_every_lot(tmp_path):
+    # F1: no silent single-lot fallback -- hand-computed net over 3 lots.
+    lots = [
+        _lot("1000.00", "1500.00", "short"),   # -500 ST
+        _lot("2000.00", "1800.00", "short"),   # +200 ST
+        _lot("2000.00", "1200.00", "long"),    # +800 LT
+    ]
+    store = DocumentStore(tmp_path / "data")
+    store.upsert(b1099("m1", 2024, None, None, None, lots=lots))
+    r = from_store(store, 2024)
+    assert r["st_current"] == D("-300")
+    assert r["lt_current"] == D("800")
+    assert r["lots_included"] == 3 and r["lots_excluded"] == 0
+
+
+def test_from_store_withholding_is_not_gain_loss(tmp_path):
+    # Box 1f (federal income tax withheld) is a withholding credit:
+    # summed separately, never folded into gain/loss.
+    store = DocumentStore(tmp_path / "data")
+    store.upsert(b1099("f1", 2024, "1000.00", "1500.00", "short",
+                       fed_withheld_1f="28.00"))
+    r = from_store(store, 2024)
+    assert r["st_current"] == D("-500")
+    assert r["fed_withheld_1f_total"] == D("28.00")
+
+
+def test_e2e_ingest_validate_carryforward_no_retyping(tmp_path):
+    """D2: synthetic 1099-B text -> ingest -> apply_validation UNCHANGED
+    (no amount retyping) -> from_store succeeds.
+
+    Extractor money values are Decimal-safe strings; carryforward's
+    _coerce accepts them and still loudly rejects floats.
+    """
+    from taxprep.ingest import ingest_file
+    from taxprep.review import apply_validation
+
+    text = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Broker: EXAMPLE BROKERAGE
+Lot 1 1d Proceeds $1000.00 1e Cost or other basis $1500.00 1g Wash sale loss disallowed $0.00 short term
+Lot 2 1d Proceeds $2000.00 1e Cost or other basis $1200.00 1g Wash sale loss disallowed $0.00 long term
+"""
+    src = tmp_path / "b1099.txt"
+    src.write_text(text)
+    store = DocumentStore(tmp_path / "data")
+    docs = ingest_file(src, store)
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.form_type == "1099-B" and doc.tax_year == 2024
+    assert len(doc.fields["lots"]["value"]) == 2
+    for lot in doc.fields["lots"]["value"]:
+        assert isinstance(lot["proceeds_1d"], str)
+        assert isinstance(lot["basis_1e"], str)
+        assert not isinstance(lot["proceeds_1d"], float)
+    # Validate with zero corrections: confirmations only, no retyping.
+    apply_validation(store, doc.doc_id, {},
+                     confirmed=["lots", "broker"],
+                     confirm_form_type=True, confirm_tax_year=True)
+    assert store.get(doc.doc_id).status == "validated"
+    r = from_store(store, 2024)
+    assert r["st_current"] == D("-500")
+    assert r["lt_current"] == D("800")
+    assert r["lots_included"] == 2 and r["lots_excluded"] == 0
 
 
 def test_from_store_empty_year_is_zero(tmp_path):

@@ -374,3 +374,17 @@ def test_report_backward_compat_len_and_iter(iso):
 # -- sync / ORPHANED --------------------------------------------------------------
 # (sync behavior lives in tests/test_sync.py; the unit seam is imported
 # here only for the report-shape assertions above)
+
+
+# -- D4/R15: return-transcript fields carry verbatim raw_text -----------------
+
+def test_transcript_fields_carry_verbatim_raw_text():
+    text = ("TAX RETURN TRANSCRIPT\nTax Year: 2024\n"
+            "Adjusted Gross Income: $85,420.00\n"
+            "Total Tax: $12,340.00\n")
+    fields, status = ingest._fields_from_transcript(
+        "RETURN_TRANSCRIPT", text, 2024)
+    assert fields["agi"]["value"] == 85420.0
+    assert fields["agi"]["raw_text"] == "Adjusted Gross Income: $85,420.00"
+    assert fields["total_tax"]["raw_text"] == "Total Tax: $12,340.00"
+    assert status == "transcribed"

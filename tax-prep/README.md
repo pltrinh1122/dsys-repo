@@ -244,10 +244,14 @@ docstring for the full statement):
 - The low-taxable-income path (worksheet lines 1-4) needs Form
   1040 line 15 per year; until Phase 4 builds the 1040s, line 4
   is set to line 2 and a warning is recorded on every year.
+- Per-lot gain/loss on 1099-B lots is `1d − 1e + 1g`: box 1g (wash
+  sale loss disallowed) is extracted per lot and added back to the
+  lot's gain/loss. Box 1f (federal income tax withheld) is a
+  withholding credit, never part of gain/loss; it is summed separately
+  for the 1040 withholding line (Phase 4).
 - Out of scope (flagged via warnings when indicated): unrecaptured
   section 1250 gain (25%), 28% collectibles rate,
-  qualified-dividend interactions. Wash-sale adjustments are
-  assumed already in 1099-B basis. State rules not modeled.
+  qualified-dividend interactions. State rules not modeled.
 
 ## Phase 6 — local MCP server (stdio only)
 

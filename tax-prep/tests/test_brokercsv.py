@@ -46,12 +46,15 @@ def test_ingest_csv_creates_lot_documents(iso):
     assert d1.form_type == "1099-B" and d1.tax_year == 2024
     assert d1.status == "needs_review"
     assert d1.text_source == "broker-csv"
-    assert d1.fields["1d_proceeds"]["value"] == "1000.00"
-    assert d1.fields["1e_basis"]["value"] == "600.00"
-    assert d1.fields["term"]["value"] == "short"   # normalized
-    assert d1.fields["date_acquired"]["value"] == "01/15/2024"
-    assert d1.fields["date_sold"]["value"] == "06/20/2024"
-    assert docs[1].fields["term"]["value"] == "long"
+    lot1 = d1.fields["lots"]["value"][0]
+    assert lot1["proceeds_1d"] == "1000.00"
+    assert lot1["basis_1e"] == "600.00"
+    assert lot1["term"] == "short"   # normalized
+    assert lot1["date_acquired"] == "01/15/2024"
+    assert lot1["date_sold"] == "06/20/2024"
+    assert lot1["description"] is None  # "Description" is not in the generic map
+    assert d1.fields["lots"]["confidence"] == "high"
+    assert docs[1].fields["lots"]["value"][0]["term"] == "long"
 
 
 def test_unknown_columns_kept_aside_never_dropped(iso):
@@ -68,7 +71,7 @@ def test_term_variants_normalized(iso):
            "10,5,L\n")
     docs = ingest_csv(_csv(iso["tmp"] / "t.csv", csv), "generic", 2024,
                       DocumentStore(iso["data"]))
-    assert [d.fields["term"]["value"] for d in docs] == [
+    assert [d.fields["lots"]["value"][0]["term"] for d in docs] == [
         "short", "long", "long"]
 
 
@@ -76,8 +79,9 @@ def test_unknown_term_kept_verbatim_low_confidence(iso):
     csv = "proceeds,basis,term\n10,5,maybe\n"
     docs = ingest_csv(_csv(iso["tmp"] / "t.csv", csv), "generic", 2024,
                       DocumentStore(iso["data"]))
-    assert docs[0].fields["term"]["value"] == "maybe"
-    assert docs[0].fields["term"]["confidence"] == "low"
+    assert docs[0].fields["lots"]["value"][0]["term"] == "maybe"
+    # unknown term -> from_store will exclude the lot: flagged low
+    assert docs[0].fields["lots"]["confidence"] == "low"
 
 
 def test_unknown_broker_fails_closed(iso):

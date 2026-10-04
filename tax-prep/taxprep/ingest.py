@@ -505,8 +505,12 @@ def _fields_from_transcript(form_type: str, text: str,
         unparsed = parsed.get("unparsed_lines", [])
     else:
         parsed = transcript.parse_return_transcript(text, tax_year=year)
+        # R15: raw_text carries the verbatim transcript line (D4), not a
+        # synthesized "" -- real evidence per field.
+        line_raw = parsed.get("line_raw_text", {})
         fields = {
-            label: {"value": val, "confidence": "high", "raw_text": ""}
+            label: {"value": val, "confidence": "high",
+                    "raw_text": line_raw.get(label, "")}
             for label, val in parsed.get("lines", {}).items()
         }
         for t in parsed.get("transactions", []):

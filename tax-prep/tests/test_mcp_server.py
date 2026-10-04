@@ -54,13 +54,27 @@ def _doc(doc_id, year, form, fields, status="transcribed"):
     )
 
 
-def _b1099(doc_id, year, proceeds, basis, term, status="validated"):
+def _lot(proceeds=None, basis=None, term=None, wash_1g=None):
+    return {
+        "description": None,
+        "date_acquired": "01/15/2024",
+        "date_sold": "06/20/2024",
+        "proceeds_1d": proceeds,
+        "basis_1e": basis,
+        "wash_1g": wash_1g,
+        "fed_withheld_1f": None,
+        "term": term,
+        "covered": None,
+    }
+
+
+def _b1099(doc_id, year, proceeds, basis, term, status="validated", lots=None):
+    if lots is None:
+        lots = [_lot(proceeds, basis, term)]
     return _doc(
         doc_id, year, "1099-B",
         {
-            "1d_proceeds": _field(proceeds),
-            "1e_basis": _field(basis),
-            "term": _field(term),
+            "lots": _field(lots),
             "broker": _field("Synthetic Broker"),
         },
         status=status,
@@ -305,6 +319,11 @@ def test_pii_sweep_all_tools(tmp_path, monkeypatch):
               "employer_name": _field("ACME CORP", "high", "ACME CORP")},
              "validated"),
         _b1099("b1", 2024, "100.00", "50.00", "short", "validated"),
+        # multi-lot doc: the nested lot-table shape must sweep clean too
+        _b1099("b2", 2024, None, None, None, "validated", lots=[
+            _lot("1000.00", "1500.00", "short", wash_1g="300.00"),
+            _lot("2000.00", "1200.00", "long"),
+        ]),
     ])
     # R5 provenance on one doc: the sweep below must cover the new keys
     prov = store.get("w2-a")

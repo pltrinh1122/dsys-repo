@@ -61,8 +61,12 @@ Known simplifications (out of scope)
 * Unrecaptured section 1250 gain (25% rate), 28% collectibles rate,
   and qualified-dividend / capital-gain worksheet interactions --
   flagged via ``flags`` into the ``warnings`` list when indicated.
-* Wash-sale basis adjustments are assumed already reflected in the
-  1099-B lots (box 1g adjustments folded into basis at transcription).
+* Wash sale (F3): box 1g (wash sale loss disallowed) is extracted per
+  lot and ADDED BACK to the lot's gain/loss: per-lot gain/loss =
+  1d proceeds - 1e basis + 1g. Box 1f (federal income tax withheld) is
+  a withholding credit, never part of gain/loss: from_store sums it
+  separately as ``fed_withheld_1f_total`` for the 1040 withholding
+  line (Phase 4).
 * State carryforward rules (states differ; several do not conform to
   the federal worksheet).
 """
@@ -405,35 +409,29 @@ def _parse_money_opt(value: Any) -> Decimal | None:
     return _coerce("1099-B box", value)
 
 
-def _field_value(fields: dict, code: str) -> Any:
-    """One field's value, tolerating both the {"value": ...} record
-    shape and bare values."""
-    f = (fields or {}).get(code)
-    return f.get("value") if isinstance(f, dict) else f
+# The 1099-B lot table lives at fields["lots"]["value"]: a list of
+# per-lot dicts (see extractors._extract_1099_b). Consumers iterate ALL
+# lots -- there is no single-lot fallback; a document with an empty or
+# missing lot table carries zero lots.
 
 
-# Field codes that constitute a lot record on a 1099-B. A document with
-# none of these present carries zero lots; a document with some of them
-# has a (possibly malformed) lot that from_store's existing
-# include/exclude-with-warning logic handles.
-_LOT_FIELD_CODES = ("1d_proceeds", "1e_basis", "term",
-                    "date_acquired", "date_sold")
+def _doc_lots(doc: Any) -> list[dict]:
+    """The 1099-B lot table as a list of per-lot dicts (possibly empty)."""
+    fields = getattr(doc, "fields", None) or {}
+    lots = fields.get("lots")
+    v = lots.get("value") if isinstance(lots, dict) else None
+    return [l for l in v if isinstance(l, dict)] if isinstance(v, list) else []
 
 
 def _has_lot_record(doc: Any) -> bool:
-    """True when this 1099-B carries at least one lot field.
+    """True when this 1099-B carries at least one lot record.
 
     A lot that is present but malformed (unknown term, missing
     proceeds/basis) is NOT zero-lots: from_store already excludes it
-    with a loud warning. Zero lots means the document has no lot data
-    at all -- the case that used to contribute a silent $0.
+    with a loud warning. Zero lots means the document has no lot table
+    entries at all -- the case that used to contribute a silent $0.
     """
-    fields = getattr(doc, "fields", None) or {}
-    for code in _LOT_FIELD_CODES:
-        v = _field_value(fields, code)
-        if v is not None and (not isinstance(v, str) or v.strip()):
-            return True
-    return False
+    return len(_doc_lots(doc)) > 0
 
 
 def carryforward_blockers(store: Any, chained_years: list[int] | None = None) -> list[dict]:
@@ -507,6 +505,12 @@ def from_store(store: Any, year: int) -> dict:
     1099-B for the year is not yet validated (validation is never
     excludable).
 
+    Every lot in every document's lot table is summed (no single-lot
+    fallback). Per-lot gain/loss = 1d proceeds - 1e basis + 1g wash sale
+    loss disallowed; box 1f (federal income tax withheld) is summed
+    separately as ``fed_withheld_1f_total`` -- it is a withholding
+    credit, never part of gain/loss.
+
     Lots with unknown term or missing proceeds/basis are EXCLUDED and
     reported in ``warnings`` -- never guessed.
     """
@@ -531,37 +535,43 @@ def from_store(store: Any, year: int) -> dict:
         )
     st = Decimal("0")
     lt = Decimal("0")
+    fed_withheld_total = Decimal("0")
     warnings: list[str] = []
     included = 0
     excluded = 0
     for d in docs:
-        f = d.fields or {}
-        term = (f.get("term") or {}).get("value")
-        proceeds = _parse_money_opt((f.get("1d_proceeds") or {}).get("value"))
-        basis = _parse_money_opt((f.get("1e_basis") or {}).get("value"))
-        if term not in ("short", "long"):
-            warnings.append(
-                f"{d.doc_id}: term {term!r} unknown -- lot excluded "
-                "from carryforward sums (never guessed)"
-            )
-            excluded += 1
-            continue
-        if proceeds is None or basis is None:
-            warnings.append(
-                f"{d.doc_id}: missing proceeds/basis -- lot excluded "
-                "from carryforward sums"
-            )
-            excluded += 1
-            continue
-        gain_loss = proceeds - basis
-        if term == "short":
-            st += gain_loss
-        else:
-            lt += gain_loss
-        included += 1
+        for n, lot in enumerate(_doc_lots(d), start=1):
+            label = f"{d.doc_id} lot {n}"
+            term = lot.get("term")
+            proceeds = _parse_money_opt(lot.get("proceeds_1d"))
+            basis = _parse_money_opt(lot.get("basis_1e"))
+            wash = _parse_money_opt(lot.get("wash_1g"))
+            withheld = _parse_money_opt(lot.get("fed_withheld_1f"))
+            if term not in ("short", "long"):
+                warnings.append(
+                    f"{label}: term {term!r} unknown -- lot excluded "
+                    "from carryforward sums (never guessed)"
+                )
+                excluded += 1
+                continue
+            if proceeds is None or basis is None:
+                warnings.append(
+                    f"{label}: missing proceeds/basis -- lot excluded "
+                    "from carryforward sums"
+                )
+                excluded += 1
+                continue
+            gain_loss = proceeds - basis + (wash or Decimal("0"))
+            if term == "short":
+                st += gain_loss
+            else:
+                lt += gain_loss
+            fed_withheld_total += withheld or Decimal("0")
+            included += 1
     return {
         "st_current": st,
         "lt_current": lt,
+        "fed_withheld_1f_total": fed_withheld_total,
         "warnings": warnings,
         "lots_included": included,
         "lots_excluded": excluded,

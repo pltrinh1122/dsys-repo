@@ -1,9 +1,8 @@
 """Broker CSV ingest (R7): CSV rows -> 1099-B lot Documents.
 
-Each data row becomes one 1099-B Document whose fields are the lot
-record that carryforward.from_store() consumes: ``term``,
-``1d_proceeds``, ``1e_basis`` (+ ``date_acquired`` / ``date_sold`` when
-the broker provides them). Documents are created with status
+Each data row becomes one 1099-B Document carrying a single-entry lot
+table (``fields["lots"]["value"]`` = [lot dict]) -- the shape
+carryforward.from_store() consumes. Documents are created with status
 ``needs_review`` -- the Operator validates them in the review UI
 before from_store will consume them.
 
@@ -37,15 +36,20 @@ from .store import DocumentStore
 
 # Canonical lot fields (what from_store reads, plus dates).
 CANONICAL_FIELDS = ("proceeds", "basis", "term",
-                    "date_acquired", "date_sold")
+                    "date_acquired", "date_sold", "description",
+                    "wash_1g", "fed_withheld_1f")
 
-# Canonical field -> 1099-B field code on the Document.
+# Canonical field -> key inside the per-lot dict on the Document's
+# fields["lots"]["value"] table.
 FIELD_CODES = {
-    "proceeds": "1d_proceeds",
-    "basis": "1e_basis",
+    "proceeds": "proceeds_1d",
+    "basis": "basis_1e",
     "term": "term",
     "date_acquired": "date_acquired",
     "date_sold": "date_sold",
+    "description": "description",
+    "wash_1g": "wash_1g",
+    "fed_withheld_1f": "fed_withheld_1f",
 }
 
 # Broker column name (normalized) -> canonical field. "generic" covers
@@ -70,6 +74,10 @@ BROKER_MAPS: dict[str, dict[str, str]] = {
         "sold": "date_sold",
         "sale date": "date_sold",
         "disposal date": "date_sold",
+        "wash sale loss disallowed": "wash_1g",
+        "wash sale disallowed": "wash_1g",
+        "federal income tax withheld": "fed_withheld_1f",
+        "backup withholding": "fed_withheld_1f",
     },
     # Best-effort provisional maps (Operator-confirmed in review).
     "fidelity": {
@@ -146,24 +154,51 @@ def ingest_csv(csv_path: str | Path, broker: str, year: int,
         # normalized header -> (original header, value)
         normed = {_norm_header(h or ""): (h, v)
                   for h, v in row.items() if h}
-        fields: dict = {}
+        lot: dict = {
+            "description": None,
+            "date_acquired": None,
+            "date_sold": None,
+            "proceeds_1d": None,
+            "basis_1e": None,
+            "wash_1g": None,
+            "fed_withheld_1f": None,
+            "term": None,
+            "covered": None,
+        }
+        term_conf = "low"
         used_originals: set[str] = set()
         for norm_h, (orig_h, val) in normed.items():
             canon = col_map.get(norm_h)
             if canon is None or canon not in FIELD_CODES:
                 continue
             used_originals.add(orig_h)
+            key = FIELD_CODES[canon]
             if canon == "term":
-                term, conf = _norm_term(val or "")
-                fields[FIELD_CODES[canon]] = _field(term, conf)
+                term, term_conf = _norm_term(val or "")
+                lot[key] = term or None
             else:
-                # Money/dates: keep the broker's raw string (Decimal-safe).
-                fields[FIELD_CODES[canon]] = _field((val or "").strip())
+                # Money/dates/descriptions: keep the broker's raw string
+                # (Decimal-safe -- never floated); from_store coerces them.
+                s = (val or "").strip()
+                lot[key] = s or None
+        fields: dict = {}
         # Unknown columns: kept aside, never dropped silently.
         extra = {orig: (row[orig] or "")
                  for orig in row if orig and orig not in used_originals}
         if extra:
             fields["extra_columns"] = _field(extra, "medium")
+        if lot["proceeds_1d"] and lot["basis_1e"] and term_conf == "high":
+            lots_conf = "high"
+        elif not lot["proceeds_1d"] and not lot["basis_1e"]:
+            lots_conf = "low"
+        elif lot["term"] is not None and term_conf != "high":
+            # Unknown term kept verbatim: from_store will exclude this
+            # lot with a loud warning -- flag it low for the reviewer.
+            lots_conf = "low"
+        else:
+            lots_conf = "medium"
+        fields["lots"] = {"value": [lot], "confidence": lots_conf,
+                          "raw_text": ""}
         fields["broker"] = _field(broker.strip(), "high")
 
         doc = Document(

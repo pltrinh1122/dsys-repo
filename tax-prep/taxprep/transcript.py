@@ -4,6 +4,27 @@ Two entry points:
   - parse_return_transcript: IRS Tax Return Transcript -> lines / transactions.
   - parse_wage_income_transcript: IRS Wage & Income Transcript -> payer blocks.
 
+Mapping contract (return transcript):
+  - Each summary line is normalized (strip, collapse internal whitespace,
+    UPPERCASE), its label region is extracted (text before the value/colon,
+    leading tax-year token removed), and matched against an explicit table
+    of the IRS Tax Return Transcript's actual label strings. Matching is
+    exact-first, then longest/most-specific prefix wins where labels nest
+    ("TOTAL TAX" vs "TOTAL TAX PAYMENTS") — never first-match-wins on
+    substrings.
+  - Ambiguity is surfaced, never silently resolved: a line whose label
+    matches several table entries with different keys leaves every
+    candidate field unset and is recorded in ``unparsed_lines`` prefixed
+    ``"AMBIGUOUS: "``. No conflict-raising infrastructure exists yet; a
+    later arc will raise these as review conflicts. Until then they are
+    visible and flaggable here, never a quiet wrong value.
+  - No silent drops: every non-blank, non-structural line is either mapped
+    to a field, consumed as a transaction, or listed in ``unparsed_lines``
+    (verbatim, or prefixed ``AMBIGUOUS:`` / ``DUPLICATE <key>:``).
+  - Provenance hook (R15): ``line_raw_text`` maps each mapped key to the
+    verbatim source line it was parsed from, so downstream field builders
+    can carry real evidence instead of synthesized ``""`` raw_text.
+
 Design note: these formats vary across sources. Both parsers prefer recall
 over precision: any non-blank line that contributes nothing to the structured
 output is kept verbatim in ``unparsed_lines``. Nothing is silently dropped.
@@ -25,47 +46,163 @@ def _is_structural(line: str) -> bool:
     return any(pat.match(line) for pat in _STRUCTURAL_LINE_RES)
 
 # ---------------------------------------------------------------------------
-# Return transcript: normalized keys for common summary labels.
-# Each entry: (snake_case key, list of label regexes matched case-insensitively
-# against a line). First matching label wins within its own line.
+# Return transcript: exact normalized label table.
+#
+# Each entry is (NORMALIZED_LABEL, key): the IRS Tax Return Transcript's
+# actual label string, normalized (stripped, single spaces, UPPERCASE).
+# A summary line is normalized the same way, its label region is extracted
+# (see _label_candidate), and matched as follows:
+#   * exact label match wins;
+#   * otherwise the longest table label that prefixes the label region
+#     (followed by a separator) wins -- most-specific wins where labels
+#     nest ("TOTAL TAX" vs "TOTAL TAX PAYMENTS"), never first-match-wins
+#     on substrings;
+#   * if the longest match is shared by entries with different keys, the
+#     line is AMBIGUOUS (see module docstring): no field is set.
+# Table entries are (label, key) pairs rather than a dict so that a
+# conflicting duplicate can never be silently resolved by dict ordering --
+# the matcher flags it instead.
 # ---------------------------------------------------------------------------
 
-_RETURN_LABEL_PATTERNS = [
-    ("agi", [
-        r"adjusted\s*gross\s*income",
-        r"\bagi\b",
-    ]),
-    ("taxable_income", [
-        r"taxable\s*income",
-    ]),
-    ("total_tax", [
-        r"total\s*tax",
-    ]),
-    ("withholding", [
-        r"federal\s*income\s*tax\s*withheld",
-        r"\bwithholding\b",
-        r"tax\s*withheld",
-    ]),
-    ("estimated_payments", [
-        r"estimated\s*tax\s*payments?",
-        r"estimated\s*payments?",
-    ]),
-    ("refund", [
-        r"\brefund\b",
-        r"overpayment",
-    ]),
-    ("amount_owed", [
-        r"amount\s*owed",
-        r"balance\s*due",
-        r"amount\s*due",
-    ]),
-    ("exemptions", [
-        r"\bexemptions?\b",
-    ]),
-    ("filing_status", [
-        r"filing\s*status",
-    ]),
+_RETURN_LABEL_TABLE = [
+    # -- core summary vocabulary (original 9 keys) --
+    ("ADJUSTED GROSS INCOME", "agi"),
+    ("ADJUSTED GROSS INCOME PER COMPUTER", "agi"),
+    ("AGI", "agi"),
+    ("TAXABLE INCOME", "taxable_income"),
+    ("TOTAL TAX", "total_tax"),
+    ("TOTAL TAX PER COMPUTER", "total_tax"),
+    ("TOTAL TAX LIABILITY", "total_tax"),
+    ("TAX", "total_tax"),
+    ("TAX PER COMPUTER", "total_tax"),
+    ("FEDERAL INCOME TAX WITHHELD", "withholding"),
+    ("WITHHOLDING", "withholding"),
+    ("ESTIMATED TAX PAYMENTS", "estimated_payments"),
+    ("ESTIMATED PAYMENTS", "estimated_payments"),
+    ("REFUND", "refund"),
+    ("REFUND AMOUNT", "refund"),
+    ("OVERPAID", "refund"),
+    ("OVERPAYMENT", "refund"),
+    ("AMOUNT OWED", "amount_owed"),
+    ("AMOUNT YOU OWE", "amount_owed"),
+    ("BALANCE DUE", "amount_owed"),
+    ("AMOUNT DUE", "amount_owed"),
+    ("EXEMPTIONS", "exemptions"),
+    ("NUMBER OF EXEMPTIONS", "exemptions"),
+    ("FILING STATUS", "filing_status"),
+    # -- payments detail (kept distinct from total_tax) --
+    ("TOTAL TAX PAYMENTS", "total_payments"),
+    ("TOTAL PAYMENTS", "total_payments"),
+    # -- other withholding (never merged into withholding) --
+    ("SOCIAL SECURITY TAX WITHHELD", "ss_tax_withheld"),
+    # -- income detail (extended vocabulary) --
+    ("WAGES, SALARIES, TIPS, ETC.", "wages"),
+    ("WAGES", "wages"),
+    ("TAXABLE INTEREST", "taxable_interest"),
+    ("TAX-EXEMPT INTEREST", "tax_exempt_interest"),
+    ("ORDINARY DIVIDENDS", "ordinary_dividends"),
+    ("QUALIFIED DIVIDENDS", "qualified_dividends"),
+    ("CAPITAL GAIN OR (LOSS)", "capital_gain_loss"),
+    ("CAPITAL GAIN OR LOSS", "capital_gain_loss"),
+    # -- Schedule D --
+    ("SHORT-TERM CAPITAL GAIN OR (LOSS)", "short_term_gain_loss"),
+    ("LONG-TERM CAPITAL GAIN OR (LOSS)", "long_term_gain_loss"),
+    ("SHORT-TERM CAPITAL LOSS CARRYOVER", "short_term_carryover"),
+    ("LONG-TERM CAPITAL LOSS CARRYOVER", "long_term_carryover"),
+    ("CAPITAL LOSS CARRYOVER", "capital_loss_carryover"),
 ]
+
+# Keys whose value is free text / an integer rather than money.
+_TEXT_KEYS = {"filing_status"}
+_INT_KEYS = {"exemptions"}
+
+# Separators allowed between a prefix-matched label and the rest of the
+# label region (e.g. "TOTAL TAX" prefixing "TOTAL TAX.").
+_PREFIX_SEPARATORS = (" ", ":", "-", ".", ",")
+
+# Leading tax-year token on a summary line ("2023 ADJUSTED GROSS INCOME").
+_LEADING_YEAR_RE = re.compile(r"^(?:19|20)\d{2}\b[\s\-:]*")
+
+
+def _normalize_line(raw: str) -> str:
+    """Strip, collapse internal whitespace, uppercase."""
+    return re.sub(r"\s+", " ", raw.strip()).upper()
+
+
+def _label_candidate(norm: str) -> str:
+    """Extract the label region from a normalized summary line.
+
+    The label is the text before the value: cut at the first money match,
+    then at the first colon ("Label: value" layout), then strip a leading
+    tax-year token. Trailing "." is preserved -- real IRS labels such as
+    "WAGES, SALARIES, TIPS, ETC." end with one.
+    """
+    m = _MONEY_RE.search(norm)
+    head = norm[: m.start()] if m else norm
+    if ":" in head:
+        head = head.split(":", 1)[0]
+    head = head.strip(" ,;-")
+    head = _LEADING_YEAR_RE.sub("", head).strip(" ,;-")
+    return head
+
+
+def _match_return_label(candidate: str) -> tuple[str | None, str | None, bool]:
+    """Match a label candidate against the table.
+
+    Returns (key, matched_label, ambiguous). Exact match wins; otherwise
+    the longest prefixing label wins. If the longest length is shared by
+    entries with different keys, ambiguous=True and no key is returned.
+    """
+    if not candidate:
+        return None, None, False
+    hits: list[tuple[int, str, str]] = []
+    for label, key in _RETURN_LABEL_TABLE:
+        if candidate == label:
+            hits.append((len(label), key, label))
+        elif candidate.startswith(label):
+            nxt = candidate[len(label):len(label) + 1]
+            if nxt in _PREFIX_SEPARATORS:
+                hits.append((len(label), key, label))
+    if not hits:
+        return None, None, False
+    best = max(length for length, _, _ in hits)
+    winners = [(key, label) for length, key, label in hits if length == best]
+    keys = {key for key, _ in winners}
+    if len(keys) > 1:
+        return None, None, True
+    return winners[0][0], winners[0][1], False
+
+
+def _label_span_re(label: str) -> re.Pattern:
+    """Regex matching the label in a raw line (flexible whitespace)."""
+    return re.compile(
+        r"\s+".join(re.escape(tok) for tok in label.split(" ")),
+        re.IGNORECASE,
+    )
+
+
+def _summary_value(raw: str, key: str, label: str):
+    """Extract the value for a matched key from the raw line.
+
+    The value region is the text after the matched label; falls back to
+    the whole line. Returns None when no usable value is present.
+    """
+    after = raw
+    m = _label_span_re(label).search(raw)
+    if m:
+        after = raw[m.end():]
+    if key in _TEXT_KEYS:
+        value = after.strip(" :-\t") or None
+        if not value:
+            value = _MONEY_RE.sub("", raw).strip(" :-\t") or None
+        return value
+    if key in _INT_KEYS:
+        m_int = re.search(r"\d+", after)
+        return int(m_int.group(0)) if m_int else None
+    value = _parse_money(after)
+    if value is None:
+        value = _parse_money(raw)
+    return value
 
 # Money extraction: $1,234.00, 1234.00, ($1,234.00) for negatives, "1234.00CR".
 _MONEY_RE = re.compile(r"\$?\s*\(?(\d{1,3}(?:,\d{3})*|\d+)(?:\.(\d{1,2}))?\)?\s*(CR)?")
@@ -157,13 +294,16 @@ def _detect_tax_year_loose(text: str) -> int | None:
 def parse_return_transcript(text: str, tax_year: int | None = None) -> dict:
     """Parse IRS Tax Return Transcript text into a dict.
 
-    Returns {"tax_year", "lines", "transactions", "unparsed_lines"} per the
-    module contract.
+    Returns {"tax_year", "lines", "line_raw_text", "transactions",
+    "unparsed_lines"} per the module contract. ``lines`` maps each parsed
+    key to its value; ``line_raw_text`` maps the same key to the verbatim
+    source line (R15 evidence hook).
     """
     if tax_year is None:
         tax_year = _detect_tax_year(text) or _detect_tax_year_loose(text)
 
     lines: dict = {}
+    line_raw_text: dict = {}  # key -> verbatim source line it was parsed from
     transactions: list = []
     unparsed_lines: list = []
     # Track (line, offset) pairs that were consumed by transaction parsing so
@@ -199,50 +339,45 @@ def parse_return_transcript(text: str, tax_year: int | None = None) -> dict:
         })
         consumed_as_transaction.add(idx)
 
-    # Second pass: summary lines.
+    # Second pass: summary lines -- exact normalized label table, never
+    # first-match-wins on substrings. Every non-blank, non-structural line
+    # is either mapped, flagged AMBIGUOUS / DUPLICATE, or kept verbatim in
+    # unparsed_lines. Nothing is silently dropped.
     for idx, raw in enumerate(raw_lines):
         if not raw.strip() or idx in consumed_as_transaction:
             continue
-        matched = False
-        lower = raw.lower()
-        for key, patterns in _RETURN_LABEL_PATTERNS:
-            for pat in patterns:
-                m = re.search(pat, lower)
-                if not m:
-                    continue
-                # Value region: prefer text after the matched label, else the
-                # whole line (e.g. "2023 Adjusted Gross Income: $65,000").
-                after = raw[m.end():]
-                value: object
-                if key == "filing_status":
-                    value = after.strip(" :-\t") or None
-                    if not value:
-                        value = _MONEY_RE.sub("", raw).strip(" :-\t") or None
-                    if value is None:
-                        break  # label seen but no usable value
-                elif key == "exemptions":
-                    m_int = re.search(r"\d+", after)
-                    value = int(m_int.group(0)) if m_int else None
-                    if value is None:
-                        break
-                else:
-                    value = _parse_money(after)
-                    if value is None:
-                        value = _parse_money(raw)
-                    if value is None:
-                        break  # label seen but no usable value
-                if key not in lines:  # keep first occurrence
-                    lines[key] = value
-                matched = True
-                break
-            if matched:
-                break
-        if not matched and not _is_structural(raw):
+        norm = _normalize_line(raw)
+        if _is_structural(raw) or _is_structural(
+                _LEADING_YEAR_RE.sub("", norm)):
+            continue
+        candidate = _label_candidate(norm)
+        key, label, ambiguous = _match_return_label(candidate)
+        if ambiguous:
+            # Matches several table entries: every candidate field stays
+            # unset; the line is visible and flaggable, never a quiet
+            # wrong value.
+            unparsed_lines.append("AMBIGUOUS: " + raw)
+            continue
+        if key is None:
             unparsed_lines.append(raw)
+            continue
+        value = _summary_value(raw, key, label)
+        if value is None:
+            # Label recognized but no usable value: visible, not mapped.
+            unparsed_lines.append(raw)
+            continue
+        if key in lines:
+            # Deterministic keep-first; the repeat stays visible rather
+            # than being silently dropped.
+            unparsed_lines.append(f"DUPLICATE {key}: " + raw)
+            continue
+        lines[key] = value
+        line_raw_text[key] = raw
 
     return {
         "tax_year": tax_year,
         "lines": lines,
+        "line_raw_text": line_raw_text,
         "transactions": transactions,
         "unparsed_lines": unparsed_lines,
     }

@@ -28,20 +28,33 @@ def _doc(doc_id, year, form, fields, status="transcribed"):
     )
 
 
+def _lot(proceeds=None, basis=None, term=None,
+         d_acq="01/15/2024", d_sold="06/20/2024", wash_1g=None):
+    return {
+        "description": None,
+        "date_acquired": d_acq,
+        "date_sold": d_sold,
+        "proceeds_1d": proceeds,
+        "basis_1e": basis,
+        "wash_1g": wash_1g,
+        "fed_withheld_1f": None,
+        "term": term,
+        "covered": None,
+    }
+
+
 def _b1099(doc_id, year, proceeds, basis, term, status="validated",
-           d_acq="01/15/2024", d_sold="06/20/2024"):
-    return _doc(
-        doc_id, year, "1099-B",
-        {
-            "1d_proceeds": _field(proceeds),
-            "1e_basis": _field(basis),
-            "term": _field(term),
-            "broker": _field("Synthetic Broker"),
-            "date_acquired": _field(d_acq),
-            "date_sold": _field(d_sold),
-        },
-        status=status,
-    )
+           d_acq="01/15/2024", d_sold="06/20/2024", lots=None,
+           summary_totals=None):
+    if lots is None:
+        lots = [_lot(proceeds, basis, term, d_acq, d_sold)]
+    fields = {
+        "lots": _field(lots),
+        "broker": _field("Synthetic Broker"),
+    }
+    if summary_totals is not None:
+        fields["summary_totals"] = _field(summary_totals)
+    return _doc(doc_id, year, "1099-B", fields, status=status)
 
 
 def _store_with(tmp_path, docs):
@@ -119,6 +132,7 @@ def test_lot_integrity_all_pass(tmp_path):
     ])
     r = V.verify_lot_integrity(store, 2024)
     assert r["passed"] is True
+    assert r["n_lots"] == 2
     assert r["n_checks"] == 12 and r["n_failed"] == 0
     assert r["failed_ids"] == []
     _pii_free(r)
@@ -142,8 +156,82 @@ def test_lot_integrity_failures_are_structural_only(tmp_path):
     assert r["failed_by_check"]["dates_parseable"] == 1
     # no values leak: only counts and ids
     _pii_free(r)
-    assert set(r) == {"passed", "n_checks", "n_failed", "failed_ids",
-                      "failed_by_check"}
+    assert set(r) == {"passed", "n_lots", "n_checks", "n_failed",
+                      "failed_ids", "failed_by_check"}
+
+
+def test_lot_integrity_multi_lot_counts_per_lot(tmp_path):
+    # one failing lot fails the doc; n_checks counts every lot
+    store = _store_with(tmp_path, [
+        _b1099("m1", 2024, None, None, None, lots=[
+            _lot("1000.00", "1500.00", "short"),
+            _lot("2000.00", None, "short"),  # missing basis
+        ]),
+    ])
+    r = V.verify_lot_integrity(store, 2024)
+    assert r["passed"] is False
+    assert r["n_lots"] == 2
+    assert r["n_checks"] == 12
+    assert r["failed_ids"] == ["m1"]
+    assert r["failed_by_check"]["basis_present"] == 1
+    _pii_free(r)
+
+
+# -- verify_summary_reconciliation -----------------------------------
+
+def test_summary_reconciliation_pass(tmp_path):
+    store = _store_with(tmp_path, [
+        _b1099("b1", 2024, None, None, None, lots=[
+            _lot("1000.00", "1500.00", "short"),
+            _lot("2500.00", "3000.00", "short"),
+        ], summary_totals={"short": {"proceeds_1d": "3500.00",
+                                     "basis_1e": "4500.00"}}),
+    ])
+    r = V.verify_summary_reconciliation(store, 2024)
+    assert r["passed"] is True
+    assert r["passed_ids"] == ["b1"]
+    assert r["failed_ids"] == [] and r["skipped_ids"] == []
+    assert r["n_compared"] == 2
+    _pii_free(r)
+
+
+def test_summary_reconciliation_tolerance_boundary(tmp_path):
+    # exactly 1 cent of drift passes; more than 1 cent fails
+    store = _store_with(tmp_path, [
+        _b1099("edge", 2024, None, None, None, lots=[
+            _lot("1000.00", "1500.00", "short"),
+        ], summary_totals={"short": {"proceeds_1d": "1000.01",
+                                     "basis_1e": "1500.00"}}),
+    ])
+    r = V.verify_summary_reconciliation(store, 2024)
+    assert r["passed"] is True and r["passed_ids"] == ["edge"]
+
+
+def test_summary_reconciliation_fail(tmp_path):
+    store = _store_with(tmp_path, [
+        _b1099("b1", 2024, None, None, None, lots=[
+            _lot("1000.00", "1500.00", "short"),
+            _lot("2500.00", "3000.00", "short"),
+        ], summary_totals={"short": {"proceeds_1d": "3500.00",
+                                     "basis_1e": "4499.97"}}),
+    ])
+    r = V.verify_summary_reconciliation(store, 2024)
+    assert r["passed"] is False
+    assert r["failed_ids"] == ["b1"]
+    assert r["passed_ids"] == [] and r["skipped_ids"] == []
+    _pii_free(r)
+
+
+def test_summary_reconciliation_skip_when_no_totals(tmp_path):
+    # no summary totals on the statement: skipped, never failed
+    store = _store_with(tmp_path, [
+        _b1099("b1", 2024, "1000.00", "1500.00", "short"),
+    ])
+    r = V.verify_summary_reconciliation(store, 2024)
+    assert r["passed"] is True
+    assert r["skipped_ids"] == ["b1"]
+    assert r["failed_ids"] == [] and r["passed_ids"] == []
+    _pii_free(r)
 
 
 # -- verify_transcript_reconciliation --------------------------------
@@ -339,6 +427,7 @@ def test_verify_all_year_scoping(tmp_path):
     r = V.verify_all(store, 2024)
     assert set(r["checks"]) == {"completeness", "no_silent_drops",
                                 "validation_gate", "lot_integrity",
+                                "summary_reconciliation",
                                 "transcript_reconciliation",
                                 "carryforward_ready"}
     assert r["checks"]["validation_gate"]["passed"] is True

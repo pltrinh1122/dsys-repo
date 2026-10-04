@@ -36,13 +36,13 @@ Some unreadable scan fragment with no boxes at all
 def test_w2_full_exact():
     fields, status = extract_fields("W-2", W2_FULL)
     assert status == "transcribed"
-    assert field(fields, "1")["value"] == 85000.0
+    assert field(fields, "1")["value"] == "85000.00"
     assert field(fields, "1")["confidence"] == "high"
-    assert field(fields, "2")["value"] == 12340.0
-    assert field(fields, "3")["value"] == 85000.0
-    assert field(fields, "4")["value"] == 5270.0
-    assert field(fields, "5")["value"] == 85000.0
-    assert field(fields, "6")["value"] == 1232.5
+    assert field(fields, "2")["value"] == "12340.00"
+    assert field(fields, "3")["value"] == "85000.00"
+    assert field(fields, "4")["value"] == "5270.00"
+    assert field(fields, "5")["value"] == "85000.00"
+    assert field(fields, "6")["value"] == "1232.50"
     assert field(fields, "employer_ein")["value"] == "12-3456789"
     assert field(fields, "employer_ein")["confidence"] == "high"
 
@@ -51,8 +51,8 @@ def test_w2_second_job_year_and_key_boxes():
     assert detect_tax_year(W2_SECOND_JOB) == 2023
     fields, status = extract_fields("W-2", W2_SECOND_JOB)
     assert status == "transcribed"
-    assert field(fields, "1")["value"] == 12000.0
-    assert field(fields, "2")["value"] == 1100.0
+    assert field(fields, "1")["value"] == "12000.00"
+    assert field(fields, "2")["value"] == "1100.00"
     assert field(fields, "employer_ein")["value"] == "98-7654321"
 
 
@@ -80,21 +80,182 @@ Date acquired 01/05/2023 Date sold 11/30/2023 short term
 """
 
 
+def _lots(fields):
+    return field(fields, "lots")["value"]
+
+
 def test_1099b_full_exact():
     fields, status = extract_fields("1099-B", B1099_FULL)
     assert status == "transcribed"
-    assert field(fields, "1d_proceeds")["value"] == 12500.0
-    assert field(fields, "1e_basis")["value"] == 9800.0
-    assert field(fields, "date_acquired")["value"] == "03/15/2022"
-    assert field(fields, "date_sold")["value"] == "06/20/2024"
-    assert field(fields, "term")["value"] == "long"
+    lots = _lots(fields)
+    assert len(lots) == 1
+    lot = lots[0]
+    assert lot["proceeds_1d"] == "12500.00"
+    assert lot["basis_1e"] == "9800.00"
+    assert lot["date_acquired"] == "03/15/2022"
+    assert lot["date_sold"] == "06/20/2024"
+    assert lot["term"] == "long"
     assert "EXAMPLE BROKERAGE" in field(fields, "broker")["value"]
 
 
 def test_1099b_short_term():
     fields, status = extract_fields("1099-B", B1099_SHORT)
-    assert field(fields, "1d_proceeds")["value"] == 2000.0
-    assert field(fields, "term")["value"] == "short"
+    lots = _lots(fields)
+    assert len(lots) == 1
+    assert lots[0]["proceeds_1d"] == "2000.00"
+    assert lots[0]["term"] == "short"
+
+
+# F1: multi-lot labeled layout -- every lot extracted, never just the first.
+B1099_THREE_LOTS = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Broker: EXAMPLE BROKERAGE
+Lot 1 1d Proceeds $1000.00 1e Cost or other basis $1500.00 1g Wash sale loss disallowed $0.00 short term
+Lot 2 1d Proceeds $2000.00 1e Cost or other basis $2600.00 1g Wash sale loss disallowed $300.00 short term
+Lot 3 1d Proceeds $500.00 1e Cost or other basis $400.00 1g Wash sale loss disallowed $0.00 short term
+"""
+
+
+def test_1099b_three_lots_all_extracted():
+    fields, status = extract_fields("1099-B", B1099_THREE_LOTS)
+    assert status == "transcribed"
+    lots = _lots(fields)
+    assert len(lots) == 3
+    assert [l["proceeds_1d"] for l in lots] == ["1000.00", "2000.00", "500.00"]
+    assert [l["basis_1e"] for l in lots] == ["1500.00", "2600.00", "400.00"]
+    # F3: 1g extracted per lot
+    assert [l["wash_1g"] for l in lots] == ["0.00", "300.00", "0.00"]
+    assert all(l["term"] == "short" for l in lots)
+    # money values are Decimal-safe strings, never floats
+    for l in lots:
+        for k in ("proceeds_1d", "basis_1e", "wash_1g"):
+            assert isinstance(l[k], str) and not isinstance(l[k], float)
+
+
+B1099_REPEATED_BLOCKS = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Broker: EXAMPLE BROKERAGE
+Description: 100 SHARES XYZ CORP
+Date acquired: 01/15/2022 Date sold: 06/20/2024
+Box 1d Proceeds: $12,500.00
+Box 1e Cost basis: $9,800.00
+Holding period: long term
+Description: 50 SHARES ABC INC
+Date acquired: 02/10/2023 Date sold: 07/22/2024
+Box 1d Proceeds: $3,000.00
+Box 1e Cost basis: $3,400.00
+Holding period: long term
+"""
+
+
+def test_1099b_repeated_labeled_blocks():
+    fields, status = extract_fields("1099-B", B1099_REPEATED_BLOCKS)
+    assert status == "transcribed"
+    lots = _lots(fields)
+    assert len(lots) == 2
+    assert lots[0]["proceeds_1d"] == "12500.00"
+    assert lots[0]["basis_1e"] == "9800.00"
+    assert lots[0]["description"] == "100 SHARES XYZ CORP"
+    assert lots[1]["proceeds_1d"] == "3000.00"
+    assert lots[1]["basis_1e"] == "3400.00"
+    assert lots[1]["description"] == "50 SHARES ABC INC"
+    assert all(l["term"] == "long" for l in lots)
+
+
+# D3: workstation probes, verbatim -- the greedy-gap truncation bug made
+# "52,345.67" extract as "5.67" and "100.00" as "0.0".
+@pytest.mark.parametrize("text,expected", [
+    ("Form 1099-B\nBroker: X\nLot 1 1d Proceeds 52,345.67", "52345.67"),
+    ("Form 1099-B\nBroker: X\nLot 1 1d Proceeds 100.00", "100.00"),
+    ("Form 1099-B\nBroker: X\nLot 1 1d Proceeds 1234.56", "1234.56"),
+    ("Form 1099-B\nBroker: X\nLot 1 1d Proceeds $52,345.67", "52345.67"),
+    ("Form 1099-B\nBroker: X\nLot 1 1d Proceeds $ 1,234.00", "1234.00"),
+    ("Form 1099-B\nBroker: X\nLot 1 1d Proceeds 8.50", "8.50"),
+    # parenthesized negatives
+    ("Form 1099-B\nBroker: X\nLot 1 1d Proceeds ($1,234.56)", "-1234.56"),
+])
+def test_d3_money_truncation_probes(text, expected):
+    fields, _ = extract_fields("1099-B", text)
+    assert _lots(fields)[0]["proceeds_1d"] == expected
+
+
+@pytest.mark.parametrize("form_type,text,box,expected", [
+    # amounts >= 10 without "$" across W-2 and 1099 box extractors
+    ("W-2", "Form W-2 Tax Year 2024\nWages, tips, other compensation 52,345.67\nEIN 12-3456789\n",
+     "1", "52345.67"),
+    ("W-2", "Form W-2 Tax Year 2024\nFederal income tax withheld 12340.00\nEIN 12-3456789\n",
+     "2", "12340.00"),
+    ("1099-INT", "Form 1099-INT Tax Year 2024\nInterest income 420.50", "1", "420.50"),
+    ("1099-DIV", "Form 1099-DIV Tax Year 2024\nTotal ordinary dividends 1200.00", "1a", "1200.00"),
+    ("1099-NEC", "Form 1099-NEC Tax Year 2024\nNonemployee compensation 8750.00", "1", "8750.00"),
+    ("1099-R", "Form 1099-R Tax Year 2024\nGross distribution 25000.00", "1", "25000.00"),
+    ("1098", "Form 1098 Tax Year 2024\nMortgage interest received 12400.00", "1", "12400.00"),
+    ("1099-MISC", "Form 1099-MISC Tax Year 2024\nRents 3600.00", "1", "3600.00"),
+])
+def test_d3_bare_amounts_across_forms(form_type, text, box, expected):
+    fields, _ = extract_fields(form_type, text)
+    assert field(fields, box)["value"] == expected
+
+
+def test_d3_amount_is_whole_token_in_raw_text():
+    """Invariant: every extracted money string appears as a whole token
+    (comma/space-insensitive) in its field's raw_text -- no truncation."""
+    import re as _re
+    texts = [B1099_FULL, B1099_SHORT, B1099_THREE_LOTS, B1099_REPEATED_BLOCKS,
+             W2_FULL, INT_FULL, DIV_FULL, NEC, R1099, F1098, MISC]
+    forms = ["1099-B"] * 4 + ["W-2", "1099-INT", "1099-DIV", "1099-NEC",
+                              "1099-R", "1098", "1099-MISC"]
+
+    def check_value(value, raw_text):
+        if not isinstance(value, str):
+            return
+        if not _re.fullmatch(r"-?\d+\.\d{2}", value):
+            return
+        # parenthesized negatives carry the "-" outside the raw token
+        token = value.lstrip("-")
+        cleaned = raw_text.replace(",", "")
+        assert _re.search(r"(?<![\d.,])" + _re.escape(token) + r"(?![\d.])",
+                          cleaned), (value, raw_text)
+
+    for form_type, text in zip(forms, texts):
+        fields, _ = extract_fields(form_type, text)
+        for code, f in fields.items():
+            if not isinstance(f, dict):
+                continue
+            v = f.get("value")
+            if code == "lots" and isinstance(v, list):
+                for lot in v:
+                    for lv in lot.values():
+                        check_value(lv, f.get("raw_text") or "")
+            else:
+                check_value(v, f.get("raw_text") or "")
+
+
+# Summary totals (statement-level, feeds verify_summary_reconciliation).
+B1099_WITH_TOTALS = B1099_THREE_LOTS + \
+    "Short-term totals: Proceeds $3500.00 Basis $4500.00\n"
+
+
+def test_1099b_summary_totals_extracted():
+    fields, _ = extract_fields("1099-B", B1099_WITH_TOTALS)
+    totals = field(fields, "summary_totals")["value"]
+    assert totals == {"short": {"proceeds_1d": "3500.00",
+                                "basis_1e": "4500.00"}}
+    # the totals line must not become a fourth lot
+    assert len(_lots(fields)) == 3
+
+
+def test_1099b_summary_totals_absent_is_missing():
+    fields, _ = extract_fields("1099-B", B1099_THREE_LOTS)
+    f = field(fields, "summary_totals")
+    assert f["value"] is None and f["confidence"] == "low"
+
+
+def test_1099b_long_term_totals_form():
+    text = (B1099_THREE_LOTS +
+            "Total Long-Term Proceeds $9000.00\nTotal Long-Term Basis $8100.00\n")
+    fields, _ = extract_fields("1099-B", text)
+    totals = field(fields, "summary_totals")["value"]
+    assert totals["long"] == {"proceeds_1d": "9000.00", "basis_1e": "8100.00"}
+    assert len(_lots(fields)) == 3
 
 
 # ---------------------------------------------------------------- 1099-INT
@@ -112,13 +273,13 @@ Box 1 Interest income $15.25
 def test_1099int_full_exact():
     fields, status = extract_fields("1099-INT", INT_FULL)
     assert status == "transcribed"
-    assert field(fields, "1")["value"] == 420.50
-    assert field(fields, "3")["value"] == 100.00
+    assert field(fields, "1")["value"] == "420.50"
+    assert field(fields, "3")["value"] == "100.00"
 
 
 def test_1099int_simple():
     fields, status = extract_fields("1099-INT", INT_SIMPLE)
-    assert field(fields, "1")["value"] == 15.25
+    assert field(fields, "1")["value"] == "15.25"
 
 
 # ---------------------------------------------------------------- 1099-DIV
@@ -138,15 +299,15 @@ Box 1b Qualified $200.00
 def test_1099div_full_exact():
     fields, status = extract_fields("1099-DIV", DIV_FULL)
     assert status == "transcribed"
-    assert field(fields, "1a")["value"] == 1200.0
-    assert field(fields, "1b")["value"] == 1000.0
-    assert field(fields, "2a")["value"] == 300.0
+    assert field(fields, "1a")["value"] == "1200.00"
+    assert field(fields, "1b")["value"] == "1000.00"
+    assert field(fields, "2a")["value"] == "300.00"
 
 
 def test_1099div_simple():
     fields, status = extract_fields("1099-DIV", DIV_SIMPLE)
-    assert field(fields, "1a")["value"] == 250.0
-    assert field(fields, "1b")["value"] == 200.0
+    assert field(fields, "1a")["value"] == "250.00"
+    assert field(fields, "1b")["value"] == "200.00"
 
 
 # ---------------------------------------------------------------- 1099-NEC / 1099-R / 1098 / 1099-MISC
@@ -183,7 +344,7 @@ MISC_RENTS = """1099-MISC 2023 Box 1 Rents $3,600.00"""
 
 
 def test_1099nec():
-    for txt, expected in ((NEC, 8750.0), (NEC_SMALL, 600.0)):
+    for txt, expected in ((NEC, "8750.00"), (NEC_SMALL, "600.00")):
         fields, status = extract_fields("1099-NEC", txt)
         assert field(fields, "1")["value"] == expected
 
@@ -191,15 +352,15 @@ def test_1099nec():
 def test_1099r():
     fields, status = extract_fields("1099-R", R1099)
     assert status == "transcribed"
-    assert field(fields, "1")["value"] == 25000.0
-    assert field(fields, "2a")["value"] == 25000.0
+    assert field(fields, "1")["value"] == "25000.00"
+    assert field(fields, "2a")["value"] == "25000.00"
     assert field(fields, "7")["value"] == "1"
     fields2, _ = extract_fields("1099-R", R1099_ROLLOVER)
     assert field(fields2, "7")["value"] == "G"
 
 
 def test_1098():
-    for txt, expected in ((F1098, 12400.0), (F1098_SMALL, 9800.0)):
+    for txt, expected in ((F1098, "12400.00"), (F1098_SMALL, "9800.00")):
         fields, status = extract_fields("1098", txt)
         assert field(fields, "1")["value"] == expected
 
@@ -207,10 +368,10 @@ def test_1098():
 def test_1099misc():
     fields, status = extract_fields("1099-MISC", MISC)
     assert status == "transcribed"
-    assert field(fields, "1")["value"] == 6000.0
-    assert field(fields, "3")["value"] == 500.0
+    assert field(fields, "1")["value"] == "6000.00"
+    assert field(fields, "3")["value"] == "500.00"
     fields2, _ = extract_fields("1099-MISC", MISC_RENTS)
-    assert field(fields2, "1")["value"] == 3600.0
+    assert field(fields2, "1")["value"] == "3600.00"
 
 
 # ---------------------------------------------------------------- classification / misc

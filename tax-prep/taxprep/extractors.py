@@ -7,9 +7,17 @@ Main entry point
 ----------------
 ``extract_fields(form_type, text)`` returns ``(fields, status)`` where
 ``fields`` maps each box code of the form to
-``{"value": float | str | None, "confidence": "high"|"medium"|"low",
+``{"value": str | None, "confidence": "high"|"medium"|"low",
 "raw_text": str}`` and ``status`` is ``"transcribed"`` when every KEY box of
 the form was found with high/medium confidence, else ``"needs_review"``.
+
+Money values are canonical Decimal-safe STRINGS (e.g. ``"52345.67"``) --
+never float, never Decimal (DocumentStore is JSONL; carryforward coerces
+via Decimal and loudly rejects floats). The 1099-B extractor returns a
+lot table: ``fields["lots"]["value"]`` is a list of per-lot dicts with
+keys ``description``, ``date_acquired``, ``date_sold``, ``proceeds_1d``,
+``basis_1e``, ``wash_1g``, ``fed_withheld_1f``, ``term``, ``covered``
+(money as Decimal-safe strings, the rest strings or None).
 
 Supporting helpers
 ------------------
@@ -27,21 +35,50 @@ phrases or in a form header line.
 
 import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-_MONEY_RE = r"[\$]?([\d,]+\.\d{2})"
-_MONEY_RE_NODOLLAR = r"([\d,]+\.\d{2})"
+# Money token. The (?<![\d,.]) anchor plus the digit-free label gaps used
+# below (``[^\n\d$]*``) are the D3 truncation fix: the gap between a label
+# and its amount can never swallow leading digits, so "52,345.67" can
+# never truncate to "5.67" and "100.00" can never become "0.00". The
+# captured group is the bare amount; "$ " spacing ("$ 1,234.00") and
+# parenthesized negatives ("($1,234.56)") are accepted -- negation is
+# detected from the match prefix by _paren_negated, not from the group.
+_MONEY_RE = r"(?<![\d,.])\(?\$?[ \t]*([\d,]+\.\d{2})\)?"
+_MONEY_RE_NODOLLAR = r"(?<![\d,.])\(?([\d,]+\.\d{2})\)?"
 
 
-def _parse_money(s: str) -> float | None:
-    """Strip '$' and commas, parse a float. Returns None on failure."""
-    try:
-        return float(s.replace("$", "").replace(",", "").strip())
-    except (ValueError, AttributeError):
+def _parse_money(s: str) -> str | None:
+    """Canonical Decimal-safe money string, e.g. "52345.67".
+
+    Strips '$', commas and whitespace. Never returns float or Decimal --
+    DocumentStore is JSONL and carryforward coerces strings via Decimal
+    (loudly rejecting floats). Returns None on failure.
+    """
+    if not isinstance(s, str):
         return None
+    t = s.replace("$", "").replace(",", "").strip()
+    if not t:
+        return None
+    try:
+        return format(Decimal(t), "f")
+    except InvalidOperation:
+        return None
+
+
+def _paren_negated(m: "re.Match") -> bool:
+    """True when the captured amount is wrapped in parentheses.
+
+    Inspects the text between the match start and the amount capture:
+    after stripping a trailing "$"/spaces (the "($1,234.56)" shape), a
+    "(" means the amount is a parenthesized negative.
+    """
+    pre = m.string[m.start():m.start(1)]
+    return pre.rstrip("$ \t").endswith("(")
 
 
 def _field(value, confidence, raw_text):
@@ -57,13 +94,18 @@ def _money_search(patterns, text):
     """Return (value, raw_text, is_labeled) for the first money pattern that
     matches. ``patterns`` is a list of (regex, labeled_bool). ``labeled``
     patterns drive "high" confidence; unlabeled ones drive "medium".
+    Values are canonical Decimal-safe strings (see _parse_money);
+    parenthesized negatives ("($1,234.56)") come back with a "-" prefix.
     """
     for pattern, labeled in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
             value = _parse_money(m.group(1))
-            if value is not None:
-                return value, m.group(0), labeled
+            if value is None:
+                continue
+            if _paren_negated(m) and not value.startswith("-"):
+                value = "-" + value
+            return value, m.group(0), labeled
     return None, "", False
 
 
@@ -104,6 +146,8 @@ def _box_field(text, label_patterns, box_num, value_transform=None):
     if m:
         value = _parse_money(m.group(1))
         if value is not None:
+            if _paren_negated(m) and not value.startswith("-"):
+                value = "-" + value
             return _field(value, "medium", m.group(0))
     return _missing_field()
 
@@ -431,25 +475,27 @@ def detect_tax_year(text: str) -> int | None:
 def _extract_w2(text: str) -> dict:
     money_boxes = [
         # (box_code, [labeled regexes with money as group 1])
+        # NOTE (D3): every label gap is [^\n\d$]* -- digits are excluded so
+        # a bare "52,345.67" can never truncate to "5.67".
         ("1", [
-            r"Wages,?\s+tips,?\s+other\s+compensation[^\n$]*" + _MONEY_RE,
-            r"\bWages\b[^\n$]*" + _MONEY_RE,
+            r"Wages,?\s+tips,?\s+other\s+compensation[^\n\d$]*" + _MONEY_RE,
+            r"\bWages\b[^\n\d$]*" + _MONEY_RE,
         ]),
         ("2", [
-            r"Federal\s+income\s+tax\s+withheld[^\n$]*" + _MONEY_RE,
-            r"\bFederal\s+withheld\b[^\n$]*" + _MONEY_RE,
+            r"Federal\s+income\s+tax\s+withheld[^\n\d$]*" + _MONEY_RE,
+            r"\bFederal\s+withheld\b[^\n\d$]*" + _MONEY_RE,
         ]),
         ("3", [
-            r"Social\s+security\s+wages[^\n$]*" + _MONEY_RE,
+            r"Social\s+security\s+wages[^\n\d$]*" + _MONEY_RE,
         ]),
         ("4", [
-            r"Social\s+security\s+tax\s+withheld[^\n$]*" + _MONEY_RE,
+            r"Social\s+security\s+tax\s+withheld[^\n\d$]*" + _MONEY_RE,
         ]),
         ("5", [
-            r"Medicare\s+wages\s+(?:and\s+tips)?[^\n$]*" + _MONEY_RE,
+            r"Medicare\s+wages\s+(?:and\s+tips)?[^\n\d$]*" + _MONEY_RE,
         ]),
         ("6", [
-            r"Medicare\s+tax\s+withheld[^\n$]*" + _MONEY_RE,
+            r"Medicare\s+tax\s+withheld[^\n\d$]*" + _MONEY_RE,
         ]),
     ]
     fields = {}
@@ -457,17 +503,18 @@ def _extract_w2(text: str) -> dict:
         fields[box] = _box_field(text, [(p, 1) for p in pats], box)
 
     # Box 12: code + amount, value as string like "D 9500.00".
+    # Decimal-exact (never float): the string is the contract.
     v, raw, labeled = _str_search(
         [
             (
                 r"Box\s*12[^\nA-Z]*?\b([A-Z]{1,2})\s+" + _MONEY_RE_NODOLLAR,
                 True,
-                lambda m: f"{m.group(1)} {float(m.group(2).replace(',', '')):.2f}",
+                lambda m: f"{m.group(1)} {format(Decimal(m.group(2).replace(',', '')), '.2f')}",
             ),
             (
                 r"\b12\b[^\nA-Z]*?\b([A-Z]{1,2})\s+" + _MONEY_RE_NODOLLAR,
                 False,
-                lambda m: f"{m.group(1)} {float(m.group(2).replace(',', '')):.2f}",
+                lambda m: f"{m.group(1)} {format(Decimal(m.group(2).replace(',', '')), '.2f')}",
             ),
         ],
         text,
@@ -523,76 +570,278 @@ def _extract_w2(text: str) -> dict:
     return fields
 
 
+# ---------------------------------------------------------------------------
+# 1099-B lots (F1): every lot on the statement is extracted, never just the
+# first. A statement is split into lot segments -- first at explicit
+# "Lot n" markers, otherwise at repeated proceeds labels (total/subtotal
+# lines are excluded from segmentation; they feed the summary-totals
+# extractor instead). Each segment yields one lot dict; a segment with no
+# lot-like content at all yields no lot.
+# ---------------------------------------------------------------------------
+
+# Per-lot money patterns: (lot key, [(regex, labeled_bool)]). Money is
+# group 1 everywhere; gaps are digit-free (D3).
+_LOT_MONEY_PATTERNS: dict[str, list[tuple[str, bool]]] = {
+    "proceeds_1d": [
+        (r"Proceeds[^\n\d$]*" + _MONEY_RE, True),
+        (r"\b1d\b[^\d\n$]*" + _MONEY_RE, False),
+    ],
+    "basis_1e": [
+        (r"Cost\s*(?:or\s+other)?\s*basis[^\n\d$]*" + _MONEY_RE, True),
+        (r"\b1e\b[^\d\n$]*" + _MONEY_RE, False),
+    ],
+    # F3: box 1g, wash sale loss disallowed -- added BACK to the lot's
+    # gain/loss by carryforward (gain/loss = 1d - 1e + 1g).
+    "wash_1g": [
+        (r"Wash\s+sale\s+loss\s+disallowed[^\n\d$]*" + _MONEY_RE, True),
+        (r"\b1g\b[^\d\n$]*" + _MONEY_RE, False),
+    ],
+    # Box 1f, federal income tax withheld: a withholding credit, never
+    # part of gain/loss (carryforward sums it separately for Phase 4).
+    "fed_withheld_1f": [
+        (r"Federal\s+income\s+tax\s+withheld[^\n\d$]*" + _MONEY_RE, True),
+        (r"Backup\s+withholding[^\n\d$]*" + _MONEY_RE, True),
+        (r"\b1f\b[^\d\n$]*" + _MONEY_RE, False),
+    ],
+}
+
+_LOT_KEYS = ("description", "date_acquired", "date_sold", "proceeds_1d",
+             "basis_1e", "wash_1g", "fed_withheld_1f", "term", "covered")
+
+
+def _clean_description(m: "re.Match") -> str | None:
+    """Trim a captured description at box-label bleed on the same line."""
+    v = m.group(1).strip()
+    v = re.split(r"\s{2,}|\s+\b1[abcdefg]\b", v, maxsplit=1)[0].strip()
+    return v or None
+
+
+_LOT_STR_PATTERNS: dict[str, list[tuple]] = {
+    "description": [
+        (r"Description\s*(?:of\s+(?:property|security))?\s*[:\-]?\s*([^\n]{1,80})",
+         True, _clean_description),
+        (r"\b1a\b\s*[:\-]?\s*([^\n]{1,80})", False, _clean_description),
+    ],
+    "date_acquired": [
+        (r"Date\s+acquired\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", True, 1),
+        (r"\bacquired\b[^\d]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False, 1),
+        (r"\b1b\b[^\d]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False, 1),
+    ],
+    "date_sold": [
+        (r"Date\s+sold\s*(?:or\s+disposed)?\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", True, 1),
+        (r"\bsold\b[^\d]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False, 1),
+        (r"\b1c\b[^\d]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False, 1),
+    ],
+}
+
+
+def _lot_term(segment: str) -> str | None:
+    """Holding term for one lot segment: "short" | "long" | None."""
+    m = re.search(r"\b(short|long)\s*-?\s*term\b", segment, re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    if re.search(r"\blong\b", segment, re.IGNORECASE):
+        return "long"
+    if re.search(r"\bshort\b", segment, re.IGNORECASE):
+        return "short"
+    return None
+
+
+def _lot_covered(segment: str) -> str | None:
+    """Basis-reporting flag for one lot segment, if stated."""
+    if re.search(r"\bnoncovered\b", segment, re.IGNORECASE):
+        return "noncovered"
+    if re.search(r"\bcovered\b", segment, re.IGNORECASE):
+        return "covered"
+    if re.search(r"basis\s+reported\s+to\s+IRS", segment, re.IGNORECASE):
+        return "covered"
+    return None
+
+
+def _extract_one_lot(segment: str) -> tuple[dict, bool]:
+    """Extract one lot dict from a segment.
+
+    Returns (lot, proceeds_labeled): ``proceeds_labeled`` is True when
+    the lot's proceeds came from a labeled pattern (drives the lots
+    field's high/medium confidence).
+    """
+    lot: dict = {}
+    proceeds_labeled = False
+    for key, pats in _LOT_MONEY_PATTERNS.items():
+        v, _raw, labeled = _money_search(pats, segment)
+        lot[key] = v
+        if key == "proceeds_1d" and v is not None:
+            proceeds_labeled = labeled
+    for key, pats in _LOT_STR_PATTERNS.items():
+        v, _raw, _labeled = _str_search(pats, segment)
+        lot[key] = v.strip() if isinstance(v, str) else None
+        if not lot[key]:
+            lot[key] = None
+    lot["term"] = _lot_term(segment)
+    lot["covered"] = _lot_covered(segment)
+    return {k: lot.get(k) for k in _LOT_KEYS}, proceeds_labeled
+
+
+_LOT_MARKER_RE = re.compile(r"\bLots?\s*#?\s*\d+\b", re.IGNORECASE)
+_PROCEEDS_SPLIT_RE = re.compile(
+    r"Proceeds[^\n\d$]*" + _MONEY_RE + r"|\b1d\b[^\d\n$]*" + _MONEY_RE,
+    re.IGNORECASE,
+)
+_TOTAL_LINE_RE = re.compile(r"\btotals?\b|\bsubtotals?\b", re.IGNORECASE)
+
+
+# A repeated lot block usually opens with its description or dates
+# ("Description: ...", "Date acquired: ...") ahead of the proceeds line.
+# When splitting at repeated proceeds labels, the block starts at the
+# nearest such opener -- unless a basis amount intervenes between the
+# opener and the proceeds (then the opener belongs to the previous
+# block's tail, e.g. a description printed after its proceeds).
+_BLOCK_OPENER_RE = re.compile(
+    r"Description\s*(?:of\s+(?:property|security))?\s*[:\-]?"
+    r"|Date\s+acquired"
+    r"|Date\s+sold\s*(?:or\s+disposed)?"
+    r"|\b1[abc]\b",
+    re.IGNORECASE,
+)
+_BASIS_DISQUALIFIER_RE = re.compile(
+    r"Cost\s*(?:or\s+other)?\s*basis[^\n\d$]*" + _MONEY_RE
+    + r"|\b1e\b[^\d\n$]*" + _MONEY_RE,
+    re.IGNORECASE,
+)
+
+
+def _total_line_spans(text: str) -> list[tuple[int, int]]:
+    """Spans of lines mentioning totals/subtotals (statement-level, not lots)."""
+    spans = []
+    for m in re.finditer(r"(?m)^[^\n]*$", text):
+        if _TOTAL_LINE_RE.search(m.group(0)):
+            spans.append((m.start(), m.end()))
+    return spans
+
+
+def _split_lot_segments(text: str) -> list[str]:
+    """Split statement text into per-lot segments.
+
+    1. Explicit "Lot n" markers win: each marker starts a segment (the
+       preamble before the first marker holds statement-level info and
+       is not a lot).
+    2. Otherwise, repeated proceeds labels start new segments -- but
+       never on total/subtotal lines (those feed the summary-totals
+       extractor, not the lot table).
+    3. Zero or one proceeds label: the whole text is one lot.
+    """
+    markers = list(_LOT_MARKER_RE.finditer(text))
+    if markers:
+        segs = []
+        for i, m in enumerate(markers):
+            end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+            seg = text[m.end():end]
+            if seg.strip():
+                segs.append(seg)
+        if segs:
+            return segs
+    total_spans = _total_line_spans(text)
+
+    def _on_total_line(pos: int) -> bool:
+        return any(s <= pos < e for s, e in total_spans)
+
+    proc_matches = [m for m in _PROCEEDS_SPLIT_RE.finditer(text)
+                    if not _on_total_line(m.start())]
+    if len(proc_matches) <= 1:
+        return [text]
+    # Repeated labeled blocks: each block starts at the nearest
+    # description/date opener ahead of its proceeds label (see
+    # _BLOCK_OPENER_RE); without an opener the block starts at the
+    # proceeds label itself.
+    openers = list(_BLOCK_OPENER_RE.finditer(text))
+    bounds: list[int] = []
+    prev_proc_end = 0
+    for pm in proc_matches:
+        cands = [om for om in openers if prev_proc_end < om.start() < pm.start()]
+        block_start = pm.start()
+        for om in cands:
+            # An opener with a basis amount between it and this lot's
+            # proceeds belongs to the previous block's tail, not to
+            # this block: keep looking.
+            if _BASIS_DISQUALIFIER_RE.search(text, om.end(), pm.start()):
+                continue
+            block_start = om.start()
+            break
+        bounds.append(block_start)
+        prev_proc_end = pm.end()
+    segs = []
+    for i, b in enumerate(bounds):
+        end = bounds[i + 1] if i + 1 < len(bounds) else len(text)
+        segs.append(text[b:end])
+    return segs
+
+
+# Statement-level summary totals, e.g. "Short-term totals: Proceeds
+# $3,000.00 Basis $4,100.00". Feeds verify_summary_reconciliation
+# (metadata-only: lot sums vs these totals, 1-cent tolerance).
+_SUMMARY_KINDS: dict[str, list[str]] = {
+    "proceeds_1d": [r"Proceeds", r"Gross\s+proceeds"],
+    "basis_1e": [r"(?:Cost\s+(?:or\s+other\s+)?)?[Bb]asis"],
+}
+
+
+def _extract_summary_totals(text: str) -> dict:
+    """Per-category summary totals: {"short": {"proceeds_1d", "basis_1e"},
+    "long": {...}} -- only categories/kinds actually shown. Missing when
+    the statement shows no totals (the reconciliation check then skips
+    the document, never fails it)."""
+    totals: dict = {}
+    raw_spans: list[str] = []
+    for cat, cat_label in (("short", r"Short[\s-]*term"),
+                           ("long", r"Long[\s-]*term")):
+        cat_totals: dict = {}
+        for key, labels in _SUMMARY_KINDS.items():
+            label_alt = "(?:" + "|".join(labels) + ")"
+            v, raw, _labeled = _money_search(
+                [
+                    (r"(?:Totals?|Subtotals?)\s+" + cat_label + r"\s+"
+                     + label_alt + r"[^\n\d$]*" + _MONEY_RE, True),
+                    (cat_label + r"\s+totals?\b[^\n]*?" + label_alt
+                     + r"[^\n\d$]*" + _MONEY_RE, True),
+                ],
+                text,
+            )
+            if v is not None:
+                cat_totals[key] = v
+                raw_spans.append(raw)
+        if cat_totals:
+            totals[cat] = cat_totals
+    if not totals:
+        return _missing_field()
+    return _field(totals, "high", "\n".join(raw_spans))
+
+
 def _extract_1099_b(text: str) -> dict:
     fields = {}
 
-    v, raw, labeled = _money_search(
-        [
-            (r"Proceeds[^\n$]*" + _MONEY_RE, True),
-            (r"\b1d\b[^\d\n$]*" + _MONEY_RE, False),
-        ],
-        text,
-    )
-    fields["1d_proceeds"] = (
-        _field(v, "high" if labeled else "medium", raw)
-        if v is not None
-        else _missing_field()
-    )
+    lots: list[dict] = []
+    all_labeled = True
+    any_proceeds = False
+    lot_raw: list[str] = []
+    for seg in _split_lot_segments(text):
+        lot, proceeds_labeled = _extract_one_lot(seg)
+        if not any(v is not None for v in lot.values()):
+            continue  # no lot-like content in this segment
+        lots.append(lot)
+        lot_raw.append(seg.strip())
+        if lot["proceeds_1d"] is not None:
+            any_proceeds = True
+            all_labeled = all_labeled and proceeds_labeled
+    if lots and any_proceeds:
+        fields["lots"] = _field(
+            lots, "high" if all_labeled else "medium", "\n".join(lot_raw))
+    elif lots:
+        # Lots parsed but no proceeds anywhere: present but malformed.
+        fields["lots"] = _field(lots, "low", "\n".join(lot_raw))
+    else:
+        fields["lots"] = _missing_field()
 
-    v, raw, labeled = _money_search(
-        [
-            (r"Cost\s*(?:or\s+other)?\s*basis[^\n$]*" + _MONEY_RE, True),
-            (r"\b1e\b[^\d\n$]*" + _MONEY_RE, False),
-        ],
-        text,
-    )
-    fields["1e_basis"] = (
-        _field(v, "high" if labeled else "medium", raw)
-        if v is not None
-        else _missing_field()
-    )
-
-    v, raw, labeled = _str_search(
-        [
-            (r"Date\s+acquired\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", True, 1),
-            (r"\bacquired\b[^\d]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False, 1),
-        ],
-        text,
-    )
-    fields["date_acquired"] = (
-        _field(v, "high" if labeled else "medium", raw)
-        if v is not None
-        else _missing_field()
-    )
-
-    v, raw, labeled = _str_search(
-        [
-            (r"Date\s+sold\s*(?:or\s+disposed)?\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", True, 1),
-            (r"\bsold\b[^\d]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False, 1),
-        ],
-        text,
-    )
-    fields["date_sold"] = (
-        _field(v, "high" if labeled else "medium", raw)
-        if v is not None
-        else _missing_field()
-    )
-
-    term = None
-    term_raw = ""
-    term_conf = "low"
-    m = re.search(r"\b(short|long)\s*-?\s*term\b", text, re.IGNORECASE)
-    if m:
-        term = m.group(1).lower()
-        term_raw = m.group(0)
-        term_conf = "high"
-    elif re.search(r"\bshort\b", text, re.IGNORECASE) and not re.search(
-        r"\blong\b", text, re.IGNORECASE
-    ):
-        term, term_raw, term_conf = "short", "short", "medium"
-    elif re.search(r"\blong\b", text, re.IGNORECASE):
-        term, term_raw, term_conf = "long", "long", "medium"
-    fields["term"] = _field(term, term_conf, term_raw)
+    fields["summary_totals"] = _extract_summary_totals(text)
 
     v, raw, labeled = _str_search(
         [
@@ -624,43 +873,43 @@ def _generic_money_extractor(defs):
 
 
 _extract_1099_int = _generic_money_extractor([
-    ("1", [r"Interest\s+income[^\n$]*" + _MONEY_RE,
-           r"\bInterest\b[^\n$]*" + _MONEY_RE], True),
-    ("3", [r"Interest\s+on\s+U\.?S\.?\s+Savings\s+Bonds[^\n$]*" + _MONEY_RE,
-           r"\bBonds?[^\n$]*" + _MONEY_RE], False),
+    ("1", [r"Interest\s+income[^\n\d$]*" + _MONEY_RE,
+           r"\bInterest\b[^\n\d$]*" + _MONEY_RE], True),
+    ("3", [r"Interest\s+on\s+U\.?S\.?\s+Savings\s+Bonds[^\n\d$]*" + _MONEY_RE,
+           r"\bBonds?[^\n\d$]*" + _MONEY_RE], False),
 ])
 
 _extract_1099_div = _generic_money_extractor([
-    ("1a", [r"Total\s+ordinary\s+dividends[^\n$]*" + _MONEY_RE,
-            r"Ordinary\s+dividends[^\n$]*" + _MONEY_RE], True),
-    ("1b", [r"Qualified\s+dividends[^\n$]*" + _MONEY_RE], False),
-    ("2a", [r"Total\s+capital\s+gain\s+distr[^\n$]*" + _MONEY_RE,
-            r"Capital\s+gain[^\n$]*" + _MONEY_RE], False),
+    ("1a", [r"Total\s+ordinary\s+dividends[^\n\d$]*" + _MONEY_RE,
+            r"Ordinary\s+dividends[^\n\d$]*" + _MONEY_RE], True),
+    ("1b", [r"Qualified\s+dividends[^\n\d$]*" + _MONEY_RE], False),
+    ("2a", [r"Total\s+capital\s+gain\s+distr[^\n\d$]*" + _MONEY_RE,
+            r"Capital\s+gain[^\n\d$]*" + _MONEY_RE], False),
 ])
 
 _extract_1099_nec = _generic_money_extractor([
-    ("1", [r"Nonemployee\s+compensation[^\n$]*" + _MONEY_RE,
-           r"\bCompensation\b[^\n$]*" + _MONEY_RE], True),
+    ("1", [r"Nonemployee\s+compensation[^\n\d$]*" + _MONEY_RE,
+           r"\bCompensation\b[^\n\d$]*" + _MONEY_RE], True),
 ])
 
 _extract_1098 = _generic_money_extractor([
-    ("1", [r"Mortgage\s+interest\s+received[^\n$]*" + _MONEY_RE,
-           r"Mortgage\s+interest[^\n$]*" + _MONEY_RE], True),
+    ("1", [r"Mortgage\s+interest\s+received[^\n\d$]*" + _MONEY_RE,
+           r"Mortgage\s+interest[^\n\d$]*" + _MONEY_RE], True),
 ])
 
 _extract_1099_misc = _generic_money_extractor([
-    ("1", [r"\bRents\b[^\n$]*" + _MONEY_RE], True),
-    ("3", [r"Other\s+income[^\n$]*" + _MONEY_RE], False),
+    ("1", [r"\bRents\b[^\n\d$]*" + _MONEY_RE], True),
+    ("3", [r"Other\s+income[^\n\d$]*" + _MONEY_RE], False),
 ])
 
 
 def _extract_1099_r(text: str) -> dict:
     fields = {}
     fields["1"] = _box_field(
-        text, [(r"Gross\s+distribution[^\n$]*" + _MONEY_RE, 1)], "1"
+        text, [(r"Gross\s+distribution[^\n\d$]*" + _MONEY_RE, 1)], "1"
     )
     fields["2a"] = _box_field(
-        text, [(r"Taxable\s+amount[^\n$]*" + _MONEY_RE, 1)], "2a"
+        text, [(r"Taxable\s+amount[^\n\d$]*" + _MONEY_RE, 1)], "2a"
     )
     v, raw, labeled = _str_search(
         [
@@ -684,7 +933,7 @@ def _extract_1099_r(text: str) -> dict:
 
 _FORM_REGISTRY = {
     "W-2": (_extract_w2, ["1", "2", "employer_ein"]),
-    "1099-B": (_extract_1099_b, ["1d_proceeds", "broker"]),
+    "1099-B": (_extract_1099_b, ["lots", "broker"]),
     "1099-INT": (_extract_1099_int, ["1"]),
     "1099-DIV": (_extract_1099_div, ["1a"]),
     "1099-NEC": (_extract_1099_nec, ["1"]),
