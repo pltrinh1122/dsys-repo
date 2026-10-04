@@ -549,13 +549,19 @@ def verify_evidence(store, year: int) -> dict:
     Page bounds come from the bronze PDF's vector page size -- no
     rendering, no PII, and no renderer required.
 
-    Arming rule (mirrors the R17 precedent): the check reports
-    ``applicable=False`` and stays green until at least one field in the
-    year carries recorded geometry -- per-field geometry is the sibling
-    R15-P4 contract and has not landed yet, so a field without geometry
-    cannot have a snapshot and must not fail the suite for it. Once
-    geometry exists anywhere in the year, every extracted field without
-    a snapshot and every computed field without lineage fails.
+    Fail-closed on missing geometry: every extracted field without
+    recorded geometry counts in ``n_fields_without_geometry`` and FAILS
+    the check. This is deliberate -- pdfplumber is the bbox source for
+    native PDFs, and when it is absent (an undeclared dependency on a
+    clean install) the extractor silently records no geometry at all.
+    An "arming rule" that stayed green until geometry appeared anywhere
+    would hide exactly that failure, so it is removed: the check is
+    applicable whenever the year holds any extracted/computed fields,
+    and absence of geometry is a fail, never a skip. Operator-confirmed
+    no-evidence rows (the review-UI verify-original gate) are the
+    disposition path for individual fields, but they do not satisfy
+    this blind check -- the check reports what the geometry record
+    holds, mechanically.
 
     Blind-safe: doc_ids, scrubbed box codes, counts, booleans -- never
     values, raw_text, or image data.
@@ -565,11 +571,11 @@ def verify_evidence(store, year: int) -> dict:
     docs = [d for d in store.list(year=year)]
     per_doc: dict[str, dict] = {}
     n_without_snapshot = 0
+    n_without_geometry = 0
     n_without_lineage = 0
     n_out_of_bounds = 0
     n_bounds_unknown = 0
     out_of_bounds: list[dict] = []
-    any_geometry = False
 
     for d in docs:
         fields = {c: f for c, f in (d.fields or {}).items()
@@ -584,7 +590,6 @@ def verify_evidence(store, year: int) -> dict:
             ev = _evidence.field_evidence(f)
             g = ev["geometry"]
             if g is not None:
-                any_geometry = True
                 stat["n_with_geometry"] += 1
             if _evidence.is_computed(f):
                 if ev["state"] == _evidence.STATE_NO_EVIDENCE:
@@ -594,6 +599,7 @@ def verify_evidence(store, year: int) -> dict:
             if g is None:
                 stat["n_without_snapshot"] += 1
                 n_without_snapshot += 1
+                n_without_geometry += 1
                 continue
             if bronze_path is None:
                 stat["n_bounds_unknown"] += 1
@@ -615,16 +621,20 @@ def verify_evidence(store, year: int) -> dict:
                      "field": _scrub_evidence_code(code)})
         per_doc[d.doc_id] = stat
 
-    applicable = any_geometry
+    # Fail-closed: the only "not applicable" case is a year with no
+    # fields at all (a vacuum passes). Any extracted field without
+    # geometry fails -- there is no skip path for missing geometry.
+    applicable = bool(per_doc)
     passed = (not applicable
               or (n_without_snapshot == 0 and n_without_lineage == 0
                   and n_out_of_bounds == 0))
     return {
         "passed": passed,
         "applicable": applicable,
-        "reason": None if applicable else "no_recorded_geometry",
+        "reason": None if applicable else "no_fields",
         "n_docs": len(per_doc),
         "n_extracted_fields_without_snapshot": n_without_snapshot,
+        "n_fields_without_geometry": n_without_geometry,
         "n_computed_fields_without_lineage": n_without_lineage,
         "n_bbox_out_of_bounds": n_out_of_bounds,
         "n_bbox_bounds_unknown": n_bounds_unknown,

@@ -436,7 +436,7 @@ def test_transcript_fields_carry_verbatim_raw_text():
             "Total Tax: $12,340.00\n")
     fields, status = ingest._fields_from_transcript(
         "RETURN_TRANSCRIPT", text, 2024)
-    assert fields["agi"]["value"] == 85420.0
+    assert fields["agi"]["value"] == "85420.00"
     assert fields["agi"]["raw_text"] == "Adjusted Gross Income: $85,420.00"
     assert fields["total_tax"]["raw_text"] == "Total Tax: $12,340.00"
     assert status == "transcribed"
@@ -500,7 +500,7 @@ def test_roa_fields_merge_both_sections_with_provenance():
     # R15: raw_text is the verbatim source line (never a synthesized
     # "section: <raw>" tag); section provenance rides the extraction
     # span, which addresses the verbatim line in the input text.
-    assert fields["agi"]["value"] == 85420.0
+    assert fields["agi"]["value"] == "85420.00"
     assert fields["agi"]["raw_text"] == \
         "Adjusted Gross Income: $85,420.00"
     assert fields["agi"]["confidence"] == "high"
@@ -531,7 +531,7 @@ def test_roa_fields_top_level_unparsed_needs_review():
     assert fields["_unparsed_lines"]["value"] == ["Some cover-page notice"]
     assert status == "needs_review"
     # sections still merged
-    assert fields["agi"]["value"] == 85420.0
+    assert fields["agi"]["value"] == "85420.00"
     assert fields["account_balance"]["value"] == "0.00"
 
 
@@ -569,11 +569,11 @@ def test_record_of_account_ingests_end_to_end(iso):
     assert doc.status == "transcribed"
     # both sections present; R15: verbatim raw_text + real char_spans
     # (the transient _extract_span is replaced by provenance at ingest)
-    assert doc.fields["agi"]["value"] == 85420.0  # return parser emits floats (pre-existing)
+    assert doc.fields["agi"]["value"] == "85420.00"  # D2: Decimal-safe strings
     assert doc.fields["agi"]["raw_text"] == \
         "Adjusted Gross Income: $85,420.00"
     prov = doc.fields["agi"]["provenance"]
-    assert prov["extractor"] == "transcript:1"
+    assert prov["extractor"] == "transcript:2"
     cs = prov["char_span"]
     assert cs["page"] == 0
     assert ROA_TEXT[cs["start"]:cs["end"]] == \

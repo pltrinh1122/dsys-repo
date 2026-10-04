@@ -3,7 +3,7 @@ name = "taxprep"
 version = "0.1.0"
 description = "Phase 1: local-only CLI to transcribe tax documents (PDF + OCR) into structured digital form for amended-return preparation."
 requires-python = ">=3.11"
-dependencies = ["pypdf", "cryptography", "mcp<2", "pdf2image"]
+dependencies = ["pypdf", "cryptography", "mcp<2", "pdf2image", "pdfplumber"]
 
 [project.optional-dependencies]
 dev = ["pytest", "reportlab"]
@@ -19,6 +19,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["taxprep*"]
+
+[tool.setuptools.package-data]
+taxprep = ["*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

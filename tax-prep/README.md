@@ -18,6 +18,20 @@ python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
 
+## Packaging
+
+A plain `pip install .` (non-editable, e.g. the workstation's gate
+install) gets a working package with no repo checkout present:
+`medallion_schema.sql` ships inside the wheel via
+`[tool.setuptools.package-data]` (`taxprep = ["*.sql"]`), and
+`mstore.py` loads it through `importlib.resources` — never a
+source-tree-relative path. Runtime dependencies are declared in
+`pyproject.toml`: `pypdf`, `cryptography`, `mcp<2`, `pdf2image`,
+`pdfplumber` (the bbox source for native PDFs). `tests/test_packaging_smoke.py`
+guards this: it builds a wheel from a clean export, installs it into a
+throwaway venv, and opens a DocumentStore with the source tree nowhere
+on `sys.path`.
+
 ## Usage
 
 ```bash

@@ -39,11 +39,18 @@ import sqlite3
 import threading
 from dataclasses import replace
 from datetime import datetime, timezone
+from importlib.resources import files
 from pathlib import Path
 
 from .models import Document
 
-_SCHEMA_PATH = Path(__file__).with_name("medallion_schema.sql")
+
+def _load_schema_sql() -> str:
+    # Packaged resource, not a source-tree-relative path: the
+    # [tool.setuptools.package-data] taxprep = ["*.sql"] entry ships
+    # medallion_schema.sql inside the wheel, so importlib.resources finds
+    # it in a pip-installed copy where no source tree exists.
+    return files("taxprep").joinpath("medallion_schema.sql").read_text(encoding="utf-8")
 
 # How long a writer waits on a contended database before failing loudly.
 # A write is never silently skipped. Monkeypatchable in tests.
@@ -292,7 +299,7 @@ class MedallionStore:
         # (Python 3.12), so the schema is applied outside txn(). A failure
         # propagates to _connect, which drops the temp file so the next
         # open retries from scratch.
-        sql = _SCHEMA_PATH.read_text(encoding="utf-8")
+        sql = _load_schema_sql()
         with self._op_lock:
             self._conn.executescript(sql)
 

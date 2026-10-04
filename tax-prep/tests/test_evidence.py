@@ -364,13 +364,25 @@ def test_snapshot_out_of_bounds_refused(pstore):
 
 
 def test_crop_text_matches_field_raw_text(pstore):
-    # R19 test 9b: the text inside the crop's bbox equals raw_text --
-    # via pdfplumber within-bbox, or OCR of the crop where tesseract is
-    # present. Neither is installed here: the check is skipped, not faked.
-    pytest.importorskip("pdfplumber",
-                        reason="pdfplumber absent: within-bbox check skipped")
-    if shutil.which("tesseract") is None:
-        pytest.skip("tesseract absent: OCR-of-crop check skipped")
+    # R19 test 9b: the text inside the recorded bbox equals the field's
+    # raw_text, verified against the immutable bronze PDF with
+    # pdfplumber's within-bbox extraction. Hard import -- pdfplumber is
+    # the bbox source for native PDFs; when it is absent this test must
+    # FAIL, never skip (P2: missing geometry is a failure, not a gap).
+    import pdfplumber
+
+    store, doc, _, _ = pstore
+    g = doc.fields["box1_wages"]["geometry"]
+    raw = doc.fields["box1_wages"]["raw_text"]
+    bronze = E.bronze_path_for_doc(store, doc)
+    assert bronze is not None
+    x0, y0, x1, y1 = g["bbox_pdf"]
+    with pdfplumber.open(str(bronze)) as pdf:
+        page = pdf.pages[E.bronze_page_for(doc, g["page"])]
+        h = float(page.height)
+        crop = page.within_bbox((x0, h - y1, x1, h - y0))
+        text = " ".join((crop.extract_text() or "").split())
+    assert " ".join(raw.split()) in text
 
 
 def test_verify_original_roundtrip(pstore):
@@ -399,7 +411,10 @@ def _pii_free(obj):
         assert "85000" not in obj and "Acme" not in obj
 
 
-def test_verify_evidence_not_applicable_without_geometry(tmp_path):
+def test_verify_evidence_missing_geometry_fails(tmp_path):
+    # P2: missing geometry FAILS the blind check -- never a skip. This
+    # is the clean-install shape: native PDF, no bbox source, so no
+    # field carries geometry.
     store = DocumentStore(tmp_path / "data")
     doc = Document(doc_id="t1", tax_year=2024, form_type="W-2",
                    source_path="t.txt", ocr_text_ref="",
@@ -407,8 +422,25 @@ def test_verify_evidence_not_applicable_without_geometry(tmp_path):
                    status="transcribed")
     store.upsert(doc)
     r = V.verify_evidence(store, 2024)
+    assert r["applicable"] is True
+    assert r["passed"] is False
+    assert r["n_fields_without_geometry"] == 1
+    assert r["reason"] is None
+    _pii_free(r)
+
+
+def test_verify_evidence_vacuum_not_applicable(tmp_path):
+    # The only "not applicable" case is a year with no fields at all --
+    # a vacuum stays green. (Any extracted field without geometry
+    # fails; see above.)
+    store = DocumentStore(tmp_path / "data")
+    doc = Document(doc_id="t0", tax_year=2024, form_type="W-2",
+                   source_path="t.txt", ocr_text_ref="",
+                   fields={}, status="transcribed")
+    store.upsert(doc)
+    r = V.verify_evidence(store, 2024)
     assert r["passed"] is True and r["applicable"] is False
-    assert r["reason"] == "no_recorded_geometry"
+    assert r["reason"] == "no_fields"
     _pii_free(r)
 
 

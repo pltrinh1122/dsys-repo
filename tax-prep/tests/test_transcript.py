@@ -30,19 +30,19 @@ Refund: $1,200.00
 def test_return_transcript_lines():
     r = parse_return_transcript(RETURN_TRANSCRIPT)
     assert r["tax_year"] == 2024
-    assert r["lines"]["agi"] == 85420.0
-    assert r["lines"]["taxable_income"] == 71220.0
-    assert r["lines"]["total_tax"] == 12340.0
-    assert r["lines"]["withholding"] == 12340.0
+    assert r["lines"]["agi"] == "85420.00"
+    assert r["lines"]["taxable_income"] == "71220.00"
+    assert r["lines"]["total_tax"] == "12340.00"
+    assert r["lines"]["withholding"] == "12340.00"
     assert r["lines"]["filing_status"] == "Single"
 
 
 def test_return_transcript_transactions():
     r = parse_return_transcript(RETURN_TRANSCRIPT)
     codes = {t["code"]: t for t in r["transactions"]}
-    assert codes["150"]["amount"] == 12340.0
+    assert codes["150"]["amount"] == "12340.00"
     assert codes["150"]["date"] == "04-15-2025"
-    assert codes["806"]["amount"] == 12340.0
+    assert codes["806"]["amount"] == "12340.00"
 
 
 def test_return_transcript_unparsed_kept():
@@ -55,9 +55,9 @@ def test_return_transcript_unparsed_kept():
 def test_return_transcript_variant_labels():
     r = parse_return_transcript(RETURN_TRANSCRIPT_REFUND)
     assert r["tax_year"] == 2023
-    assert r["lines"]["agi"] == 50000.0
-    assert r["lines"]["withholding"] == 6000.0
-    assert r["lines"]["refund"] == 1200.0
+    assert r["lines"]["agi"] == "50000.00"
+    assert r["lines"]["withholding"] == "6000.00"
+    assert r["lines"]["refund"] == "1200.00"
 
 
 WAGE_INCOME = """WAGE AND INCOME TRANSCRIPT Tax Year 2024
@@ -129,31 +129,31 @@ def _d4_transcript(*summary_lines):
 def test_label_order_payments_before_liability():
     r = parse_return_transcript(
         _d4_transcript(D4_PAYMENTS, D4_LIABILITY))
-    assert r["lines"]["total_tax"] == 12340.0
-    assert r["lines"]["total_payments"] == 5000.0
+    assert r["lines"]["total_tax"] == "12340.00"
+    assert r["lines"]["total_payments"] == "5000.00"
     assert not r["unparsed_lines"]
 
 
 def test_label_order_liability_before_payments():
     r = parse_return_transcript(
         _d4_transcript(D4_LIABILITY, D4_PAYMENTS))
-    assert r["lines"]["total_tax"] == 12340.0
-    assert r["lines"]["total_payments"] == 5000.0
+    assert r["lines"]["total_tax"] == "12340.00"
+    assert r["lines"]["total_payments"] == "5000.00"
     assert not r["unparsed_lines"]
 
 
 def test_withholding_ss_before_federal():
     r = parse_return_transcript(
         _d4_transcript(D4_SS_WITHHELD, D4_FED_WITHHELD))
-    assert r["lines"]["withholding"] == 12340.0
-    assert r["lines"]["ss_tax_withheld"] == 3100.0
+    assert r["lines"]["withholding"] == "12340.00"
+    assert r["lines"]["ss_tax_withheld"] == "3100.00"
 
 
 def test_withholding_federal_before_ss():
     r = parse_return_transcript(
         _d4_transcript(D4_FED_WITHHELD, D4_SS_WITHHELD))
-    assert r["lines"]["withholding"] == 12340.0
-    assert r["lines"]["ss_tax_withheld"] == 3100.0
+    assert r["lines"]["withholding"] == "12340.00"
+    assert r["lines"]["ss_tax_withheld"] == "3100.00"
 
 
 EXTENDED_VOCAB_TRANSCRIPT = """TAX RETURN TRANSCRIPT
@@ -182,21 +182,21 @@ Number of Exemptions: 2
 def test_extended_vocabulary_keys():
     r = parse_return_transcript(EXTENDED_VOCAB_TRANSCRIPT)
     assert r["tax_year"] == 2023
-    assert r["lines"]["wages"] == 120000.0
-    assert r["lines"]["taxable_interest"] == 1250.50
-    assert r["lines"]["ordinary_dividends"] == 3400.0
-    assert r["lines"]["capital_gain_loss"] == -2500.0
-    assert r["lines"]["short_term_gain_loss"] == -1000.0
-    assert r["lines"]["long_term_gain_loss"] == -1500.0
-    assert r["lines"]["short_term_carryover"] == -4000.0
-    assert r["lines"]["long_term_carryover"] == -6000.0
-    assert r["lines"]["agi"] == 115000.0
-    assert r["lines"]["taxable_income"] == 90000.0
-    assert r["lines"]["total_tax"] == 15000.0
-    assert r["lines"]["withholding"] == 14000.0
-    assert r["lines"]["estimated_payments"] == 2000.0
-    assert r["lines"]["total_payments"] == 16000.0
-    assert r["lines"]["refund"] == 1000.0
+    assert r["lines"]["wages"] == "120000.00"
+    assert r["lines"]["taxable_interest"] == "1250.50"
+    assert r["lines"]["ordinary_dividends"] == "3400.00"
+    assert r["lines"]["capital_gain_loss"] == "-2500.00"
+    assert r["lines"]["short_term_gain_loss"] == "-1000.00"
+    assert r["lines"]["long_term_gain_loss"] == "-1500.00"
+    assert r["lines"]["short_term_carryover"] == "-4000.00"
+    assert r["lines"]["long_term_carryover"] == "-6000.00"
+    assert r["lines"]["agi"] == "115000.00"
+    assert r["lines"]["taxable_income"] == "90000.00"
+    assert r["lines"]["total_tax"] == "15000.00"
+    assert r["lines"]["withholding"] == "14000.00"
+    assert r["lines"]["estimated_payments"] == "2000.00"
+    assert r["lines"]["total_payments"] == "16000.00"
+    assert r["lines"]["refund"] == "1000.00"
     assert r["lines"]["exemptions"] == 2
     assert r["lines"]["filing_status"] == "Married Filing Jointly"
     assert not r["unparsed_lines"]
@@ -229,7 +229,7 @@ def test_ambiguous_line_leaves_field_unset(monkeypatch):
 def test_duplicate_key_first_wins_and_visible():
     r = parse_return_transcript(
         _d4_transcript("Total Tax: $1.00", "Total Tax: $2.00"))
-    assert r["lines"]["total_tax"] == 1.0
+    assert r["lines"]["total_tax"] == "1.00"
     assert any(line.startswith("DUPLICATE total_tax: ")
                for line in r["unparsed_lines"])
 
@@ -244,7 +244,7 @@ def test_line_raw_text_is_verbatim():
 def test_leading_whitespace_line_maps_and_keeps_verbatim():
     r = parse_return_transcript(
         _d4_transcript("   Total Tax: $12,340.00"))
-    assert r["lines"]["total_tax"] == 12340.0
+    assert r["lines"]["total_tax"] == "12340.00"
     assert r["line_raw_text"]["total_tax"] == "   Total Tax: $12,340.00"
 
 
@@ -287,11 +287,11 @@ def test_fuzz_every_line_accounted():
         assert (raw in mapped_raws or raw in unparsed
                 or any(u != raw and u.endswith(raw) for u in unparsed)), raw
     # spot-check the interesting outcomes
-    assert r["lines"]["total_tax"] == 12340.0      # keep-first
-    assert r["lines"]["total_payments"] == 5000.0  # lowercase label still maps
-    assert r["lines"]["agi"] == 50000.0            # keep-first
-    assert r["lines"]["wages"] == 85000.0
-    assert r["lines"]["capital_gain_loss"] == -3000.0
+    assert r["lines"]["total_tax"] == "12340.00"      # keep-first
+    assert r["lines"]["total_payments"] == "5000.00"  # lowercase label still maps
+    assert r["lines"]["agi"] == "50000.00"            # keep-first
+    assert r["lines"]["wages"] == "85000.00"
+    assert r["lines"]["capital_gain_loss"] == "-3000.00"
     assert any(u.startswith("DUPLICATE agi: ") for u in unparsed)
     assert any(u.startswith("DUPLICATE total_tax: ") for u in unparsed)
     assert "Total Tax:" in unparsed  # label recognized, no usable value
@@ -334,7 +334,7 @@ def test_d5_real_total_tax_line_still_maps_with_header_present():
         "TAX RETURN TRANSCRIPT\nTax Year: 2024\n"
         "Tax Period Ending: Dec. 31, 2024\n"
         "Total Tax Liability: $12,340.00\n")
-    assert r["lines"]["total_tax"] == 12340.0
+    assert r["lines"]["total_tax"] == "12340.00"
     assert not any("Period Ending" in u for u in r["unparsed_lines"])
 
 
@@ -348,7 +348,7 @@ def test_d5_summary_value_ignores_date_digits():
     # a real amount next to a date still extracts
     assert tr._summary_value(
         "Total Tax: $5,000.00 as of Dec. 31, 2024",
-        "total_tax", "TOTAL TAX") == 5000.0
+        "total_tax", "TOTAL TAX") == "5000.00"
 
 
 # ---------------------------------------------------------------------------
@@ -593,8 +593,8 @@ def test_roa_sections_reuse_parsers():
 def test_roa_return_section_content():
     r = parse_record_of_account(ROA)
     sec = r["return_section"]
-    assert sec["lines"]["agi"] == 85420.0
-    assert sec["lines"]["total_tax"] == 12340.0
+    assert sec["lines"]["agi"] == "85420.00"
+    assert sec["lines"]["total_tax"] == "12340.00"
     assert {t["code"] for t in sec["transactions"]} == {"150", "806"}
     assert sec["unparsed_lines"] == []
 
@@ -613,7 +613,7 @@ def test_roa_doc_level_lines_go_top_level():
     r = parse_record_of_account(ROA_WITH_DOC_LEVEL_LINE)
     assert r["unparsed_lines"] == ["Some cover-page notice"]
     # sections unaffected by the doc-level line
-    assert r["return_section"]["lines"]["agi"] == 85420.0
+    assert r["return_section"]["lines"]["agi"] == "85420.00"
     assert r["account_section"]["lines"]["account_balance"] == "0.00"
 
 
@@ -641,6 +641,113 @@ def test_roa_overlap_sanity_against_standalone_return():
         assert g["raw"] == w["raw"]
         gs, ge = g["span"]
         assert ROA[gs:ge] == w["raw"]  # span is valid in document coords
+
+
+# ---------------------------------------------------------------------------
+# X3: ROA account-section split without a clean title line
+# ---------------------------------------------------------------------------
+# Real Record-of-Account transcripts often carry no whole-line
+# "TAX ACCOUNT TRANSCRIPT" header: the account section starts at an
+# account-balance/accrual label or a prefixed title. Before X3 the
+# whole-line anchor missed it and the entire ROA was absorbed into
+# return_section (account_section 0/0/0), which also made
+# roa_corroboration vacuous on the account side.
+
+ROA_X3_NO_TITLE = """\
+RECORD OF ACCOUNT
+Tax Year: 2024
+TAX RETURN TRANSCRIPT
+Adjusted Gross Income: $85,420.00
+Total Tax: $12,340.00
+150 Tax return filed 04-15-2025 $12,340.00
+Account Balance: $0.00
+Accrued Interest: $5.00 as of 09/22/2025
+150 Tax return filed 20241205 04-15-2025 $12,340.00
+806 W-2 or 1099 withholding 20241205 04-15-2025 $12,340.00
+846 Refund issued 20243207 10-05-2025 $0.00
+"""
+
+ROA_X3_PREFIXED_TITLE = """\
+XX Form 1040 Record of Account YY
+Tax Year: 2024
+TAX RETURN TRANSCRIPT
+Adjusted Gross Income: $85,420.00
+Form 1040 Tax Account Transcript
+Account Balance: $100.00
+846 Refund issued 20243207 10-05-2025 $100.00
+"""
+
+
+def test_x3_split_on_balance_anchor_without_title():
+    r = parse_record_of_account(ROA_X3_NO_TITLE)
+    sec = r["account_section"]
+    # the account side is populated now, not 0/0/0
+    assert sec["lines"]["account_balance"] == "0.00"
+    assert sec["lines"]["accrued_interest"] == "5.00"
+    by_code = {t["code"]: t for t in sec["transactions"]}
+    assert set(by_code) == {"150", "806", "846"}
+    assert by_code["150"]["cycle"] == "20241205"
+    assert by_code["846"]["amount"] == "0.00"
+    assert sec["unparsed_lines"] == []
+    # the return side keeps its own lines; the TC lines there stay there
+    ret = r["return_section"]
+    assert ret["lines"]["agi"] == "85420.00"
+    assert ret["lines"]["total_tax"] == "12340.00"
+    assert [t["code"] for t in ret["transactions"]] == ["150"]
+    assert r["unparsed_lines"] == []
+
+
+def test_x3_split_on_prefixed_title_not_doc_title():
+    # "Form 1040 Tax Account Transcript" (extra words) is the anchor;
+    # the document title "XX Form 1040 Record of Account YY" must not be.
+    r = parse_record_of_account(ROA_X3_PREFIXED_TITLE)
+    sec = r["account_section"]
+    assert sec["lines"]["account_balance"] == "100.00"
+    assert [t["code"] for t in sec["transactions"]] == ["846"]
+    ret = r["return_section"]
+    assert ret["lines"]["agi"] == "85420.00"
+    # no return content leaked into the account section
+    assert "agi" not in sec["lines"]
+    assert r["unparsed_lines"] == []
+
+
+def test_x3_tc_lines_are_not_anchors():
+    # TC lines also occur in return sections: the split must not fire on
+    # the return section's own "150 ..."/"806 ..." lines.
+    text = ("RECORD OF ACCOUNT\nTax Year: 2024\nTAX RETURN TRANSCRIPT\n"
+            "Adjusted Gross Income: $85,420.00\n"
+            "150 Tax return filed 04-15-2025 $12,340.00\n"
+            "806 W-2 or 1099 withholding 04-15-2025 $12,340.00\n"
+            "Account Balance: $0.00\n")
+    r = parse_record_of_account(text)
+    assert [t["code"] for t in r["return_section"]["transactions"]] == ["150", "806"]
+    assert r["account_section"]["lines"]["account_balance"] == "0.00"
+
+
+def _roa_accounted_lines(text):
+    import taxprep.transcript as tr
+    return [raw for raw in text.splitlines()
+            if raw.strip()
+            and not tr._is_structural(raw)
+            and not tr._is_structural(
+                tr._LEADING_YEAR_RE.sub("", tr._normalize_line(raw)))]
+
+
+def test_x3_line_accounting_invariant():
+    # mapped + unparsed = total: every eligible line is accounted exactly
+    # once across both sections and the top level. Nothing silently lost.
+    for text in (ROA, ROA_X3_NO_TITLE, ROA_X3_PREFIXED_TITLE,
+                 ROA_WITH_DOC_LEVEL_LINE):
+        r = parse_record_of_account(text)
+        eligible = _roa_accounted_lines(text)
+        mapped = (len(r["return_section"]["lines"])
+                  + len(r["return_section"]["transactions"])
+                  + len(r["account_section"]["lines"])
+                  + len(r["account_section"]["transactions"]))
+        unparsed = (len(r["return_section"]["unparsed_lines"])
+                    + len(r["account_section"]["unparsed_lines"])
+                    + len(r["unparsed_lines"]))
+        assert mapped + unparsed == len(eligible), text[:60]
 
 
 # ---------------------------------------------------------------------------
@@ -703,7 +810,8 @@ def test_blind_sweep_roa_parser_output():
                    _ACCOUNT_TOP_KEYS | {"tax_year"}, _RETURN_LINE_VOCAB,
                    txn_keys={"code", "description", "date", "amount",
                              "raw", "span"},
-                   decimal_safe_amounts=False)
+                   # D2: return-transcript money is Decimal-safe strings
+                   decimal_safe_amounts=True)
     _sweep_section(r["account_section"], _ACCOUNT_TOP_KEYS,
                    _ACCOUNT_LINE_VOCAB)
     for u in r["unparsed_lines"]:

@@ -673,28 +673,37 @@ def bus_html(store, token: str | None = None, bus_dir=None,
     Renders ids, timestamps, senders, topics, types, correlation ids and
     payload KEY names. Payload VALUES are never rendered -- agent
     surfaces stay metadata-only even inside the Operator console.
+
+    The bus accretes to the dsys-store checkout, which may be absent on
+    this machine. A missing (or non-git) checkout renders an error panel
+    instead of raising -- an unhandled exception here would drop the
+    review server's connection mid-request.
     """
-    sections = []
-    for topic in _bus.topics(bus_dir=bus_dir):
-        msgs = _bus.list_messages(topic, bus_dir=bus_dir)[-limit_per_topic:]
-        rows = "".join(
-            f"<tr><td class=\"mono\">{html.escape(m.get('id', ''))}</td>"
-            f"<td>{html.escape(str(m.get('ts', '')))}</td>"
-            f"<td class=\"mono\">{html.escape(str(m.get('from', '')))}</td>"
-            f"<td class=\"mono\">{html.escape(str(m.get('type', '')))}</td>"
-            f"<td class=\"mono\">{html.escape(str(m.get('correlation_id') or '—'))}</td>"
-            f"<td class=\"mono\">{html.escape(', '.join(sorted((m.get('payload') or {}).keys())))}</td></tr>"
-            for m in msgs) or '<tr><td colspan="6"><i>no messages</i></td></tr>'
-        sections.append(
-            f"<h3><span class=\"mono\">{html.escape(topic)}</span> "
-            f"({len(msgs)} recent)</h3>"
-            f"<table><tr><th>id</th><th>ts</th><th>from</th><th>type</th>"
-            f"<th>correlation</th><th>payload keys</th></tr>{rows}</table>")
-    body = "\n".join(sections) or "<p><i>No bus topics.</i></p>"
-    return _page("Bus", token, "bus", f"""
-<p>Broadcast bus — metadata only. Payload values are never shown here;
-the bus itself refuses SSN/EIN-shaped payloads at publish time.</p>
-{body}""")
+    intro = ("<p>Broadcast bus — metadata only. Payload values are never shown here;\n"
+             "the bus itself refuses SSN/EIN-shaped payloads at publish time.</p>")
+    try:
+        sections = []
+        for topic in _bus.topics(bus_dir=bus_dir):
+            msgs = _bus.list_messages(topic, bus_dir=bus_dir)[-limit_per_topic:]
+            rows = "".join(
+                f"<tr><td class=\"mono\">{html.escape(m.get('id', ''))}</td>"
+                f"<td>{html.escape(str(m.get('ts', '')))}</td>"
+                f"<td class=\"mono\">{html.escape(str(m.get('from', '')))}</td>"
+                f"<td class=\"mono\">{html.escape(str(m.get('type', '')))}</td>"
+                f"<td class=\"mono\">{html.escape(str(m.get('correlation_id') or '—'))}</td>"
+                f"<td class=\"mono\">{html.escape(', '.join(sorted((m.get('payload') or {}).keys())))}</td></tr>"
+                for m in msgs) or '<tr><td colspan="6"><i>no messages</i></td></tr>'
+            sections.append(
+                f"<h3><span class=\"mono\">{html.escape(topic)}</span> "
+                f"({len(msgs)} recent)</h3>"
+                f"<table><tr><th>id</th><th>ts</th><th>from</th><th>type</th>"
+                f"<th>correlation</th><th>payload keys</th></tr>{rows}</table>")
+        body = "\n".join(sections) or "<p><i>No bus topics.</i></p>"
+    except (FileNotFoundError, ValueError) as exc:
+        # _require_store_checkout: missing or non-git dsys-store checkout.
+        body = (f"<div class=\"pend\">Bus unavailable: "
+                f"{html.escape(str(exc))}</div>")
+    return _page("Bus", token, "bus", f"{intro}\n{body}")
 
 
 # -- Activity log (R13) --------------------------------------------------------------

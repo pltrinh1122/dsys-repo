@@ -790,3 +790,66 @@ def test_roa_corroboration_arms_when_parsers_land(tmp_path):
     assert r["applicable"] is True
     assert r["n_roa"] == 1
     _pii_free(r)
+
+
+# X3: the ROA's account section must actually populate, or
+# roa_corroboration compares nothing on the account side. Synthetic ROA
+# with no clean account title (the X3 shape) plus a same-year standalone
+# Account Transcript carrying a different balance: the disagreement must
+# surface as a needs_human conflict, metadata-only.
+_ROA_X3_CORRO = """\
+RECORD OF ACCOUNT
+Tax Year: 2024
+TAX RETURN TRANSCRIPT
+Adjusted Gross Income: $85,420.00
+Account Balance: $0.00
+Accrued Interest: $5.00 as of 09/22/2025
+150 Tax return filed 20241205 04-15-2025 $12,340.00
+846 Refund issued 20243207 10-05-2025 $0.00
+"""
+
+_STANDALONE_ACCT_X3 = """\
+TAX ACCOUNT TRANSCRIPT
+Tax Year: 2024
+Account Balance: $100.00
+Accrued Interest: $5.00 as of 09/22/2025
+150 Tax return filed 20241205 04-15-2025 $12,340.00
+846 Refund issued 20243207 10-05-2025 $0.00
+"""
+
+
+def test_x3_roa_corroboration_evaluates_account_side(tmp_path):
+    store = _store_with(tmp_path, [])
+    _ocr(store, _doc("roa1", 2024, "RECORD_OF_ACCOUNT", {},
+                     "transcribed"), _ROA_X3_CORRO)
+    _ocr(store, _doc("acct1", 2024, "ACCOUNT_TRANSCRIPT", {},
+                     "transcribed"), _STANDALONE_ACCT_X3)
+    r = V.verify_roa_corroboration(store, 2024)
+    assert r["applicable"] is True
+    assert r["n_roa"] == 1
+    # the account side is compared now (X3 populated it): the balance
+    # disagreement is raised to the Operator, never auto-resolved
+    assert r["n_conflicts"] >= 1
+    assert r["passed"] is False
+    acct_conflicts = [c for c in r["conflicts"] if c["section"] == "account"]
+    assert acct_conflicts, r["conflicts"]
+    assert any(c["key"] == "account_balance"
+               and c["conflict"] == "value_mismatch"
+               for c in acct_conflicts)
+    _pii_free(r)
+
+
+def test_x3_roa_corroboration_agreeing_account_side(tmp_path):
+    # identical account content -> no conflicts, check passes
+    store = _store_with(tmp_path, [])
+    _ocr(store, _doc("roa1", 2024, "RECORD_OF_ACCOUNT", {},
+                     "transcribed"), _ROA_X3_CORRO)
+    _ocr(store, _doc("acct1", 2024, "ACCOUNT_TRANSCRIPT", {},
+                     "transcribed"), _STANDALONE_ACCT_X3.replace(
+                         "Account Balance: $100.00",
+                         "Account Balance: $0.00"))
+    r = V.verify_roa_corroboration(store, 2024)
+    assert r["applicable"] is True
+    assert r["n_conflicts"] == 0
+    assert r["passed"] is True
+    _pii_free(r)

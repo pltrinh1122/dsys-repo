@@ -329,7 +329,10 @@ def _raw(base, target, method="GET", headers=None, data=None):
 
 
 @pytest.fixture()
-def server(tmp_path, cfgdir):
+def server(tmp_path, cfgdir, monkeypatch):
+    # Hermetic bus: never resolve the real ~/workspace/dsys-store --
+    # test_console_views_200 must pass on machines without the checkout.
+    monkeypatch.setenv("TAXPREP_BUS_DIR", str(tmp_path / "bus"))
     store = DocumentStore(tmp_path / "data")
     srv = make_server(store, port=0)
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -342,7 +345,8 @@ def server(tmp_path, cfgdir):
 
 
 @pytest.fixture()
-def token_server(tmp_path, cfgdir):
+def token_server(tmp_path, cfgdir, monkeypatch):
+    monkeypatch.setenv("TAXPREP_BUS_DIR", str(tmp_path / "bus"))
     store = DocumentStore(tmp_path / "data")
     srv = make_server(store, port=0, token="sekret")
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -372,6 +376,38 @@ def test_console_views_200(server):
     for view in _CONSOLE_VIEWS:
         code, _ = _get(base + f"/console/{view}")
         assert code == 200, view
+
+
+def test_console_bus_view_renders_metadata_only(server, tmp_path, monkeypatch):
+    # Hermetic: the bus dir is the fixture's temp TAXPREP_BUS_DIR, never
+    # the real ~/workspace/dsys-store checkout.
+    from taxprep import bus as _bus
+    base, _ = server
+    bus_dir = Path(os.environ["TAXPREP_BUS_DIR"])
+    _bus.publish("tax-prep.build", "code_landed",
+                 {"head": "abc123", "kind": "test"},
+                 from_id="op-synth", bus_dir=bus_dir)
+    code, body = _get(base + "/console/bus")
+    assert code == 200
+    assert "tax-prep.build" in body and "code_landed" in body
+    assert "op-synth" in body
+    # metadata only: payload keys render, payload values never do
+    assert "head" in body
+    assert "abc123" not in body
+
+
+def test_console_bus_view_missing_store_renders_error_panel(
+        server, tmp_path, monkeypatch):
+    # No dsys-store checkout anywhere: the Bus view must render an
+    # error panel (HTTP 200), never raise unhandled FileNotFoundError
+    # and drop the connection (RemoteDisconnected).
+    monkeypatch.delenv("TAXPREP_BUS_DIR")
+    monkeypatch.setenv("TAXPREP_STORE_DIR", str(tmp_path / "no-such-store"))
+    base, _ = server
+    code, body = _get(base + "/console/bus")
+    assert code == 200, "bus view must not drop the connection"
+    assert "Bus unavailable" in body
+    assert "dsys-store checkout not found" in body
 
 
 def test_console_doc_404(server):

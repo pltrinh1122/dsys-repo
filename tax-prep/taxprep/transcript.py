@@ -1,7 +1,9 @@
 """IRS transcript parsers — local-only, stdlib only.
 
 Four entry points:
-  - parse_return_transcript: IRS Tax Return Transcript -> lines / transactions.
+  - parse_return_transcript: IRS Tax Return Transcript -> lines /
+    transactions. Money is Decimal-safe strings (D2), never floats --
+    the same convention as the account parser.
   - parse_wage_income_transcript: IRS Wage & Income Transcript -> payer blocks.
   - parse_account_transcript: IRS Tax Account Transcript -> lines /
     transactions (with cycle). Money is Decimal-safe strings, never floats.
@@ -42,7 +44,9 @@ import re
 # input text (``line_spans`` / box ``span``), so downstream field
 # builders carry real evidence instead of synthesized raw_text. Bump on
 # ANY parser-logic change (feeds the R15 extractor id "transcript:<n>").
-TRANSCRIPT_VERSION = "1"
+# "2": X2 -- return-transcript money is Decimal-safe strings (D2, was
+# floats) and transcript title lines tolerate a "Form NNNN" prefix.
+TRANSCRIPT_VERSION = "2"
 
 
 def _line_offsets(text: str) -> list[int]:
@@ -57,11 +61,21 @@ def _line_offsets(text: str) -> list[int]:
 # Structural lines: the transcript title / standalone tax-year declaration.
 # These are represented by form_type / tax_year, so they are consumed rather
 # than reported as unparsed.
+# X2: a title line may carry a "Form NNNN" prefix ("Form 1040 Tax Return
+# Transcript") and may share its line with surrounding words (the real
+# title line carries extra words) -- like the document-level detector,
+# the title matches ANYWHERE in the line. A line the detector calls a
+# title, the parsers consume as structural, never as unparsed content.
+_FORM_TITLE_PREFIX = r"(?:form\s+[0-9][0-9a-z\-]*\s+)?"
 _STRUCTURAL_LINE_RES = [
-    re.compile(r"^\s*tax return transcript\s*$", re.IGNORECASE),
-    re.compile(r"^\s*wage and income transcript\b", re.IGNORECASE),
-    re.compile(r"^\s*(?:tax\s+)?account\s+transcript\s*$", re.IGNORECASE),
-    re.compile(r"^\s*record of account\s*$", re.IGNORECASE),
+    re.compile(_FORM_TITLE_PREFIX
+               + r"tax\s+return\s+transcript\b", re.IGNORECASE),
+    re.compile(_FORM_TITLE_PREFIX
+               + r"wage\s+and\s+income\s+transcript\b", re.IGNORECASE),
+    re.compile(_FORM_TITLE_PREFIX
+               + r"(?:tax\s+)?account\s+transcript\b", re.IGNORECASE),
+    re.compile(_FORM_TITLE_PREFIX
+               + r"record\s+of\s+account\b", re.IGNORECASE),
     re.compile(r"^\s*tax\s*(year|period)\s*[:\-]?\s*\d{4}\s*$", re.IGNORECASE),
     # D5: "Tax Period Ending: Dec. 31, 2024" is a header, never a
     # label. Without this, the bare ("TAX", "total_tax") table entry
@@ -72,7 +86,10 @@ _STRUCTURAL_LINE_RES = [
 
 
 def _is_structural(line: str) -> bool:
-    return any(pat.match(line) for pat in _STRUCTURAL_LINE_RES)
+    # search (not match): X2 title patterns match anywhere in the line.
+    # The ^-anchored entries (tax year / period ending) behave
+    # identically under search.
+    return any(pat.search(line) for pat in _STRUCTURAL_LINE_RES)
 
 # ---------------------------------------------------------------------------
 # Return transcript: exact normalized label table.
@@ -220,6 +237,8 @@ def _summary_value(raw: str, key: str, label: str):
 
     The value region is the text after the matched label; falls back to
     the whole line. Returns None when no usable value is present.
+    Money values are Decimal-safe strings (D2), never floats -- the
+    same _money_str convention the account parser uses.
     """
     after = raw
     m = _label_span_re(label).search(raw)
@@ -235,9 +254,9 @@ def _summary_value(raw: str, key: str, label: str):
         return int(m_int.group(0)) if m_int else None
     # D5: dates are blanked before the money search -- numbers inside
     # dates ("Dec. 31, 2024", "12-31-2024") are never amounts.
-    value = _parse_money(_blank_dates(after))
+    value = _money_str(_blank_dates(after))
     if value is None:
-        value = _parse_money(_blank_dates(raw))
+        value = _money_str(_blank_dates(raw))
     return value
 
 # Money extraction: $1,234.00, 1234.00, ($1,234.00) for negatives, "1234.00CR".
@@ -269,6 +288,41 @@ _ACCOUNT_SECTION_HEADER_RE = re.compile(
     r"^\s*(?:tax\s+)?account\s+transcript\s*$", re.IGNORECASE)
 _RETURN_SECTION_HEADER_RE = re.compile(
     r"^\s*tax\s+return\s+transcript\s*$", re.IGNORECASE)
+
+# X3: the account-section anchor. The whole-line _ACCOUNT_SECTION_HEADER_RE
+# above misses real ROAs, whose account section often carries no clean
+# title line at all. The anchor is the first line (at/after the return
+# section start) that is either a tolerant account-transcript title --
+# X2 semantics: "account transcript" anywhere in the line, optional
+# "Form NNNN"/"tax" prefix and surrounding words -- or an
+# account-balance/accrual label. The document title "record of account"
+# is never an anchor (most-specific-wins, as in detect_transcript_type).
+# TC transaction lines are deliberately NOT anchors: the return parser
+# also consumes them (real return transcripts list TC 150/806/...), so
+# they are ambiguous between sections.
+_ACCOUNT_TITLE_ANCHOR_RE = re.compile(
+    r"(?:form\s+[0-9][0-9a-z\-]*\s+)?(?:tax\s+)?account\s+transcript\b",
+    re.IGNORECASE)
+
+
+def _is_account_section_anchor(line: str) -> bool:
+    """Does this line start the ROA's account section?"""
+    norm = _normalize_line(line)
+    if "RECORD OF ACCOUNT" in norm:
+        return False
+    if _ACCOUNT_TITLE_ANCHOR_RE.search(line):
+        return True
+    candidate = _label_candidate(norm)
+    key, _, ambiguous = _match_label(candidate, _ACCOUNT_LABEL_TABLE)
+    return key is not None or ambiguous
+
+
+def _find_account_anchor_idx(raw_lines: list, start: int = 0) -> int | None:
+    """Index of the first account-section anchor at/after ``start``."""
+    for i in range(start, len(raw_lines)):
+        if _is_account_section_anchor(raw_lines[i]):
+            return i
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +480,9 @@ def parse_return_transcript(text: str, tax_year: int | None = None) -> dict:
         date_m = _DATE_RE.search(rest)
         date = date_m.group(1) if date_m else None
         amt_m = _TXN_AMOUNT_RE.search(rest)
-        amount = _parse_money(amt_m.group(0)) if amt_m else None
+        # D2: Decimal-safe string, never a float (matches the account
+        # parser's convention).
+        amount = _money_str(amt_m.group(0)) if amt_m else None
         description = rest
         if amt_m:
             description = (rest[: amt_m.start()] + rest[amt_m.end():]).strip()
@@ -677,24 +733,25 @@ def _split_roa_sections(text: str) -> tuple[str, str, list]:
     """Split Record-of-Account text into (return_text, account_text,
     doc_level_lines).
 
-    The account section starts at the first account-section header line;
-    the return section runs from its own header (or the document start)
-    to that boundary. Non-blank, non-structural lines before the first
-    section header belong to neither section and are returned as
-    doc-level lines. When no account-section header is present the whole
-    text is the return section.
+    The account section starts at the first account-section anchor line
+    (X3: tolerant title or account-balance/accrual label -- real ROAs
+    often carry no clean "TAX ACCOUNT TRANSCRIPT" title); the return
+    section runs from its own header (or the document start) to that
+    boundary. The anchor search starts after the return-section header
+    when one is present, so return-section content can never be claimed
+    by the account section. Non-blank, non-structural lines before the
+    first section header belong to neither section and are returned as
+    doc-level lines. When no anchor is present the whole text is the
+    return section.
     """
     raw_lines = text.splitlines()
-    acct_idx = next(
-        (i for i, line in enumerate(raw_lines)
-         if _ACCOUNT_SECTION_HEADER_RE.match(line)),
-        None,
-    )
     ret_idx = next(
         (i for i, line in enumerate(raw_lines)
          if _RETURN_SECTION_HEADER_RE.match(line)),
         None,
     )
+    search_start = (ret_idx + 1) if ret_idx is not None else 0
+    acct_idx = _find_account_anchor_idx(raw_lines, search_start)
     if acct_idx is None:
         return text, "", []
     section_start = ret_idx if ret_idx is not None else 0
@@ -729,11 +786,13 @@ def parse_record_of_account(text: str, tax_year: int | None = None) -> dict:
 
     Returns exactly {"return_section", "account_section",
     "unparsed_lines"}. A Record of Account is a return section followed
-    by an account section: the text is split on the account-section
-    header and each section is parsed by reusing parse_return_transcript
-    / parse_account_transcript on the section text. Lines that fall
-    outside both sections (document-level lines before the first section
-    header) go to top-level unparsed_lines.
+    by an account section: the text is split at the account-section
+    anchor (X3: tolerant title or account-balance/accrual label -- the
+    whole-line header alone misses real ROAs) and each section is parsed
+    by reusing parse_return_transcript / parse_account_transcript on the
+    section text. Lines that fall outside both sections (document-level
+    lines before the first section header) go to top-level
+    unparsed_lines.
 
     R15: the section parsers' char spans are shifted to full-document
     coordinates so every field's evidence span is valid against the
@@ -752,9 +811,10 @@ def parse_record_of_account(text: str, tax_year: int | None = None) -> dict:
         None,
     )
     if account_text:
-        acct_idx = next(
-            i for i, line in enumerate(raw_lines)
-            if _ACCOUNT_SECTION_HEADER_RE.match(line))
+        search_start = (ret_idx + 1) if ret_idx is not None else 0
+        acct_idx = _find_account_anchor_idx(raw_lines, search_start)
+        # _split_roa_sections found an anchor, so this must too.
+        assert acct_idx is not None
         account_start = offsets[acct_idx]
         return_start = offsets[ret_idx] if ret_idx is not None else 0
     return_section = parse_return_transcript(return_text, tax_year=tax_year)

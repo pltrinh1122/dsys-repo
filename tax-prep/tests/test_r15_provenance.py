@@ -7,6 +7,7 @@ path and name. Synthetic fixtures only.
 """
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -169,7 +170,7 @@ def test_highlight_marks_exactly_one_span_per_field():
         "a": {"provenance": {
             "page": 0, "bbox_pdf": None, "bbox_source": None,
             "char_span": {"page": 0, "start": 7, "end": 13},
-            "extractor": "transcript:1"}},
+            "extractor": "transcript:2"}},
     }
     out = review.highlight_ocr(text, fields)
     assert out.count("<mark>") == 1
@@ -243,6 +244,27 @@ def test_native_pdf_produces_pdfplumber_bbox(tmp_path):
     assert missing["bbox_source"] is None
     assert missing["char_span"] is None
     assert missing["extractor"] == "extractors:3"
+
+
+def test_native_pdf_without_pdfplumber_fails_evidence_check(tmp_path,
+                                                            monkeypatch):
+    # P2: the clean-install shape. pdfplumber absent -> the extractor
+    # records honest nulls (no geometry, never a guess) AND the R19
+    # blind check FAILS with n_fields_without_geometry > 0 -- it never
+    # stays green on a geometry-less year.
+    monkeypatch.setitem(sys.modules, "pdfplumber", None)
+    iso = _iso(tmp_path)
+    pdf = iso["src"] / "w2.pdf"
+    _native_w2_pdf(pdf)
+    doc = ingest.ingest_file(pdf, iso["store"])[0]
+    assert doc.text_source == "native"
+    prov = doc.fields["1"]["provenance"]
+    assert prov["bbox_pdf"] is None
+    assert prov["bbox_source"] is None
+    r = verify.verify_evidence(iso["store"], doc.tax_year)
+    assert r["applicable"] is True
+    assert r["passed"] is False
+    assert r["n_fields_without_geometry"] > 0
 
 
 def test_words_from_tsv_parses_word_boxes():

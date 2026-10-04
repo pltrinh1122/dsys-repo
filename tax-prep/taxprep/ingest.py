@@ -1425,11 +1425,75 @@ def _blocked_multi_form_document(
     return doc
 
 
+def _check_no_transcript_box_mix(
+        sections: list[extractors.FormSection]) -> None:
+    """X2 guard: one source can never yield both transcript-derived and
+    box-form documents.
+
+    The document-level detector (extractors.detect_transcript_type)
+    must type every transcript before the R1 split runs. Reaching the
+    split with a mixed set means the detector missed a transcript title
+    -- exactly the phantom-document regression's shape (a transcript's
+    embedded "Form W-2" / "Schedule D" headings spawning box-form
+    children under it, an L3 double-count risk). Fail loudly, never
+    silently: ingest_dir records the failure as an errored file with
+    RC_EXTRACT_FAILED.
+    """
+    typed = {s.form_type for s in sections
+             if not s.excluded and s.form_type}
+    transcript = sorted(t for t in typed if t in TRANSCRIPT_FORMS)
+    box = sorted(t for t in typed if t in BOX_FORMS)
+    if transcript and box:
+        raise AssertionError(
+            "X2 guard: one source would yield both transcript-derived "
+            f"{transcript} and box-form {box} documents -- the "
+            "document-level transcript detector missed a transcript title")
+
+
+def _transcript_document(path: Path, doc_id: str, form_type: str,
+                         text: str, year: int | None, bundle: PageBundle,
+                         source_sha: str, store: DocumentStore) -> Document:
+    """X2: one Document for a transcript-typed source.
+
+    The document-level detector typed this source as a transcript: the
+    whole text is parsed by that type's transcript parser. The text is
+    NEVER split into form sections -- embedded "Form W-2" / "Schedule
+    D" headings are transcript content, handled by the transcript
+    parsers, never child documents.
+    """
+    fields, status = _extract_for_type(form_type, text, year)
+    # R15: extraction-time field provenance over the whole text (page
+    # boundaries survive via the joined-text page map -- P4).
+    fields = _attach_provenance(fields, page_spans_for_joined(bundle.pages),
+                                form_type, bundle, bundle.pages)
+    # R13: fresh docs enter with no lifecycle state; the scan -> select
+    # -> ingest preamble fires inside _store_idempotent.
+    doc = lifecycle.new_document(
+        doc_id=doc_id,
+        tax_year=year,
+        form_type=form_type,
+        source_path=str(path),
+        ocr_text_ref="",
+        fields=fields,
+    )
+    return _store_idempotent(store, doc, text, bundle, source_sha,
+                             clean=(status == "transcribed"))
+
+
 def _build_documents(path: Path, doc_id: str, bundle: PageBundle,
                      source_sha: str, store: DocumentStore) -> list[Document]:
     """Split gated pages into form sections and build Documents."""
     pages = bundle.pages
     text = "\n".join(pages)
+
+    # X2: the transcript type is decided at DOCUMENT level first, from
+    # page-1 title lines (extractors.detect_transcript_type). A
+    # transcript-typed source is never split into form sections.
+    transcript_type = extractors.detect_transcript_type(pages)
+    if transcript_type is not None:
+        year = extractors.detect_tax_year(text)
+        return [_transcript_document(path, doc_id, transcript_type, text,
+                                     year, bundle, source_sha, store)]
 
     sections = extractors.split_form_sections(pages)
     typed = [s for s in sections if not s.excluded and s.form_type]
@@ -1452,6 +1516,10 @@ def _build_documents(path: Path, doc_id: str, bundle: PageBundle,
                 page_spans=page_spans_for_joined(pages),
             )
         ]
+
+    # X2 guard: the split below must never mix transcript-derived and
+    # box-form children (see _check_no_transcript_box_mix).
+    _check_no_transcript_box_mix(typed)
 
     if len(distinct) >= 2:
         if all(

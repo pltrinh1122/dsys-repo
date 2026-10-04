@@ -30,6 +30,12 @@ scoring, parenthesized "(Form 1040)" mentions treated as references).
 spans at title anchors, for multi-form files (consolidated 1099s, stacked
 scans).
 
+``detect_transcript_type(pages)`` — X2: decide the transcript type at
+DOCUMENT level first, from page-1 title lines carrying a transcript
+title anywhere in the line (a "Form NNNN" prefix and surrounding
+boilerplate tolerated). A transcript-typed document is never split into
+form sections.
+
 ``detect_tax_year(text)`` — find a 4-digit tax year (2000-2030) near tax-year
 phrases or in a form header line.
 """
@@ -450,6 +456,58 @@ def classify_form(text: str) -> str:
         joined = " ".join(s.text for s in sections if not s.excluded)
         return _keyword_fallback(joined)
     return "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# X2: document-level transcript typing.
+#
+# A transcript title missed by the whole-line anchors (e.g. "Form 1040
+# Tax Return Transcript" -- the ^...$ anchors require the title to start
+# the line) used to fall through to the R1 per-section split, where the
+# transcript's embedded "Form W-2" / "Schedule D" headings spawned
+# PHANTOM box-form child documents (a phantom W-2 with 10 fields is an
+# L3 double-count risk). The transcript type is therefore decided at
+# DOCUMENT level first, from page-1 title lines: a line carries a
+# transcript title when the title appears ANYWHERE in the line (a
+# "Form NNNN" prefix and surrounding header boilerplate are tolerated).
+# The first matching line wins; within a line the most specific title
+# wins ("record of account" before "account transcript", so "Record of
+# Account Transcript" types as RECORD_OF_ACCOUNT, never
+# ACCOUNT_TRANSCRIPT). Once a document is transcript-typed it is never
+# split into form sections: embedded form/schedule headings are
+# transcript content, handled by the transcript parsers.
+# ---------------------------------------------------------------------------
+
+_TRANSCRIPT_TITLE_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("RECORD_OF_ACCOUNT",
+     re.compile(r"\brecord\s+of\s+account\b", re.IGNORECASE)),
+    ("WAGE_INCOME_TRANSCRIPT",
+     re.compile(r"\bwage\s+and\s+income\s+transcript\b", re.IGNORECASE)),
+    ("RETURN_TRANSCRIPT",
+     re.compile(r"\breturn\s+transcript\b", re.IGNORECASE)),
+    ("ACCOUNT_TRANSCRIPT",
+     re.compile(r"\baccount\s+transcript\b", re.IGNORECASE)),
+]
+
+
+def detect_transcript_type(pages: list[str]) -> str | None:
+    """Document-level transcript type from page-1 title lines.
+
+    Scans the non-blank lines of the first page in order; the first line
+    containing a transcript title (anywhere in the line) decides, with
+    the most specific title winning within a line. Returns the
+    transcript form_type, or None when no page-1 line carries a title.
+    Deterministic: line order plus the fixed specificity table above.
+    """
+    if not pages:
+        return None
+    for line in pages[0].splitlines():
+        if not line.strip():
+            continue
+        for form_type, rx in _TRANSCRIPT_TITLE_PATTERNS:
+            if rx.search(line):
+                return form_type
+    return None
 
 
 _LEADING_ANCHOR_RES: dict[str, re.Pattern] = {}
