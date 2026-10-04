@@ -325,22 +325,64 @@ def publish(
     return path
 
 
+# Pending-addresses sidecar: lets an operator tag the NEXT code_landed
+# broadcast with requirement IDs it addresses (e.g. ["X1", "D5"]) without
+# editing a running push script. Written as {"head": <sha>, "addresses": [...]}
+# and consumed only when the head matches the broadcast being published.
+_PENDING_ADDRESSES_PATH = Path.home() / ".config" / "taxprep" / "code_landed_addresses.json"
+
+
+def _pending_addresses(head: str) -> list | None:
+    """Consume the pending-addresses sidecar if it targets this head."""
+    try:
+        raw = _PENDING_ADDRESSES_PATH.read_text()
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("head") != head:
+        return None
+    addrs = data.get("addresses")
+    if not isinstance(addrs, list) or not all(isinstance(a, str) for a in addrs):
+        return None
+    try:
+        _PENDING_ADDRESSES_PATH.unlink()
+    except OSError:
+        pass
+    return addrs
+
+
 def code_landed_payload(repo: str, branch: str, head: str,
-                        n_commits: int) -> dict:
+                        n_commits: int, addresses: list | None = None) -> dict:
     """Payload for a tax-prep.build / code_landed broadcast.
 
-    Exact key set: {"repo", "branch", "head", "commits_pushed", "action"}.
-    Every value is a shape (repo/branch names, commit SHA, count, action
-    string) -- nothing PII-shaped, so it always survives the
-    publish-side PII guard. Used by scripts/push-and-broadcast.sh.
+    Exact key set: {"repo", "branch", "head", "commits_pushed", "action"}
+    plus optional "addresses": requirement IDs this push addresses
+    (workstation re-install gate protocol). Every value is a shape --
+    nothing PII-shaped, so it always survives the publish-side PII
+    guard. Used by scripts/push-and-broadcast.sh.
+
+    addresses may also arrive via the TAXPREP_CODE_LANDED_ADDRESSES
+    env var (comma-separated) or the pending-addresses sidecar file.
     """
-    return {
+    if addresses is None:
+        env = os.environ.get("TAXPREP_CODE_LANDED_ADDRESSES", "")
+        if env.strip():
+            addresses = [a.strip() for a in env.split(",") if a.strip()]
+    if addresses is None:
+        addresses = _pending_addresses(head)
+    payload = {
         "repo": repo,
         "branch": branch,
         "head": head,
         "commits_pushed": n_commits,
         "action": f"pull {branch} and re-run verify_all",
     }
+    if addresses:
+        payload["addresses"] = addresses
+    return payload
 
 
 def _read_message(path: Path) -> dict | None:

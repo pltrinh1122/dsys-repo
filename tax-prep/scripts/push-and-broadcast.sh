@@ -117,6 +117,9 @@ echo "OK: dsys-repo pushed ($ahead commit(s)); remote head verified."
 
 # --- 2. publish the broadcast (payload from the shared helper) ---
 cd "$TAXPREP_DIR" || fail "tax-prep dir not found: $TAXPREP_DIR"
+# TAXPREP_CODE_LANDED_ADDRESSES (comma-separated, optional): requirement IDs
+# this push addresses (e.g. "X1,D5"); carried into the code_landed payload
+# for the workstation's re-install gate protocol.
 payload="$("$TAXPREP_PY" -c "
 from taxprep.bus import code_landed_payload
 import json, sys
