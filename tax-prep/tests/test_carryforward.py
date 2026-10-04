@@ -6,12 +6,18 @@ from pathlib import Path
 
 import pytest
 
+from taxprep import evidence as _evidence
 from taxprep import exclusions
 from taxprep.carryforward import (
+    LOT_GAIN_LOSS_FORMULA,
+    LOT_GAIN_LOSS_INPUTS,
     carryforward_blockers,
     compute_chain,
     compute_year,
     from_store,
+    lot_gain_loss_decimal,
+    read_tagged_gain_loss,
+    tag_lot_gain_loss,
 )
 from taxprep.models import Document
 from taxprep.store import DocumentStore
@@ -631,3 +637,103 @@ def test_guard_exclusion_does_not_suppress_unvalidated(tmp_path):
                                 "operator: should not matter")
     with pytest.raises(ValueError, match="not yet validated"):
         from_store(store, 2024)
+
+
+# LINEAGE-1: per-lot gain/loss lineage tagging ---------------------------
+#
+# The extractor tags each lot's gain_loss at creation (single formula
+# 1d - 1e + 1g); from_store reads the tag when present and well-formed
+# and recomputes identically for legacy/CSV lots without it. These
+# tests pin the no-drift contract: both paths must agree, and a
+# tampered tag must never override the math.
+
+def _tagged_lot(proceeds, basis, term, wash_1g=None):
+    lot = _lot(proceeds, basis, term, wash_1g=wash_1g)
+    lot["gain_loss"] = tag_lot_gain_loss(lot)
+    assert lot["gain_loss"] is not None
+    return lot
+
+
+def test_tagged_and_fallback_paths_agree(tmp_path):
+    # Identical lots, one doc extractor-tagged, one legacy (no tag):
+    # from_store must produce identical st/lt either way.
+    tagged = [
+        _tagged_lot("1000.00", "1500.00", "short"),              # -500
+        _tagged_lot("2000.00", "2600.00", "short", "300.00"),    # -300
+        _tagged_lot("500.00", "400.00", "long"),                 # +100
+    ]
+    legacy = [_lot("1000.00", "1500.00", "short"),
+              _lot("2000.00", "2600.00", "short", wash_1g="300.00"),
+              _lot("500.00", "400.00", "long")]
+    store = DocumentStore(tmp_path / "data")
+    store.upsert(b1099("t1", 2024, None, None, None, lots=tagged))
+    r_tagged = from_store(store, 2024)
+    store2 = DocumentStore(tmp_path / "data2")
+    store2.upsert(b1099("t1", 2024, None, None, None, lots=legacy))
+    r_legacy = from_store(store2, 2024)
+    assert r_tagged["st_current"] == r_legacy["st_current"] == D("-800")
+    assert r_tagged["lt_current"] == r_legacy["lt_current"] == D("100")
+    _from_store_pii_free(r_tagged)
+
+
+def test_from_store_reads_well_formed_tag(tmp_path):
+    lot = _tagged_lot("2000.00", "2600.00", "short", "300.00")
+    assert read_tagged_gain_loss(lot) == D("-300.00")
+    assert lot_gain_loss_decimal(D("2000.00"), D("2600.00"),
+                                D("300.00")) == D("-300.00")
+
+
+def test_from_store_tampered_tag_falls_back_to_recompute(tmp_path):
+    # A tag with a wrong formula or an unparseable value is not
+    # well-formed: from_store recomputes instead of trusting it.
+    bad_formula = _tagged_lot("1000.00", "1500.00", "short")
+    bad_formula["gain_loss"] = dict(bad_formula["gain_loss"],
+                                    formula="1d - 1e", value="999.99")
+    assert read_tagged_gain_loss(bad_formula) is None
+    bad_value = _tagged_lot("1000.00", "1500.00", "short")
+    bad_value["gain_loss"] = dict(bad_value["gain_loss"], value="not-a-number")
+    assert read_tagged_gain_loss(bad_value) is None
+    store = DocumentStore(tmp_path / "data")
+    store.upsert(b1099("t1", 2024, None, None, None,
+                       lots=[bad_formula, bad_value]))
+    r = from_store(store, 2024)
+    assert r["st_current"] == D("-1000")  # recomputed, not the tag's 999.99
+
+
+def test_from_store_lineage_shape(tmp_path):
+    store = DocumentStore(tmp_path / "data")
+    store.upsert(b1099("b1", 2024, "1000.00", "1500.00", "short",
+                       fed_withheld_4="10.00"))
+    r = from_store(store, 2024)
+    lin = r["lineage"]
+    for key in ("st_current", "lt_current", "fed_withheld_4_total",
+                "accrued_market_discount_1f_total"):
+        entry = lin[key]
+        assert _evidence.field_lineage(entry) is not None, key
+        assert entry["computed"] is True
+    # Numeric values stay Decimals for downstream arithmetic.
+    assert isinstance(r["st_current"], D)
+    _from_store_pii_free(r)
+
+
+def test_compute_year_lineage_shape():
+    r = compute_year(D(0), D(0), D("-9000"), D(0), "single")
+    for key in ("st_net", "lt_net", "net_loss", "deductible_loss",
+                "st_carry_out", "lt_carry_out"):
+        entry = r["lineage"][key]
+        assert _evidence.field_lineage(entry) is not None, key
+    # Inputs are not computed: they carry no lineage entries.
+    assert "st_current" not in r["lineage"]
+    assert r["lineage"]["st_net"]["formula"] == \
+        "st_current - st_carry_in (Schedule D line 7)"
+
+
+def test_compute_chain_into_2026_lineage():
+    res = compute_chain(
+        {2024: {"st_current": D("-9000"), "lt_current": D("0")},
+         2025: {"st_current": D("0"), "lt_current": D("0")}},
+        {2024: "single", 2025: "single"})
+    lin = res["lineage"]["carryforward_into_2026"]
+    assert _evidence.field_lineage(lin["st"]) is not None
+    assert _evidence.field_lineage(lin["lt"]) is not None
+    assert "2025" in lin["st"]["formula"]  # latest chained year < 2026

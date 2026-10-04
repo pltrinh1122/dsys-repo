@@ -44,6 +44,12 @@ import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
+# LINEAGE-1: the per-lot gain/loss tag (single formula 1d - 1e + 1g)
+# lives in carryforward -- the engine is the formula's home, so the
+# extractor and from_store cannot drift apart. No import cycle:
+# carryforward imports only decimal/typing/exclusions.
+from .carryforward import tag_lot_gain_loss
+
 # Derivation version for the Arc B medallion (contract section 7, W2 owns).
 # "1" is the pre-medallion era (JSONL store, no artifact derivation).
 # "2" added medallion derivation. "3" adds R15 field provenance
@@ -863,7 +869,15 @@ def _extract_one_lot(segment: str) -> tuple[dict, bool]:
             lot[key] = None
     lot["term"] = _lot_term(segment)
     lot["covered"] = _lot_covered(segment)
-    return {k: lot.get(k) for k in _LOT_KEYS}, proceeds_labeled
+    lot = {k: lot.get(k) for k in _LOT_KEYS}
+    # LINEAGE-1: tag the per-lot gain/loss at creation (single formula
+    # 1d - 1e + 1g; tagged only when 1d and 1e are present). The entry
+    # is a computed-shaped dict, never a plain string -- consumers
+    # reading lot["gain_loss"] must expect the tag shape. from_store
+    # reads the tag when well-formed and recomputes identically for
+    # legacy/CSV lots that carry none.
+    lot["gain_loss"] = tag_lot_gain_loss(lot)
+    return lot, proceeds_labeled
 
 
 _LOT_MARKER_RE = re.compile(r"\bLots?\s*#?\s*\d+\b", re.IGNORECASE)

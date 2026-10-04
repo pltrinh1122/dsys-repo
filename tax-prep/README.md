@@ -229,8 +229,10 @@ must never see PII in its context. Enforcement is layered:
   completeness (known form/year), the validation gate (all validated),
   1099-B lot integrity (present/non-negative boxes, valid term,
   parseable dates), transcript reconciliation (validated docs vs the
-  IRS wage & income transcript, 1-cent tolerance), and
-  carryforward-readiness. Every check returns counts/ids/booleans
+  IRS wage & income transcript, 1-cent tolerance),
+  carryforward-readiness, and source-evidence coverage (the check
+  descends into the 1099-B lot table: every per-lot computed gain/loss
+  must carry its lineage). Every check returns counts/ids/booleans
   only. A FAILED check means "needs human eyes", not "wrong".
 - **CLI blind mode (defense in depth).** With `TAXPREP_BLIND=1`,
   `taxprep show` redacts field values (box_code + confidence +
@@ -258,9 +260,16 @@ taxprep/
                  medallion API (txn, register_bronze, artifacts, decisions)
   medallion_schema.sql  DDL for the medallion store (single source of truth)
   ingest.py      directory walk, PDF text extraction (pypdf, pdfplumber
-                 fallback), .txt OCR sidecars, classification, year detection
+                 fallback), .txt OCR sidecars, classification, year detection;
+                 repeated transcript TC codes get ordinal-suffixed field
+                 keys (X4): tc_806, tc_806_2, ... -- never silently
+                 overwritten; one ordinal namespace spans both ROA sections
   extractors.py  box-level field extractors (regex/positional heuristics)
   transcript.py  IRS Tax Return Transcript + Wage & Income Transcript parsers
+                 Record of Account: block model (X3b) -- anchor-event scan
+                 over the whole text (return headers + account anchors, no
+                 ordering assumption); summary lines route by grammar,
+                 transactions by their span's block section
   review.py      localhost-only visual validation UI (queue, per-doc review,
                  POST /api/validate); binds 127.0.0.1 only
   carryforward.py  capital-loss carryforward engine: per-year Schedule D
@@ -381,6 +390,29 @@ Typical loop: `ingest` → `review` (validate everything) →
 `carryforward`. The 2023-2025 rows drive the 1040-X amendments; the
 `Carryforward into 2026` line is the figure to enter in the upcoming
 TurboTax return (2026 lots are partial-year until December).
+
+**Computed-field lineage (LINEAGE-1).** Every computed number carries
+its lineage (formula + input references) in the R19a consumer shape
+`{"computed": True, "formula": ..., "inputs": [...]}`:
+
+- Each 1099-B lot's `gain_loss` is tagged at extraction with the single
+  formula `1d - 1e + 1g` (inputs `proceeds_1d`, `basis_1e`, `wash_1g`;
+  tagged only when 1d and 1e are present). The formula lives in exactly
+  one place (`carryforward.lot_gain_loss_decimal`): `from_store` reads
+  the lot's tag when well-formed and recomputes identically for
+  legacy/CSV lots without it, so the two paths cannot drift.
+- `from_store` / `compute_year` / `compute_chain` results carry a
+  `"lineage"` entry alongside the numeric values (which stay Decimals
+  for downstream arithmetic) — `st_current`/`lt_current`, the worksheet
+  lines, and the carryforward-into-2026 pair.
+- The evidence pane renders one lineage sub-row per tagged lot
+  (formula + input links); the blind `verify_evidence` check descends
+  into the lot table, so a computed field without lineage fails
+  `n_computed_fields_without_lineage`.
+
+All money stays Decimal-safe strings end to end; computed entries
+carry no bbox (no source region) and never render the "no visual
+evidence" state.
 
 ## Duplicates & conflicts (Arc B)
 

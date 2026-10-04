@@ -308,6 +308,39 @@ def compute_year(
             "L13_lt_carryover": lt_carry_out,
         },
         "warnings": warnings,
+        # LINEAGE-1: computed worksheet lines carry their lineage in
+        # the R19a consumer shape. Inputs (carry-ins, currents, the
+        # limit) are not computed and carry no lineage.
+        "lineage": {
+            "st_net": {
+                "computed": True,
+                "formula": "st_current - st_carry_in (Schedule D line 7)",
+                "inputs": ["st_current", "st_carry_in"]},
+            "lt_net": {
+                "computed": True,
+                "formula": "lt_current - lt_carry_in (Schedule D line 15)",
+                "inputs": ["lt_current", "lt_carry_in"]},
+            "net_loss": {
+                "computed": True,
+                "formula": "-(st_net + lt_net) when st_net + lt_net < 0, "
+                           "else 0",
+                "inputs": ["st_net", "lt_net"]},
+            "deductible_loss": {
+                "computed": True,
+                "formula": "min(-(st_net + lt_net), annual_limit) when "
+                           "st_net + lt_net < 0, else 0",
+                "inputs": ["st_net", "lt_net", "annual_limit"]},
+            "st_carry_out": {
+                "computed": True,
+                "formula": "max(0, L5 - L7) where L5 = -st_net (st_net < 0), "
+                           "L7 = L4_used_deduction + max(0, lt_net)",
+                "inputs": ["st_net", "lt_net", "L4_used_deduction"]},
+            "lt_carry_out": {
+                "computed": True,
+                "formula": "max(0, L9 - L12) where L9 = -lt_net (lt_net < 0), "
+                           "L12 = max(0, st_net) + max(0, L4_used_deduction - L5)",
+                "inputs": ["lt_net", "st_net", "L4_used_deduction"]},
+        },
     }
 
 
@@ -368,12 +401,36 @@ def compute_chain(
     if earlier:
         last = results[max(earlier)]
         into = {"st": last["st_carry_out"], "lt": last["lt_carry_out"]}
+    if earlier:
+        last_year = max(earlier)
+        into_lineage = {
+            "st": {"computed": True,
+                   "formula": f"st_carry_out of {last_year} (latest chained "
+                              "year before 2026)",
+                   "inputs": [f"years[{last_year}].st_carry_out"]},
+            "lt": {"computed": True,
+                   "formula": f"lt_carry_out of {last_year} (latest chained "
+                              "year before 2026)",
+                   "inputs": [f"years[{last_year}].lt_carry_out"]},
+        }
+    else:
+        into_lineage = {
+            "st": {"computed": True,
+                   "formula": "0 (no chained year before 2026)",
+                   "inputs": ["years"]},
+            "lt": {"computed": True,
+                   "formula": "0 (no chained year before 2026)",
+                   "inputs": ["years"]},
+        }
 
     return {
         "years": results,
         "table": format_table(results, into),
         "warnings": warnings,
         "carryforward_into_2026": into,
+        # LINEAGE-1: the carried-into-2026 pair is computed from the
+        # chain; its lineage rides alongside the Decimal values.
+        "lineage": {"carryforward_into_2026": into_lineage},
     }
 
 
@@ -423,6 +480,69 @@ def _parse_money_opt(value: Any) -> Decimal | None:
 # per-lot dicts (see extractors._extract_1099_b). Consumers iterate ALL
 # lots -- there is no single-lot fallback; a document with an empty or
 # missing lot table carries zero lots.
+
+
+# -- per-lot gain/loss: the single formula (LINEAGE-1) ------------------
+#
+# The one and only per-lot gain/loss formula: ``1d - 1e + 1g``
+# (proceeds minus basis plus wash-sale loss disallowed). The extractor
+# tags each lot's ``gain_loss`` at creation with this formula; from_store
+# reads the tag when present and well-formed and falls back to THIS SAME
+# expression for legacy/CSV lots. Never duplicate the expression --
+# extend these helpers instead.
+
+LOT_GAIN_LOSS_FORMULA = "1d - 1e + 1g"
+LOT_GAIN_LOSS_INPUTS = ("proceeds_1d", "basis_1e", "wash_1g")
+
+
+def lot_gain_loss_decimal(proceeds: Decimal, basis: Decimal,
+                          wash: Decimal | None) -> Decimal:
+    """Per-lot gain/loss from parsed Decimals -- the single formula."""
+    return proceeds - basis + (wash if wash is not None else Decimal("0"))
+
+
+def tag_lot_gain_loss(lot: dict) -> dict | None:
+    """Computed-shaped ``gain_loss`` entry for one lot dict, or None.
+
+    Tagged only when proceeds (1d) and basis (1e) are both present --
+    an absent wash amount (1g) enters as 0, exactly as the formula
+    reads. The value stays a Decimal-safe string end to end; the entry
+    carries no bbox (computed fields have no source region).
+    """
+    proceeds = _parse_money_opt(lot.get("proceeds_1d"))
+    basis = _parse_money_opt(lot.get("basis_1e"))
+    if proceeds is None or basis is None:
+        return None
+    wash = _parse_money_opt(lot.get("wash_1g"))
+    gl = lot_gain_loss_decimal(proceeds, basis, wash)
+    return {"value": str(gl), "computed": True,
+            "formula": LOT_GAIN_LOSS_FORMULA,
+            "inputs": list(LOT_GAIN_LOSS_INPUTS)}
+
+
+def read_tagged_gain_loss(lot: dict) -> Decimal | None:
+    """The lot's tagged gain_loss when present AND well-formed, else None.
+
+    Well-formed = ``computed`` True, the lineage validates via
+    evidence.field_lineage, the formula/inputs match this module's
+    constants, and the value parses as a Decimal. Anything else
+    (legacy lots, CSV lots, tampered tags) returns None so the caller
+    falls back to recomputation -- a tag never overrides the math
+    silently.
+    """
+    from . import evidence as _evidence
+
+    tag = lot.get("gain_loss")
+    if not isinstance(tag, dict):
+        return None
+    lin = _evidence.field_lineage(tag)
+    if (lin is None or lin["formula"] != LOT_GAIN_LOSS_FORMULA
+            or lin["inputs"] != list(LOT_GAIN_LOSS_INPUTS)):
+        return None
+    try:
+        return _coerce("gain_loss", tag.get("value"))
+    except (ValueError, TypeError):
+        return None
 
 
 def _doc_lots(doc: Any) -> list[dict]:
@@ -620,7 +740,12 @@ def from_store(store: Any, year: int,
                 raise ValueError(
                     f"{label}: missing proceeds/basis -- "
                     "carryforward_blockers should have refused")
-            gain_loss = proceeds - basis + (wash or Decimal("0"))
+            # Single formula (LOT_GAIN_LOSS_FORMULA): prefer the lot's
+            # tagged gain_loss when present and well-formed; recompute
+            # identically for legacy/CSV lots that carry no tag.
+            gain_loss = read_tagged_gain_loss(lot)
+            if gain_loss is None:
+                gain_loss = lot_gain_loss_decimal(proceeds, basis, wash)
             if term == "short":
                 st += gain_loss
             else:
@@ -636,4 +761,29 @@ def from_store(store: Any, year: int,
         "warnings": [],
         "lots_included": included,
         "lots_excluded": 0,
+        # LINEAGE-1: computed outputs carry their lineage (formula +
+        # input references) in the R19a consumer shape. The numeric
+        # values stay Decimals for downstream arithmetic; the lineage
+        # rides alongside, never in place of the value.
+        "lineage": {
+            "st_current": {
+                "computed": True,
+                "formula": "sum of per-lot gain_loss (1d - 1e + 1g) "
+                           "over short-term lots",
+                "inputs": ["lots[].gain_loss"]},
+            "lt_current": {
+                "computed": True,
+                "formula": "sum of per-lot gain_loss (1d - 1e + 1g) "
+                           "over long-term lots",
+                "inputs": ["lots[].gain_loss"]},
+            "fed_withheld_4_total": {
+                "computed": True,
+                "formula": "sum of fed_withheld_4 over included lots",
+                "inputs": ["lots[].fed_withheld_4"]},
+            "accrued_market_discount_1f_total": {
+                "computed": True,
+                "formula": "sum of accrued_market_discount_1f over "
+                           "included lots",
+                "inputs": ["lots[].accrued_market_discount_1f"]},
+        },
     }

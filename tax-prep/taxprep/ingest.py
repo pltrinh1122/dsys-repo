@@ -678,11 +678,20 @@ def _unparsed_field(unparsed: list, unparsed_spans: list) -> dict:
     return _tfield(unparsed, "low", "\n".join(unparsed), span)
 
 
-def _transcript_line_fields(parsed: dict) -> tuple[dict, list, list]:
+def _transcript_line_fields(parsed: dict,
+                            txn_counts: dict | None = None) -> tuple[dict, list, list]:
     """Shared builder for return/account transcript parsed dicts.
 
     Returns (fields, unparsed_lines, unparsed_spans). Every field gets
     verbatim raw_text, a derived confidence, and an extraction span.
+
+    X4: repeated TC codes get ordinal-suffixed keys. The first
+    occurrence keeps ``tc_<code>`` (existing consumers depend on it);
+    repeats become ``tc_<code>_2``, ``tc_<code>_3``, ... in parser
+    order (deterministic). ``txn_counts`` is the shared ordinal
+    namespace: pass one dict across calls to share it (the
+    RECORD_OF_ACCOUNT branch does, so cross-section repeats share the
+    namespace); omit it for a fresh per-call namespace.
     """
     line_raw = parsed.get("line_raw_text", {})
     line_spans = parsed.get("line_spans", {})
@@ -692,9 +701,14 @@ def _transcript_line_fields(parsed: dict) -> tuple[dict, list, list]:
                        line_raw.get(label, ""), line_spans.get(label))
         for label, val in parsed.get("lines", {}).items()
     }
+    if txn_counts is None:
+        txn_counts = {}
     for t in parsed.get("transactions", []):
-        code = f"tc_{t.get('code')}"
-        fields[code] = _tfield(
+        base = f"tc_{t.get('code')}"
+        txn_counts[base] = txn_counts.get(base, 0) + 1
+        n = txn_counts[base]
+        key = base if n == 1 else f"{base}_{n}"
+        fields[key] = _tfield(
             t.get("amount"), "medium",
             t.get("raw", "") or t.get("description", ""), t.get("span"))
     return (fields, parsed.get("unparsed_lines", []),
@@ -714,9 +728,10 @@ def _fields_from_transcript(form_type: str, text: str,
 
     R17: ACCOUNT_TRANSCRIPT maps balance/accrual lines as fields plus
     tc_<code> transaction fields, same field shape as the return branch.
-    RECORD_OF_ACCOUNT merges both sections' fields; section provenance
-    is carried by each field's char_span (R15), not by a synthesized
-    tag prefix in raw_text.
+    X4: repeated TC codes get ordinal-suffixed keys (tc_806_2, ...);
+    RECORD_OF_ACCOUNT merges both sections' fields with ONE ordinal
+    namespace across sections; section provenance is carried by each
+    field's char_span (R15), not by a synthesized tag prefix in raw_text.
     """
     if form_type == "WAGE_INCOME_TRANSCRIPT":
         parsed = transcript.parse_wage_income_transcript(text, tax_year=year)
@@ -747,9 +762,15 @@ def _fields_from_transcript(form_type: str, text: str,
         # each section's own unparsed -- all verbatim, spans parallel.
         unparsed = list(parsed.get("unparsed_lines", []))
         unparsed_spans = list(parsed.get("unparsed_spans", []))
+        # X4: ONE ordinal namespace across both sections, so a TC code
+        # repeated in return_section and account_section yields
+        # tc_<code> and tc_<code>_2 instead of one silently overwriting
+        # the other.
+        txn_counts: dict = {}
         for section in ("return_section", "account_section"):
             sec = parsed.get(section, {})
-            sec_fields, sec_unparsed, sec_spans = _transcript_line_fields(sec)
+            sec_fields, sec_unparsed, sec_spans = _transcript_line_fields(
+                sec, txn_counts)
             fields.update(sec_fields)
             unparsed.extend(sec_unparsed)
             unparsed_spans.extend(sec_spans)

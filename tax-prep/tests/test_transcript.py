@@ -816,3 +816,284 @@ def test_blind_sweep_roa_parser_output():
                    _ACCOUNT_LINE_VOCAB)
     for u in r["unparsed_lines"]:
         assert isinstance(u, str)
+
+
+# ---------------------------------------------------------------------------
+# X3b: ROA block model -- no return-then-account ordering assumption
+# ---------------------------------------------------------------------------
+# All fixtures synthetic. The anchor-event scan runs over the whole
+# text; each line's block section is the nearest anchor at/before it;
+# summary lines route by grammar and transactions by their span's block
+# section. "RECORD OF ACCOUNT" is never an anchor; TC lines are never
+# anchors.
+
+import json as _json
+
+import taxprep.transcript as _tr
+
+# Byte-identical regression pin: parse_record_of_account output captured
+# from the pre-X3b code (ordered text split + span shifting) on the two
+# return-first fixtures. Tuples normalize to lists on the JSON
+# round-trip before comparison.
+_ROA_PRE_X3B_SNAPSHOT = """\
+{
+ "ROA": {
+  "account_section": {
+   "line_confidence": {
+    "account_balance": "high",
+    "accrued_interest": "high"
+   },
+   "line_raw_text": {
+    "account_balance": "Account Balance: $0.00",
+    "accrued_interest": "Accrued Interest: $0.00 as of 09/22/2025"
+   },
+   "line_spans": {
+    "account_balance": [
+     227,
+     249
+    ],
+    "accrued_interest": [
+     250,
+     290
+    ]
+   },
+   "lines": {
+    "account_balance": "0.00",
+    "accrued_interest": "0.00"
+   },
+   "transactions": [
+    {
+     "amount": "12340.00",
+     "code": "150",
+     "cycle": "20241205",
+     "date": "04-15-2025",
+     "description": "Tax return filed",
+     "raw": "150 Tax return filed 20241205 04-15-2025 $12,340.00",
+     "span": [
+      291,
+      342
+     ]
+    },
+    {
+     "amount": "0.00",
+     "code": "846",
+     "cycle": "20243207",
+     "date": "10-05-2025",
+     "description": "Refund issued",
+     "raw": "846 Refund issued 20243207 10-05-2025 $0.00",
+     "span": [
+      343,
+      386
+     ]
+    }
+   ],
+   "unparsed_lines": [],
+   "unparsed_spans": []
+  },
+  "return_section": {
+   "line_confidence": {
+    "agi": "high",
+    "total_tax": "high"
+   },
+   "line_raw_text": {
+    "agi": "Adjusted Gross Income: $85,420.00",
+    "total_tax": "Total Tax: $12,340.00"
+   },
+   "line_spans": {
+    "agi": [
+     55,
+     88
+    ],
+    "total_tax": [
+     89,
+     110
+    ]
+   },
+   "lines": {
+    "agi": "85420.00",
+    "total_tax": "12340.00"
+   },
+   "tax_year": 2025,
+   "transactions": [
+    {
+     "amount": "12340.00",
+     "code": "150",
+     "date": "04-15-2025",
+     "description": "Tax return filed",
+     "raw": "150 Tax return filed 04-15-2025 $12,340.00",
+     "span": [
+      111,
+      153
+     ]
+    },
+    {
+     "amount": "12340.00",
+     "code": "806",
+     "date": "04-15-2025",
+     "description": "W-2 or 1099 withholding",
+     "raw": "806 W-2 or 1099 withholding 04-15-2025 $12,340.00",
+     "span": [
+      154,
+      203
+     ]
+    }
+   ],
+   "unparsed_lines": [],
+   "unparsed_spans": []
+  },
+  "unparsed_lines": [],
+  "unparsed_spans": []
+ },
+ "ROA_DOC_LEVEL": {
+  "account_section": {
+   "line_confidence": {
+    "account_balance": "high"
+   },
+   "line_raw_text": {
+    "account_balance": "Account Balance: $0.00"
+   },
+   "line_spans": {
+    "account_balance": [
+     135,
+     157
+    ]
+   },
+   "lines": {
+    "account_balance": "0.00"
+   },
+   "transactions": [],
+   "unparsed_lines": [],
+   "unparsed_spans": []
+  },
+  "return_section": {
+   "line_confidence": {
+    "agi": "high"
+   },
+   "line_raw_text": {
+    "agi": "Adjusted Gross Income: $85,420.00"
+   },
+   "line_spans": {
+    "agi": [
+     78,
+     111
+    ]
+   },
+   "lines": {
+    "agi": "85420.00"
+   },
+   "tax_year": null,
+   "transactions": [],
+   "unparsed_lines": [],
+   "unparsed_spans": []
+  },
+  "unparsed_lines": [
+   "Some cover-page notice"
+  ],
+  "unparsed_spans": [
+   [
+    33,
+    55
+   ]
+  ]
+ }
+}"""
+
+
+def _snapshot_normalized(obj):
+    return _json.loads(_json.dumps(obj, sort_keys=True))
+
+
+def test_x3b_return_first_byte_identical_to_pre_x3b():
+    snapshot = _json.loads(_ROA_PRE_X3B_SNAPSHOT)
+    for name, text in (("ROA", ROA),
+                       ("ROA_DOC_LEVEL", ROA_WITH_DOC_LEVEL_LINE)):
+        got = parse_record_of_account(text)
+        assert _snapshot_normalized(got) == snapshot[name], name
+
+
+ROA_X3B_ACCOUNT_FIRST = """\
+RECORD OF ACCOUNT
+Tax Year: 2024
+Account Balance: $1,234.56
+Accrued Interest: $12.34 as of 09/22/2025
+Adjusted Gross Income: $85,420.00
+Total Tax: $12,340.00
+150 Tax return filed 20241205 04-15-2025 $12,340.00
+806 W-2 or 1099 withholding 20241205 04-15-2025 $12,340.00
+mystery trailer line
+"""
+
+
+def test_x3b_account_first_routes_by_grammar():
+    # Mirrors the audit fixture: account summary first, return body
+    # lines, then the transactions table, NO return header. Grammar --
+    # not block order -- decides the section: return-grammar lines land
+    # in return_section, account summary + TCs in account_section, and
+    # only the truly-unparseable line stays unparsed.
+    r = parse_record_of_account(ROA_X3B_ACCOUNT_FIRST)
+    ret, acct = r["return_section"], r["account_section"]
+    assert ret["lines"] == {"agi": "85420.00", "total_tax": "12340.00"}
+    assert ret["transactions"] == []
+    assert ret["unparsed_lines"] == []
+    assert acct["lines"] == {"account_balance": "1234.56",
+                             "accrued_interest": "12.34"}
+    assert [t["code"] for t in acct["transactions"]] == ["150", "806"]
+    # account block: the account parser's transaction dicts (cycle kept)
+    assert acct["transactions"][0]["cycle"] == "20241205"
+    assert acct["unparsed_lines"] == ["mystery trailer line"]
+    span = acct["unparsed_spans"][0]
+    assert ROA_X3B_ACCOUNT_FIRST[span[0]:span[1]] == "mystery trailer line"
+    assert r["unparsed_lines"] == []
+
+
+ROA_X3B_INTERLEAVED = """\
+RECORD OF ACCOUNT
+Tax Year: 2024
+TAX RETURN TRANSCRIPT
+Adjusted Gross Income: $85,420.00
+TAX ACCOUNT TRANSCRIPT
+Account Balance: $0.00
+TAX RETURN TRANSCRIPT
+Total Tax: $12,340.00
+"""
+
+
+def test_x3b_interleaved_blocks_all_routed():
+    # return block, account block, return block again: every block is
+    # routed to its parser; nothing strands as unparsed.
+    r = parse_record_of_account(ROA_X3B_INTERLEAVED)
+    ret, acct = r["return_section"], r["account_section"]
+    assert ret["lines"] == {"agi": "85420.00", "total_tax": "12340.00"}
+    assert acct["lines"] == {"account_balance": "0.00"}
+    assert ret["unparsed_lines"] == []
+    assert acct["unparsed_lines"] == []
+    assert r["unparsed_lines"] == []
+
+
+def test_x3b_span_coverage_invariant():
+    # mapped + unparsed = total, verified via spans: line_spans,
+    # transaction spans, and unparsed spans across both sections and
+    # the top level are pairwise disjoint and cover every non-blank,
+    # non-structural line exactly once. Nothing silently dropped.
+    fixtures = (ROA, ROA_WITH_DOC_LEVEL_LINE, ROA_X3_NO_TITLE,
+                ROA_X3_PREFIXED_TITLE, ROA_X3B_ACCOUNT_FIRST,
+                ROA_X3B_INTERLEAVED)
+    for text in fixtures:
+        r = parse_record_of_account(text)
+        offsets = _tr._line_offsets(text)
+        content = set()
+        for i, raw in enumerate(text.splitlines()):
+            if not raw.strip() or _tr._is_structural(raw):
+                continue
+            content.add((offsets[i], offsets[i] + len(raw)))
+        claimed = []
+        for sec in (r["return_section"], r["account_section"]):
+            claimed += list((sec.get("line_spans") or {}).values())
+            claimed += [tuple(t["span"]) for t in sec.get("transactions", [])]
+            claimed += [tuple(s) for s in (sec.get("unparsed_spans") or [])]
+        claimed += [tuple(s) for s in (r.get("unparsed_spans") or [])]
+        for a in range(len(claimed)):
+            for b in range(a + 1, len(claimed)):
+                (s1, e1), (s2, e2) = claimed[a], claimed[b]
+                assert e1 <= s2 or e2 <= s1, (text[:40], claimed[a], claimed[b])
+        assert set(claimed) == content, text[:40]

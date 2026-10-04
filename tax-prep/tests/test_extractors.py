@@ -2,6 +2,8 @@
 
 import pytest
 
+from decimal import Decimal
+
 from taxprep.extractors import classify_form, detect_tax_year, extract_fields
 
 
@@ -129,6 +131,41 @@ def test_1099b_three_lots_all_extracted():
     for l in lots:
         for k in ("proceeds_1d", "basis_1e", "wash_1g"):
             assert isinstance(l[k], str) and not isinstance(l[k], float)
+
+
+# LINEAGE-1: every lot's gain_loss is tagged at creation with the single
+# formula 1d - 1e + 1g, as a computed-shaped entry (never a plain
+# string, no bbox -- computed fields have no source region).
+def test_1099b_lot_gain_loss_tagged():
+    fields, _ = extract_fields("1099-B", B1099_THREE_LOTS)
+    lots = _lots(fields)
+    assert len(lots) == 3
+    expected = ["-500.00", "-300.00", "100.00"]  # 1d - 1e + 1g per lot
+    for lot, want in zip(lots, expected):
+        gl = lot["gain_loss"]
+        assert gl == {"value": want, "computed": True,
+                      "formula": "1d - 1e + 1g",
+                      "inputs": ["proceeds_1d", "basis_1e", "wash_1g"]}
+        assert isinstance(gl["value"], str)  # Decimal-safe, never float
+        assert Decimal(gl["value"]) == Decimal(want)  # exact decimal text
+
+
+def test_1099b_lot_gain_loss_absent_without_basis():
+    # B1099_SHORT has proceeds but no basis: 1d and 1e are not both
+    # present, so no gain_loss is tagged (never a guess).
+    fields, _ = extract_fields("1099-B", B1099_SHORT)
+    lots = _lots(fields)
+    assert len(lots) == 1
+    assert lots[0]["gain_loss"] is None
+
+
+def test_1099b_lot_gain_loss_missing_wash_enters_zero():
+    # No 1g on the lot: the formula still reads 1d - 1e + 1g with
+    # 1g = 0, and wash_1g stays listed as an input.
+    fields, _ = extract_fields("1099-B", B1099_FULL)
+    gl = _lots(fields)[0]["gain_loss"]
+    assert gl["value"] == "2700.00"  # 12500.00 - 9800.00 + 0
+    assert gl["inputs"] == ["proceeds_1d", "basis_1e", "wash_1g"]
 
 
 B1099_REPEATED_BLOCKS = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024

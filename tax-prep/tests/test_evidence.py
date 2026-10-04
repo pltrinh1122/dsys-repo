@@ -22,6 +22,8 @@ from urllib.parse import quote, urlparse
 
 import pytest
 
+from pathlib import Path
+
 from taxprep import evidence as E
 from taxprep import mcp_server as MCP
 from taxprep import review as R
@@ -881,3 +883,231 @@ def test_bidirectional_wiring_present(pstore):
     assert 'tr.field-row td:first-child' in html
     assert 'button.vorig' in html
     assert 'getElementById("zoomIn")' in html
+
+
+# -- H. PII temp-dir privacy (B4) -------------------------------------------
+
+def _needs_renderer():
+    # Same renderer-absent skip pattern as the suite (test_review.py):
+    # synthetic fixture, skips cleanly when poppler/pdf2image are absent.
+    pytest.importorskip("pdf2image")
+    if shutil.which("pdftoppm") is None:
+        pytest.skip("pdftoppm (poppler-utils) not available")
+
+
+def _scan_files(root):
+    found = set()
+    for dirpath, _dirs, files in os.walk(root, followlinks=False):
+        for fn in files:
+            found.add(os.path.join(dirpath, fn))
+    return found
+
+
+def test_render_page_scratch_never_touches_system_tmp(pstore, monkeypatch):
+    """pdftoppm's intermediate PII page files must never land in the
+    system temp dir. The render scratch dir lives under <data_dir>/evidence
+    (mode 700) and is removed afterwards (the ocr.py pattern)."""
+    _needs_renderer()
+    import tempfile as tf
+    store, doc, _info, _bytes = pstore
+    data_dir = Path(store.data_dir)
+    evdir = E.evidence_dir(store)
+    # Simulate the system temp dir as a watched dir we control.
+    sys_tmp = data_dir.parent / "watched-system-tmp"
+    sys_tmp.mkdir(exist_ok=True)
+    monkeypatch.setattr(tf, "tempdir", str(sys_tmp))
+    # Force a fresh render (not a cache hit) so the scratch path runs.
+    sha = E.silver.bronze_hash_for_doc(store, doc)
+    cached = E._rendered_page_path(store, sha, 0, E.PAGE_DPI)
+    cached.unlink(missing_ok=True)
+    before = _scan_files(sys_tmp)
+    path, err = E.render_page(store, doc, 0)
+    assert err is None and path is not None
+    # (a) the final image lives under the data dir, cached deterministically.
+    assert path.is_relative_to(data_dir) and path.exists()
+    # (b) no new files appeared under the (watched) system temp dir.
+    assert _scan_files(sys_tmp) == before, \
+        "render leaked PII page files into the system temp dir"
+    # (c) the scratch dir was cleaned up -- nothing left behind.
+    leftovers = [p for p in evdir.iterdir() if p.name.startswith("render-")]
+    assert leftovers == []
+
+
+def test_field_snapshot_render_routes_through_render_page(pstore, monkeypatch):
+    """The second convert call site (field_snapshot) routes through
+    render_page, so the B4 fix covers it: a snapshot render leaves no
+    system-temp trace either."""
+    _needs_renderer()
+    import tempfile as tf
+    store, doc, _info, _bytes = pstore
+    data_dir = Path(store.data_dir)
+    sys_tmp = data_dir.parent / "watched-system-tmp"
+    sys_tmp.mkdir(exist_ok=True)
+    monkeypatch.setattr(tf, "tempdir", str(sys_tmp))
+    # Bust the page cache so the snapshot path actually renders.
+    sha = E.silver.bronze_hash_for_doc(store, doc)
+    E._rendered_page_path(store, sha, 0, E.SNAPSHOT_DPI).unlink(
+        missing_ok=True)
+    before = _scan_files(sys_tmp)
+    path, err = E.field_snapshot(store, doc, "box1_wages")
+    assert err is None and path is not None
+    assert path.is_relative_to(data_dir)
+    assert _scan_files(sys_tmp) == before, \
+        "snapshot render leaked PII page files into the system temp dir"
+    assert path.read_bytes()[:3] == JPEG_MAGIC
+
+
+def test_render_page_scratch_cleanup_on_failure(pstore, monkeypatch):
+    """A failed render still removes the scratch dir (try/finally)."""
+    _needs_renderer()
+    store, doc, _info, _bytes = pstore
+    evdir = E.evidence_dir(store)
+    sha = E.silver.bronze_hash_for_doc(store, doc)
+    E._rendered_page_path(store, sha, 0, E.PAGE_DPI).unlink(missing_ok=True)
+    real = E._convert_from_path
+    def boom(*a, **k):
+        raise RuntimeError("synthetic poppler failure")
+    monkeypatch.setattr(E, "_convert_from_path", boom)
+    path, err = E.render_page(store, doc, 0)
+    assert path is None and err == E.REASON_SNAPSHOT_FAILED
+    leftovers = [p for p in evdir.iterdir() if p.name.startswith("render-")]
+    assert leftovers == []
+    monkeypatch.undo()
+    assert E._convert_from_path is real
+
+
+# -- F. LINEAGE-1: per-lot gain/loss lineage -------------------------------
+#
+# The extractor tags each lot's gain_loss at creation (single formula
+# 1d - 1e + 1g). The blind check descends into fields["lots"]["value"]
+# so the tags are covered by n_computed_fields_without_lineage, and the
+# evidence pane renders one lineage sub-row per tagged lot. Synthetic
+# fixtures only.
+
+from taxprep import evidence_pane as EP
+from taxprep.carryforward import tag_lot_gain_loss
+
+
+def _ev_store(tmp_path):
+    """PDF-backed store like pstore, but with no documents yet."""
+    store = DocumentStore(tmp_path / "data")
+    pdf_path = tmp_path / "ev.pdf"
+    _make_pdf(pdf_path)
+    pdf_bytes = pdf_path.read_bytes()
+    sha = hashlib.sha256(pdf_bytes).hexdigest()
+    store.store_bronze_bytes(sha, pdf_bytes)
+    return store, sha
+
+
+def _syn_lot(proceeds, basis, wash, term):
+    lot = {"description": None, "date_acquired": "01/15/2024",
+           "date_sold": "06/20/2024", "proceeds_1d": proceeds,
+           "basis_1e": basis, "wash_1g": wash,
+           "accrued_market_discount_1f": None, "fed_withheld_4": None,
+           "term": term, "covered": "covered"}
+    lot["gain_loss"] = tag_lot_gain_loss(lot)
+    assert lot["gain_loss"] is not None
+    return lot
+
+
+def _b1099_doc(store, sha, lots, doc_id="b-ev-2024"):
+    doc = Document(
+        doc_id=doc_id, tax_year=2024, form_type="1099-B",
+        source_path="b.pdf", ocr_text_ref="", status="transcribed",
+        fields={
+            "lots": {"value": lots, "confidence": "high",
+                     "raw_text": "synthetic lots", "geometry": dict(GEOM)},
+            "broker": {"value": "SYNTH BROKER", "confidence": "high",
+                       "raw_text": "Broker: SYNTH", "geometry": dict(GEOM)},
+        })
+    doc.source_sha256 = sha
+    doc.ocr_text_ref = store.save_ocr(
+        doc_id, "Form 1099-B synthetic fixture\n")
+    store.upsert(doc)
+    return doc
+
+
+def test_verify_evidence_covers_lot_gain_loss_lineage(tmp_path):
+    store, sha = _ev_store(tmp_path)
+    lots = [_syn_lot("1000.00", "1500.00", "0.00", "short"),
+            _syn_lot("2000.00", "2600.00", "300.00", "short"),
+            _syn_lot("500.00", "400.00", "0.00", "long")]
+    doc = _b1099_doc(store, sha, lots)
+    r = V.verify_evidence(store, 2024)
+    assert r["docs"][doc.doc_id]["n_lot_computed"] == 3
+    assert r["n_computed_fields_without_lineage"] == 0
+    assert r["passed"] is True
+    _pii_free(r)
+
+
+def test_verify_evidence_lot_gain_loss_missing_lineage_fails(tmp_path):
+    store, sha = _ev_store(tmp_path)
+    lots = [_syn_lot("1000.00", "1500.00", "0.00", "short")]
+    # Broken tag: computed but no lineage -- the blind check fails.
+    lots[0]["gain_loss"] = {"value": "-500.00", "computed": True}
+    doc = _b1099_doc(store, sha, lots)
+    r = V.verify_evidence(store, 2024)
+    assert r["docs"][doc.doc_id]["n_computed_without_lineage"] == 1
+    assert r["n_computed_fields_without_lineage"] == 1
+    assert r["passed"] is False
+    _pii_free(r)
+
+
+def test_pane_lot_gain_loss_subrows_show_lineage(tmp_path):
+    store, sha = _ev_store(tmp_path)
+    lots = [_syn_lot("1000.00", "1500.00", "0.00", "short"),
+            _syn_lot("2000.00", "2600.00", "300.00", "short")]
+    doc = _b1099_doc(store, sha, lots)
+    html = EP.pane_html(store, doc)
+    for n in (1, 2):
+        assert f'id="row-lots.lot{n}.gain_loss"' in html
+    # Lineage view: formula + input links anchored to the parent lots
+    # row, where the lot's inputs live. Never "no visual evidence".
+    assert html.count('1d - 1e + 1g') >= 2
+    assert 'href="#row-lots"' in html
+    assert ">proceeds_1d</a>" in html
+    assert "no visual evidence" not in html
+
+
+def test_pane_computed_field_with_edited_input(tmp_path):
+    # R19a: a computed field whose INPUT was operator-edited still
+    # shows the lineage view (formula + input links) plus the input's
+    # edit record.
+    store, sha = _ev_store(tmp_path)
+    doc = _b1099_doc(store, sha, [_syn_lot("1000.00", "1500.00", "0.00",
+                                                  "short")])
+    doc.fields["proceeds_1d"] = {
+        "value": "1100.00", "confidence": "human-corrected",
+        "raw_text": "Box 1d Proceeds 1100.00", "geometry": dict(GEOM),
+        "history": [{"ts": "2026-10-04T00:00:00+00:00",
+                     "old": "1000.00", "new": "1100.00"}]}
+    doc.fields["gain"] = {"value": "-400.00", "computed": True,
+                          "formula": "1d - 1e + 1g",
+                          "inputs": ["proceeds_1d", "basis_1e", "wash_1g"]}
+    store.upsert(doc)
+    html = EP.pane_html(store, doc)
+    assert 'class="lineage"' in html and "1d - 1e + 1g" in html
+    assert 'href="#row-proceeds_1d"' in html
+    assert "the image never proves the edited value" in html
+    assert "1000.00" in html and "1100.00" in html
+
+
+def test_pane_computed_field_with_own_history(tmp_path):
+    # R19a narrowing: a computed field that was itself operator-edited
+    # shows lineage AND the edit record in the same cell.
+    store, sha = _ev_store(tmp_path)
+    doc = _b1099_doc(store, sha, [_syn_lot("1000.00", "1500.00", "0.00",
+                                                  "short")])
+    doc.fields["gain"] = {
+        "value": "-400.00", "computed": True, "formula": "1d - 1e",
+        "inputs": ["proceeds_1d", "basis_1e"],
+        "history": [{"ts": "2026-10-04T00:00:00+00:00",
+                     "old": "-500.00", "new": "-400.00"}]}
+    store.upsert(doc)
+    ev = E.field_evidence(doc.fields["gain"])
+    assert ev["state"] == E.STATE_LINEAGE
+    assert len(ev["history"]) == 1  # field_evidence keeps lineage+history
+    html = EP.pane_html(store, doc)
+    assert 'class="lineage"' in html and "1d - 1e" in html
+    assert 'class="edithist"' in html
+    assert "-500.00" in html and "-400.00" in html

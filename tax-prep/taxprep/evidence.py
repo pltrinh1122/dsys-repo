@@ -42,6 +42,8 @@ import json
 import math
 import os
 import re
+import shutil
+import tempfile
 from pathlib import Path
 
 from . import silver
@@ -414,17 +416,30 @@ def render_page(store, doc, page_0based: int,
         return out, None
     if _convert_from_path is None:
         return None, REASON_NO_RENDERER
+    # PII temp dir: pdftoppm's intermediate page files MUST NOT land in the
+    # system temp dir. The scratch dir is created under the evidence dir
+    # (mode 700 by construction) and removed afterwards, try/finally --
+    # the ocr.py private-TMPDIR pattern.
+    tmp = Path(tempfile.mkdtemp(prefix="render-", dir=str(evidence_dir(store))))
     try:
-        images = _convert_from_path(str(bronze_path), dpi=dpi,
+        paths = _convert_from_path(str(bronze_path), dpi=dpi,
                                     first_page=page_0based + 1,
-                                    last_page=page_0based + 1)
-        if not images:
+                                    last_page=page_0based + 1,
+                                    output_folder=str(tmp),
+                                    paths_only=True)
+        if not paths:
             return None, "page render produced no image"
-        img = images[0]
+        from PIL import Image
+        with Image.open(paths[0]) as img:
+            _mkdir_700(out.parent)
+            img.save(out, format="JPEG", quality=80)
     except Exception:
+        # Never leave a partial cached page behind -- the next call would
+        # read it as a good render.
+        out.unlink(missing_ok=True)
         return None, REASON_SNAPSHOT_FAILED
-    _mkdir_700(out.parent)
-    img.save(out, format="JPEG", quality=80)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     os.chmod(out, 0o600)
     return out, None
 

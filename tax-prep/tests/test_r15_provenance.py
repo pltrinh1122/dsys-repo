@@ -159,7 +159,7 @@ def test_ingested_doc_provenance_shape(tmp_path):
         # .txt source: no layout source, char spans only
         assert prov["bbox_pdf"] is None
         assert prov["bbox_source"] is None
-        assert prov["extractor"] == "extractors:3"
+        assert prov["extractor"] == "extractors:4"
 
 
 # -- P4: highlight marks exactly one span per field ---------------------
@@ -170,7 +170,7 @@ def test_highlight_marks_exactly_one_span_per_field():
         "a": {"provenance": {
             "page": 0, "bbox_pdf": None, "bbox_source": None,
             "char_span": {"page": 0, "start": 7, "end": 13},
-            "extractor": "transcript:2"}},
+            "extractor": "transcript:3"}},
     }
     out = review.highlight_ocr(text, fields)
     assert out.count("<mark>") == 1
@@ -243,7 +243,7 @@ def test_native_pdf_produces_pdfplumber_bbox(tmp_path):
     assert missing["bbox_pdf"] is None
     assert missing["bbox_source"] is None
     assert missing["char_span"] is None
-    assert missing["extractor"] == "extractors:3"
+    assert missing["extractor"] == "extractors:4"
 
 
 def test_native_pdf_without_pdfplumber_fails_evidence_check(tmp_path,

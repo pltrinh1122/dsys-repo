@@ -91,6 +91,8 @@ def test_pii_guard_extended_patterns(busdir, tuning_path):
     """N3: 9-digit runs, masked SSNs (any case), long digit runs, and
     currency amounts are refused; legitimate shapes still pass."""
     refused = [
+        ({"note": "acct 12345678 broker"}, "8-digit"),
+        ({"note": "id:87654321."}, "8-digit"),
         ({"note": "ssn 123456789 unhyphenated"}, "9-digit"),
         ({"note": "XXX-XX-1234"}, "masked-SSN"),
         ({"note": "xxx-xx-9876"}, "masked-SSN"),

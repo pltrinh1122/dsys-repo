@@ -8,8 +8,11 @@ Four entry points:
   - parse_account_transcript: IRS Tax Account Transcript -> lines /
     transactions (with cycle). Money is Decimal-safe strings, never floats.
   - parse_record_of_account: IRS Record of Account -> {"return_section",
-    "account_section", "unparsed_lines"}, reusing the return and account
-    parsers on the two sections.
+    "account_section", "unparsed_lines", "unparsed_spans"}. Block model
+    (X3b): an anchor-event scan over the whole text finds every return
+    header and account anchor with no ordering assumption; each line's
+    block section is the nearest anchor at/before it; summary lines are
+    routed by grammar, transactions by their span's block section.
 
 Mapping contract (return transcript):
   - Each summary line is normalized (strip, collapse internal whitespace,
@@ -46,7 +49,11 @@ import re
 # ANY parser-logic change (feeds the R15 extractor id "transcript:<n>").
 # "2": X2 -- return-transcript money is Decimal-safe strings (D2, was
 # floats) and transcript title lines tolerate a "Form NNNN" prefix.
-TRANSCRIPT_VERSION = "2"
+# "3": X3b -- the ROA is parsed as anchor blocks with no ordering
+# assumption (byte-identical output on ordered ROAs); X4 -- repeated
+# TC codes get ordinal-suffixed ingest field keys (tc_806_2), which is
+# an ingest.py keying change riding on the same parse.
+TRANSCRIPT_VERSION = "3"
 
 
 def _line_offsets(text: str) -> list[int]:
@@ -315,14 +322,6 @@ def _is_account_section_anchor(line: str) -> bool:
     candidate = _label_candidate(norm)
     key, _, ambiguous = _match_label(candidate, _ACCOUNT_LABEL_TABLE)
     return key is not None or ambiguous
-
-
-def _find_account_anchor_idx(raw_lines: list, start: int = 0) -> int | None:
-    """Index of the first account-section anchor at/after ``start``."""
-    for i in range(start, len(raw_lines)):
-        if _is_account_section_anchor(raw_lines[i]):
-            return i
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -726,114 +725,217 @@ def parse_account_transcript(text: str, tax_year: int | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Record of Account
+# Record of Account — block model (X3b)
 # ---------------------------------------------------------------------------
 
-def _split_roa_sections(text: str) -> tuple[str, str, list]:
-    """Split Record-of-Account text into (return_text, account_text,
-    doc_level_lines).
+def _roa_anchor_events(raw_lines: list) -> list:
+    """Anchor-event scan over the whole document.
 
-    The account section starts at the first account-section anchor line
-    (X3: tolerant title or account-balance/accrual label -- real ROAs
-    often carry no clean "TAX ACCOUNT TRANSCRIPT" title); the return
-    section runs from its own header (or the document start) to that
-    boundary. The anchor search starts after the return-section header
-    when one is present, so return-section content can never be claimed
-    by the account section. Non-blank, non-structural lines before the
-    first section header belong to neither section and are returned as
-    doc-level lines. When no anchor is present the whole text is the
-    return section.
+    Returns [(line_idx, kind)] in document order for every return-header
+    match (_RETURN_SECTION_HEADER_RE) and every account anchor
+    (_is_account_section_anchor), searching from line 0 -- no
+    return-then-account ordering assumption. A line matching both is a
+    return header (precedence). X3's deliberate rules preserved: TC
+    transaction lines are never anchors; the "RECORD OF ACCOUNT" doc
+    title is never an anchor.
     """
-    raw_lines = text.splitlines()
-    ret_idx = next(
-        (i for i, line in enumerate(raw_lines)
-         if _RETURN_SECTION_HEADER_RE.match(line)),
-        None,
-    )
-    search_start = (ret_idx + 1) if ret_idx is not None else 0
-    acct_idx = _find_account_anchor_idx(raw_lines, search_start)
-    if acct_idx is None:
-        return text, "", []
-    section_start = ret_idx if ret_idx is not None else 0
-    doc_level = [
-        line for line in raw_lines[:section_start]
-        if line.strip() and not _is_structural(line)
-    ]
-    return_text = "\n".join(raw_lines[section_start:acct_idx])
-    account_text = "\n".join(raw_lines[acct_idx:])
-    return return_text, account_text, doc_level
+    events = []
+    for i, line in enumerate(raw_lines):
+        if _RETURN_SECTION_HEADER_RE.match(line):
+            events.append((i, "return"))
+        elif _is_account_section_anchor(line):
+            events.append((i, "account"))
+    return events
 
 
-def _shift_spans(obj, delta: int) -> None:
-    """Shift R15 char spans in a parsed section by ``delta`` (in place).
+def _roa_block_kinds(n_lines: int, events: list) -> list:
+    """Block section ("return" / "account" / "doc") for each line.
 
-    Section parsers report spans relative to the section text; the
-    Record-of-Account parse must report them relative to the full
-    document text.
+    A line's block section is the kind of the nearest anchor at/before
+    it. Lines before the first anchor: doc-level when the first anchor
+    is a return header, return-block content when the first anchor is
+    an account anchor (preserves the X3 behavior where text before the
+    account anchor was parsed as return text).
     """
-    for key, span in (obj.get("line_spans") or {}).items():
-        obj["line_spans"][key] = (span[0] + delta, span[1] + delta)
-    obj["unparsed_spans"] = [(s + delta, e + delta)
-                             for s, e in (obj.get("unparsed_spans") or [])]
-    for txn in obj.get("transactions") or []:
-        if txn.get("span"):
-            s, e = txn["span"]
-            txn["span"] = (s + delta, e + delta)
+    kinds = []
+    ev = 0
+    cur = None
+    pre = "doc" if events and events[0][1] == "return" else "return"
+    for i in range(n_lines):
+        while ev < len(events) and events[ev][0] <= i:
+            cur = events[ev][1]
+            ev += 1
+        kinds.append(cur if cur is not None else pre)
+    return kinds
+
+
+def _roa_summary_claims(run: dict, off_to_idx: dict) -> tuple:
+    """Per-line summary claims from a full-text parser run.
+
+    Returns (mapped, unparsed): idx -> key for mapped summary lines,
+    idx -> the verbatim unparsed entry (with any AMBIGUOUS:/DUPLICATE
+    prefix) for lines the parser saw but did not map. Index keys come
+    from the run's R15 spans, which are document-relative because the
+    run covered the full text.
+    """
+    mapped, unparsed = {}, {}
+    for key, span in (run.get("line_spans") or {}).items():
+        mapped[off_to_idx[span[0]]] = key
+    for entry, span in zip(run.get("unparsed_lines", []),
+                           run.get("unparsed_spans", [])):
+        unparsed[off_to_idx[span[0]]] = entry
+    return mapped, unparsed
+
+
+def _roa_pick_unparsed(ret_entry, acct_entry):
+    """Deterministic unparsed entry when no parser mapped the line.
+
+    A prefixed entry (AMBIGUOUS: / DUPLICATE) carries strictly more
+    information than the bare raw line, so it wins; prefixed-in-both is
+    unreachable on disjoint label tables -- the return parser's entry
+    breaks that tie.
+    """
+    for entry in (ret_entry, acct_entry):
+        if entry is not None and (
+                entry.startswith("AMBIGUOUS: ")
+                or entry.startswith("DUPLICATE ")):
+            return entry
+    return ret_entry if ret_entry is not None else acct_entry
 
 
 def parse_record_of_account(text: str, tax_year: int | None = None) -> dict:
     """Parse IRS Record of Account text into a dict.
 
     Returns exactly {"return_section", "account_section",
-    "unparsed_lines"}. A Record of Account is a return section followed
-    by an account section: the text is split at the account-section
-    anchor (X3: tolerant title or account-balance/accrual label -- the
-    whole-line header alone misses real ROAs) and each section is parsed
-    by reusing parse_return_transcript / parse_account_transcript on the
-    section text. Lines that fall outside both sections (document-level
-    lines before the first section header) go to top-level
-    unparsed_lines.
+    "unparsed_lines", "unparsed_spans"}. The block model (X3b): an
+    anchor-event scan over the whole text finds every return header and
+    account anchor with no ordering assumption; each line's block
+    section is the nearest anchor at/before it. Both section parsers
+    run once over the FULL text (so every R15 span is document-relative
+    -- no span shifting), and claims are assigned per line:
 
-    R15: the section parsers' char spans are shifted to full-document
-    coordinates so every field's evidence span is valid against the
-    stored per-page text.
+      - summary lines by grammar: mapped by the return parser ->
+        return_section, by the account parser -> account_section,
+        mapped by both -> the line's block section wins (deterministic
+        tie-break);
+      - transaction lines are deduplicated by span (both parsers consume
+        TC-led lines) and assigned to their span's block section,
+        keeping that block section's parser's version of the dict;
+      - lines no parser mapped -> unparsed of their block section
+        (identical raws from both parsers' unparsed lists are deduped;
+        AMBIGUOUS:/DUPLICATE prefixes are kept).
+
+    Lines before the first anchor are document-level (top-level
+    unparsed_lines/unparsed_spans, exactly as before) when the first
+    anchor is a return header; when it is an account anchor they are
+    return-block content. When there is no anchor at all the whole text
+    is the return section, as before.
     """
-    return_text, account_text, doc_level = _split_roa_sections(text)
-    offsets = _line_offsets(text)
     raw_lines = text.splitlines()
-    # Section texts are "\n".join slices of the document's lines; shift
-    # their parser-relative spans into full-document coordinates.
-    return_start = 0
-    account_start = 0
-    ret_idx = next(
-        (i for i, line in enumerate(raw_lines)
-         if _RETURN_SECTION_HEADER_RE.match(line)),
-        None,
-    )
-    if account_text:
-        search_start = (ret_idx + 1) if ret_idx is not None else 0
-        acct_idx = _find_account_anchor_idx(raw_lines, search_start)
-        # _split_roa_sections found an anchor, so this must too.
-        assert acct_idx is not None
-        account_start = offsets[acct_idx]
-        return_start = offsets[ret_idx] if ret_idx is not None else 0
-    return_section = parse_return_transcript(return_text, tax_year=tax_year)
-    account_section = parse_account_transcript(account_text, tax_year=tax_year)
-    _shift_spans(return_section, return_start)
-    _shift_spans(account_section, account_start)
-    # Doc-level lines (before the first section header): verbatim spans
-    # in full-document coordinates, parallel to "unparsed_lines".
-    # Mirrors _split_roa_sections' doc_level construction exactly.
-    doc_spans = []
-    if account_text:
-        for i in range(ret_idx if ret_idx is not None else 0):
-            line = raw_lines[i]
-            if line.strip() and not _is_structural(line):
-                doc_spans.append((offsets[i], offsets[i] + len(line)))
+    offsets = _line_offsets(text)
+    events = _roa_anchor_events(raw_lines)
+
+    if not events:
+        # No anchor anywhere: the whole text is the return section (X3
+        # behavior preserved byte-identical).
+        return {
+            "return_section":
+                parse_return_transcript(text, tax_year=tax_year),
+            "account_section":
+                parse_account_transcript("", tax_year=tax_year),
+            "unparsed_lines": [],
+            "unparsed_spans": [],
+        }
+
+    ret = parse_return_transcript(text, tax_year=tax_year)
+    acct = parse_account_transcript(text, tax_year=tax_year)
+    off_to_idx = {off: i for i, off in enumerate(offsets)}
+    ret_mapped, ret_unparsed = _roa_summary_claims(ret, off_to_idx)
+    acct_mapped, acct_unparsed = _roa_summary_claims(acct, off_to_idx)
+
+    # The return section's tax_year is detected on the return block's
+    # text, exactly as the pre-X3b section-slice parse did (a bare
+    # tax_year=None therefore keeps the old detection quirks, e.g. a
+    # TC-line date winning when no year line is in the block).
+    kinds_pre = _roa_block_kinds(len(raw_lines), events)
+    return_block_text = "\n".join(
+        raw for i, raw in enumerate(raw_lines) if kinds_pre[i] == "return")
+    resolved_year = (tax_year if tax_year is not None
+                     else _detect_tax_year(return_block_text)
+                     or _detect_tax_year_loose(return_block_text))
+
+    # Transaction dedupe by span: both parsers consume the same TC-led
+    # lines; the span is the line's identity.
+    txn_by_idx: dict = {}
+    for run, tag in ((ret, "ret"), (acct, "acct")):
+        for t in run.get("transactions", []):
+            idx = off_to_idx[t["span"][0]]
+            txn_by_idx.setdefault(idx, {})[tag] = t
+
+    def _new_section(with_year: bool) -> dict:
+        sec = {
+            "lines": {}, "line_raw_text": {}, "line_spans": {},
+            "line_confidence": {}, "transactions": [],
+            "unparsed_lines": [], "unparsed_spans": [],
+        }
+        if with_year:
+            sec["tax_year"] = resolved_year
+        return sec
+
+    return_section = _new_section(True)
+    account_section = _new_section(False)
+    sections = {"return": return_section, "account": account_section}
+    runs = {"return": ret, "account": acct}
+
+    def _copy_summary(src: dict, key: str, dst: dict) -> None:
+        dst["lines"][key] = src["lines"][key]
+        dst["line_raw_text"][key] = src["line_raw_text"][key]
+        dst["line_spans"][key] = src["line_spans"][key]
+        dst["line_confidence"][key] = src["line_confidence"][key]
+
+    kinds = kinds_pre
+    doc_lines, doc_spans = [], []
+    for i, raw in enumerate(raw_lines):
+        kind = kinds[i]
+        if kind == "doc":
+            if raw.strip() and not _is_structural(raw):
+                doc_lines.append(raw)
+                doc_spans.append((offsets[i], offsets[i] + len(raw)))
+            continue
+        if not raw.strip() or _is_structural(raw):
+            continue  # blank / structural: consumed by both parsers
+        if i in txn_by_idx:
+            got = txn_by_idx[i]
+            t = got.get("ret" if kind == "return" else "acct")
+            if t is None:  # unreachable: both parsers consume TC-led
+                # lines, but never KeyError on a half claim
+                t = next(iter(got.values()))
+            sections[kind]["transactions"].append(t)
+            continue
+        rkey, akey = ret_mapped.get(i), acct_mapped.get(i)
+        if rkey is not None and akey is not None:
+            # Mapped by both: the line's block section wins, keeping
+            # that section's parser's version of the entry.
+            _copy_summary(runs[kind], rkey if kind == "return" else akey,
+                          sections[kind])
+        elif rkey is not None:
+            _copy_summary(ret, rkey, return_section)
+        elif akey is not None:
+            _copy_summary(acct, akey, account_section)
+        else:
+            # Claimed by neither parser as a summary line: unparsed in
+            # the line's block section (dedupe the identical raws both
+            # parsers list; keep AMBIGUOUS:/DUPLICATE prefixes).
+            entry = _roa_pick_unparsed(ret_unparsed.get(i),
+                                      acct_unparsed.get(i))
+            sections[kind]["unparsed_lines"].append(entry)
+            sections[kind]["unparsed_spans"].append(
+                (offsets[i], offsets[i] + len(raw)))
+
     return {
         "return_section": return_section,
         "account_section": account_section,
-        "unparsed_lines": doc_level,
+        "unparsed_lines": doc_lines,
         "unparsed_spans": doc_spans,
     }
 

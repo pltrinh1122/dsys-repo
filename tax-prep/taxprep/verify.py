@@ -540,6 +540,27 @@ def _scrub_evidence_code(code: str) -> str:
     return str(code)
 
 
+def _lot_computed_entries(field: dict) -> list[tuple[str, dict]]:
+    """``(lot_label, entry)`` for computed entries inside a lots field.
+
+    Descends into ``fields["lots"]["value"]`` lot dicts; each lot's
+    ``gain_loss`` entry, when present as a computed-shaped dict, is
+    returned. Blind-safe: labels and the entry dicts only, never
+    values (callers must not log the entry's value).
+    """
+    out: list[tuple[str, dict]] = []
+    v = field.get("value") if isinstance(field, dict) else None
+    if not isinstance(v, list):
+        return out
+    for n, lot in enumerate(v, start=1):
+        if not isinstance(lot, dict):
+            continue
+        gl = lot.get("gain_loss")
+        if isinstance(gl, dict) and gl.get("computed") is True:
+            out.append((f"lot{n}", gl))
+    return out
+
+
 def verify_evidence(store, year: int) -> dict:
     """R19/R19a: per-doc source-evidence coverage as blind metadata.
 
@@ -548,6 +569,11 @@ def verify_evidence(store, year: int) -> dict:
     computed fields without lineage, and boxes outside page bounds.
     Page bounds come from the bronze PDF's vector page size -- no
     rendering, no PII, and no renderer required.
+
+    LINEAGE-1: the check descends into fields["lots"]["value"] lot
+    dicts, so each lot's tagged gain_loss (a computed field) is covered
+    by ``n_computed_fields_without_lineage`` exactly like a top-level
+    computed field.
 
     Fail-closed on missing geometry: every extracted field without
     recorded geometry counts in ``n_fields_without_geometry`` and FAILS
@@ -585,6 +611,7 @@ def verify_evidence(store, year: int) -> dict:
         bronze_path = _evidence.bronze_path_for_doc(store, d)
         stat = {"n_fields": len(fields), "n_with_geometry": 0,
                 "n_without_snapshot": 0, "n_computed_without_lineage": 0,
+                "n_lot_computed": 0,
                 "n_out_of_bounds": 0, "n_bounds_unknown": 0}
         for code, f in fields.items():
             ev = _evidence.field_evidence(f)
@@ -596,6 +623,15 @@ def verify_evidence(store, year: int) -> dict:
                     stat["n_computed_without_lineage"] += 1
                     n_without_lineage += 1
                 continue
+            # LINEAGE-1: descend into the 1099-B lot table -- per-lot
+            # gain_loss entries are computed fields, so they are covered
+            # by the n_computed_fields_without_lineage blind check.
+            for _lot_label, entry in _lot_computed_entries(f):
+                stat["n_lot_computed"] += 1
+                if (_evidence.field_evidence(entry)["state"]
+                        == _evidence.STATE_NO_EVIDENCE):
+                    stat["n_computed_without_lineage"] += 1
+                    n_without_lineage += 1
             if g is None:
                 stat["n_without_snapshot"] += 1
                 n_without_snapshot += 1

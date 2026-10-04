@@ -81,12 +81,14 @@ def _check_topic(topic: str) -> str:
 _SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 _EIN_RE = re.compile(r"\b\d{2}-\d{7}\b")
 # N3: the guard used to catch only hyphenated SSN/EIN. Extend it:
+#  - \b\d{8}\b             8-digit runs (brokerage/bank account numbers)
 #  - \b\d{9}\b            unhyphenated 9-digit runs (SSN without dashes)
 #  - XXX-XX-\d{4}         masked SSNs, any case (XXX, xxx, Xxx, ...)
 #  - \b\d{10,}\b          long digit runs (account / lot numbers)
 #  - \$[\d,]*\.\d{2}      currency amounts ($85,000.00)
 # Legitimate shapes still pass: 4-digit years, small counts, enum
 # strings, doc_ids, commit SHAs -- none match the patterns above.
+_ACCT_8_RE = re.compile(r"\b\d{8}\b")
 _PLAIN_9_RE = re.compile(r"\b\d{9}\b")
 _MASKED_SSN_RE = re.compile(r"\b[xX]{3}-[xX]{2}-\d{4}\b")
 _LONG_DIGITS_RE = re.compile(r"\b\d{10,}\b")
@@ -107,6 +109,11 @@ def _check_no_pii(serialized: str) -> None:
     if _MASKED_SSN_RE.search(serialized):
         raise ValueError(
             "payload refused: matches masked-SSN pattern (XXX-XX-\\d{4}); "
+            "the bus carries shapes only, never PII"
+        )
+    if _ACCT_8_RE.search(serialized):
+        raise ValueError(
+            "payload refused: matches 8-digit run (account number?); "
             "the bus carries shapes only, never PII"
         )
     if _PLAIN_9_RE.search(serialized):

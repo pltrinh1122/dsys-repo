@@ -668,9 +668,34 @@ def test_render_all_pages(tmp_path):
     import taxprep.review as review
     store, doc = _pdf_doc(tmp_path, pages=2)
     assert evidence_status(store, doc)["mode"] == "images"
-    images, error = review._pdf_page_images(doc)
+    images, error = review._pdf_page_images(store, doc)
     assert error is None
     assert len(images) == 2  # ALL pages, not a max_pages cap
+
+
+def test_pdf_page_images_scratch_never_touches_system_tmp(tmp_path, monkeypatch):
+    """review._pdf_page_images is the third pdftoppm call site: its
+    intermediate PII page files must live under <data_dir>/evidence
+    (mode 700), never the system temp dir -- same B4 fix as
+    evidence.render_page."""
+    _needs_renderer()
+    import shutil
+    import tempfile as tf
+    import taxprep.review as review
+    from pathlib import Path
+    store, doc = _pdf_doc(tmp_path, pages=2)
+    data_dir = Path(store.data_dir)
+    sys_tmp = data_dir.parent / "watched-system-tmp"
+    sys_tmp.mkdir(exist_ok=True)
+    monkeypatch.setattr(tf, "tempdir", str(sys_tmp))
+    before = {p for p in sys_tmp.rglob("*")}
+    images, error = review._pdf_page_images(store, doc)
+    assert error is None and len(images) == 2
+    assert {p for p in sys_tmp.rglob("*")} == before, \
+        "review render leaked PII page files into the system temp dir"
+    evdir = data_dir / "evidence"
+    leftovers = [p for p in evdir.iterdir() if p.name.startswith("review-")]
+    assert leftovers == []
 
 
 def test_page_range_passed_to_renderer(tmp_path, monkeypatch):
@@ -684,7 +709,7 @@ def test_page_range_passed_to_renderer(tmp_path, monkeypatch):
     monkeypatch.setattr(review, "_convert_from_path", spy)
     store, doc = _pdf_doc(tmp_path, pages=3)
     doc.page_range = (2, 3)  # split document's page range
-    images, error = review._pdf_page_images(doc)
+    images, error = review._pdf_page_images(store, doc)
     assert error is None and images == []
     assert seen["first_page"] == 2 and seen["last_page"] == 3
 

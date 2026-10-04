@@ -196,7 +196,7 @@ def _doc_page_texts(store: DocumentStore,
         return None
 
 
-def _pdf_page_images(doc: Document) -> tuple[list[str], str | None]:
+def _pdf_page_images(store, doc: Document) -> tuple[list[str], str | None]:
     """Render source PDF pages to JPEG data URIs.
 
     Renders ALL pages, or the split document's page range when
@@ -205,7 +205,14 @@ def _pdf_page_images(doc: Document) -> tuple[list[str], str | None]:
     Returns ``(images, error)``: ``error`` is None on success, otherwise a
     short reason string. Poppler's ``pdftoppm`` (poppler-utils) is the
     system prerequisite; ``pdf2image`` is a declared project dependency.
+
+    B4 privacy: pdftoppm's scratch files go to a private dir under the
+    data dir (700), never the system temp dir -- PII page images must
+    not touch /tmp. Same pattern as evidence.render_page.
     """
+    import shutil
+    import tempfile
+
     src = doc.source_path or ""
     if not src.lower().endswith(".pdf"):
         return [], "not a PDF source"
@@ -220,16 +227,25 @@ def _pdf_page_images(doc: Document) -> tuple[list[str], str | None]:
     pair = _evidence.page_range_pair(page_range)
     if pair is not None:
         kwargs["first_page"], kwargs["last_page"] = pair
+    tmp = tempfile.mkdtemp(prefix="review-",
+                           dir=str(_evidence.evidence_dir(store)))
     try:
-        images = _convert_from_path(str(pdf_path), **kwargs)
-    except Exception as exc:
-        # Reason only; exception text never surfaces (no PII/paths leak).
-        return [], f"page render failed ({type(exc).__name__})"
-    out = []
-    for img in images:
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=70)
-        out.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+        kwargs["output_folder"] = tmp
+        kwargs["paths_only"] = True
+        try:
+            paths = _convert_from_path(str(pdf_path), **kwargs)
+        except Exception as exc:
+            # Reason only; exception text never surfaces (no PII/paths leak).
+            return [], f"page render failed ({type(exc).__name__})"
+        from PIL import Image
+        out = []
+        for p in paths:
+            with Image.open(p) as img:
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=70)
+                out.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     return out, None
 
 
@@ -248,7 +264,7 @@ def evidence_status(store: DocumentStore, doc: Document) -> dict:
     """
     src = doc.source_path or ""
     if src.lower().endswith(".pdf"):
-        images, error = _pdf_page_images(doc)
+        images, error = _pdf_page_images(store, doc)
         if error is None:
             return {"mode": "images", "reason": None}
         try:
@@ -272,7 +288,7 @@ def _source_evidence_html(store: DocumentStore, doc: Document) -> tuple[str, boo
     """
     ev = evidence_status(store, doc)
     if ev["mode"] == "images":
-        images, _ = _pdf_page_images(doc)
+        images, _ = _pdf_page_images(store, doc)
         imgs = "".join(
             f'<img src="data:image/jpeg;base64,{p}" alt="source page">' for p in images
         )
@@ -410,11 +426,17 @@ def _page_viewer_html(store: DocumentStore, doc: Document,
 
 def _field_evidence_cell(store: DocumentStore, doc: Document, code: str,
                          f: dict, base: str,
-                         images_mode: bool) -> tuple[str, bool]:
+                         images_mode: bool,
+                         input_anchor=None) -> tuple[str, bool]:
     """One field row's evidence cell.
 
     Returns ``(cell_html, confirm_disabled)``. The disabled flag is
     computed server-side so the fail-closed rule never depends on JS.
+
+    ``input_anchor`` (optional): ``code -> href`` for the lineage
+    view's input links. Default anchors each input to its own field
+    row (``#row-<code>``); per-lot computed rows pass an anchor to the
+    parent lots row, where the lot's inputs actually live.
     """
     ev = _evidence.field_evidence(f)
     state = ev["state"]
@@ -422,13 +444,28 @@ def _field_evidence_cell(store: DocumentStore, doc: Document, code: str,
                 f"&field={quote(code)}")
     if state == _evidence.STATE_LINEAGE:
         lin = ev["lineage"]
+
+        def _href(c):
+            if input_anchor is not None:
+                return input_anchor(c)
+            return f"#row-{html.escape(c)}"
+
         inputs = " ".join(
-            f'<a href="#row-{html.escape(c)}" class="inplink" '
+            f'<a href="{_href(c)}" class="inplink" '
             f'data-box="{html.escape(c)}">{html.escape(c)}</a>'
             for c in lin["inputs"])
+        # R19a: a computed field that was itself operator-edited shows
+        # the lineage AND the edit record (the lineage view is never
+        # the "no visual evidence" state).
+        hist = "".join(
+            f'<div class="edithist">edited {html.escape(str(e.get("ts", "")))}: '
+            f'{html.escape(str(e.get("old")))} → '
+            f'{html.escape(str(e.get("new")))} (operator)</div>'
+            for e in ev["history"]
+            if isinstance(e, dict) and e.get("old") is not None)
         cell = (f'<div class="lineage"><b>computed</b> — no source region.<br>'
                 f'formula: <code>{html.escape(lin["formula"])}</code>'
-                f'<br>inputs: {inputs}</div>')
+                f'<br>inputs: {inputs}</div>{hist}')
         return cell, False
     if state in (_evidence.STATE_SNAPSHOT, _evidence.STATE_EDITED):
         note = ""

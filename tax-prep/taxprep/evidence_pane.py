@@ -97,6 +97,45 @@ document.querySelectorAll("#evidence-pane button.vorig").forEach(btn=>{
 """
 
 
+def _lot_gain_loss_rows(store, doc, lots_field: dict,
+                        base: str, images_mode: bool) -> list[str]:
+    """Per-lot gain_loss sub-rows under the lots field (LINEAGE-1).
+
+    Each lot's tagged gain_loss is a computed field: it renders the
+    lineage view (formula + input links), never the "no visual
+    evidence" state. The inputs are the lot's own proceeds/basis/wash
+    cells, which live in the parent lots row -- so every input link
+    anchors there.
+    """
+    v = lots_field.get("value") if isinstance(lots_field, dict) else None
+    if not isinstance(v, list):
+        return []
+    rows = []
+    for n, lot in enumerate(v, start=1):
+        if not isinstance(lot, dict):
+            continue
+        gl = lot.get("gain_loss")
+        if not isinstance(gl, dict) or gl.get("computed") is not True:
+            continue
+        code = f"lots.lot{n}.gain_loss"
+        val = gl.get("value")
+        vtxt = "" if val is None else str(val)
+        cell, ev_disabled = _review._field_evidence_cell(
+            store, doc, code, gl, base, images_mode,
+            input_anchor=lambda _c: "#row-lots")
+        dis = "disabled" if ev_disabled else ""
+        rows.append(
+            f'<tr class="field-row lot-computed" data-box="{html.escape(code)}" '
+            f'id="row-{html.escape(code)}">'
+            f'<td class="fcode">{html.escape(code)}</td>'
+            f"<td>{html.escape(vtxt)}</td>"
+            f"<td>{cell}</td>"
+            f'<td><input type="checkbox" class="fchk" {dis}></td>'
+            "</tr>"
+        )
+    return rows
+
+
 def pane_html(store, doc) -> str:
     """Evidence section HTML for one document (console mount point).
 
@@ -133,6 +172,8 @@ def pane_html(store, doc) -> str:
             f'<td><input type="checkbox" class="fchk" {dis}></td>'
             "</tr>"
         )
+        if code == "lots":
+            rows.extend(_lot_gain_loss_rows(store, doc, f, base, images_mode))
     table = (
         '<table class="evtable"><tr><th>field</th><th>value</th>'
         "<th>evidence</th><th>confirm</th></tr>"

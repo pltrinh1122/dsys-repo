@@ -142,7 +142,7 @@ def test_reingest_disagreement_keeps_validated_values_flags_rereview(
     # Disagreement is only reachable through a derivation change: same
     # bytes always re-derive identically (I2 no-op), so the disagreeing
     # extractor rides a version bump (I6).
-    def _disagree(form_type, text, year):
+    def _disagree(form_type, text, year, text_source=None):
         fields = {"1": {"value": "99999.99", "confidence": "high",
                         "raw_text": ""}}
         return fields, "transcribed"
@@ -573,7 +573,7 @@ def test_record_of_account_ingests_end_to_end(iso):
     assert doc.fields["agi"]["raw_text"] == \
         "Adjusted Gross Income: $85,420.00"
     prov = doc.fields["agi"]["provenance"]
-    assert prov["extractor"] == "transcript:2"
+    assert prov["extractor"] == "transcript:3"
     cs = prov["char_span"]
     assert cs["page"] == 0
     assert ROA_TEXT[cs["start"]:cs["end"]] == \
@@ -585,3 +585,88 @@ def test_record_of_account_ingests_end_to_end(iso):
     cs = doc.fields["tc_846"]["provenance"]["char_span"]
     assert ROA_TEXT[cs["start"]:cs["end"]] == \
         doc.fields["tc_846"]["raw_text"]
+
+
+# -- X4: repeated TC codes get ordinal-suffixed keys ------------------------
+# All fixtures synthetic. First occurrence keeps tc_<code>; repeats become
+# tc_<code>_2, tc_<code>_3, ... in parser order. The RECORD_OF_ACCOUNT
+# branch shares ONE ordinal namespace across both sections, so a TC code
+# in return_section no longer silently overwrites the same code in
+# account_section.
+
+X4_REPEAT_TEXT = ("TAX ACCOUNT TRANSCRIPT\nTax Year: 2024\n"
+                  "150 Tax return filed 20241205 04-15-2025 $1,234.56\n"
+                  "806 W-2 or 1099 withholding 20241205 04-15-2025 $500.00\n"
+                  "806 W-2 or 1099 withholding 20243207 04-15-2025 $600.00\n")
+
+X4_ROA_REPEAT_TEXT = ("RECORD OF ACCOUNT\nTax Year: 2024\n"
+                      "TAX RETURN TRANSCRIPT\n"
+                      "Adjusted Gross Income: $85,420.00\n"
+                      "150 Tax return filed 04-15-2025 $12,340.00\n"
+                      "TAX ACCOUNT TRANSCRIPT\n"
+                      "Account Balance: $0.00\n"
+                      "150 Tax return filed 20241205 04-15-2025 $12,340.00\n"
+                      "846 Refund issued 20243207 10-05-2025 $0.00\n")
+
+X4_RETURN_REPEAT_TEXT = ("TAX RETURN TRANSCRIPT\nTax Year: 2024\n"
+                         "Adjusted Gross Income: $85,420.00\n"
+                         "150 Tax return filed 04-15-2025 $12,340.00\n"
+                         "806 W-2 or 1099 withholding 04-15-2025 $5,000.00\n"
+                         "806 W-2 or 1099 withholding 04-15-2025 $7,340.00\n")
+
+
+def test_x4_repeated_tc_code_gets_ordinal_keys():
+    parsed = ingest.transcript.parse_account_transcript(X4_REPEAT_TEXT)
+    assert len(parsed["transactions"]) == 3  # the parser keeps all three
+    fields, status = ingest._fields_from_transcript(
+        "ACCOUNT_TRANSCRIPT", X4_REPEAT_TEXT, 2024)
+    tc_keys = sorted(k for k in fields if k.startswith("tc_"))
+    assert tc_keys == ["tc_150", "tc_806", "tc_806_2"]
+    # verbatim raw lines (R15), first occurrence keeps the bare key
+    assert fields["tc_806"]["raw_text"] == \
+        "806 W-2 or 1099 withholding 20241205 04-15-2025 $500.00"
+    assert fields["tc_806_2"]["raw_text"] == \
+        "806 W-2 or 1099 withholding 20243207 04-15-2025 $600.00"
+    assert status == "transcribed"
+
+
+def test_x4_tc_field_count_matches_transaction_count():
+    # invariant: one stored tc_* field per parsed transaction -- no
+    # silent overwrite
+    cases = [
+        ("ACCOUNT_TRANSCRIPT", X4_REPEAT_TEXT,
+         ingest.transcript.parse_account_transcript),
+        ("RETURN_TRANSCRIPT", X4_RETURN_REPEAT_TEXT,
+         ingest.transcript.parse_return_transcript),
+    ]
+    for form_type, text, parse_fn in cases:
+        n_txns = len(parse_fn(text)["transactions"])
+        fields, _ = ingest._fields_from_transcript(form_type, text, 2024)
+        n_tc = sum(1 for k in fields if k.startswith("tc_"))
+        assert n_tc == n_txns, (form_type, n_tc, n_txns)
+    # ROA: transactions across both sections share the ordinal namespace
+    parsed = ingest.transcript.parse_record_of_account(X4_ROA_REPEAT_TEXT)
+    n_txns = (len(parsed["return_section"]["transactions"])
+              + len(parsed["account_section"]["transactions"]))
+    fields, _ = ingest._fields_from_transcript(
+        "RECORD_OF_ACCOUNT", X4_ROA_REPEAT_TEXT, 2024)
+    n_tc = sum(1 for k in fields if k.startswith("tc_"))
+    assert n_tc == n_txns == 3
+
+
+def test_x4_roa_cross_section_repeat_shares_ordinal_namespace():
+    # TC 150 in BOTH sections: both preserved, no cross-section
+    # overwrite. Return section's occurrence (first in parser order)
+    # keeps the bare key.
+    fields, status = ingest._fields_from_transcript(
+        "RECORD_OF_ACCOUNT", X4_ROA_REPEAT_TEXT, 2024)
+    tc_keys = sorted(k for k in fields if k.startswith("tc_"))
+    assert tc_keys == ["tc_150", "tc_150_2", "tc_846"]
+    assert fields["tc_150"]["raw_text"] == \
+        "150 Tax return filed 04-15-2025 $12,340.00"
+    assert fields["tc_150_2"]["raw_text"] == \
+        "150 Tax return filed 20241205 04-15-2025 $12,340.00"
+    span = fields["tc_150_2"].pop("_extract_span")
+    assert X4_ROA_REPEAT_TEXT[span[0]:span[1]] == \
+        fields["tc_150_2"]["raw_text"]
+    assert status == "transcribed"

@@ -14,9 +14,11 @@ Regression pinned: the whole-line transcript anchors missed a prefixed
 title ("Form 1040 Tax Return Transcript"), the file fell through to the
 R1 per-section split, and the embedded "Form W-2" / "Schedule D"
 headings spawned PHANTOM box-form child documents (an L3 double-count
-risk). The type is now decided at DOCUMENT level first -- from page-1
-title lines carrying a transcript title anywhere in the line -- and a
-transcript-typed document is never split.
+risk). The type is now decided at DOCUMENT level first -- from the
+first three pages' title lines carrying a transcript title anywhere in
+the line (X2b: the scan used to cover page 1 only, so a cover page
+pushed the title off the detector and crashed ingest on the X2 guard)
+-- and a transcript-typed document is never split.
 
 G-2 canary details baked in: the title sits on page-1 line 3 sharing
 its line with exactly 2 extra words, and the in-text "Form W-2" /
@@ -350,6 +352,18 @@ def test_guard_fires_on_split_path_when_detector_misses(tmp_path):
                                 store)
 
 
+def test_guard_still_fires_when_split_mixes_transcript_and_box():
+    # the guard's own contract, pinned directly: a split that mixes a
+    # transcript child with a box-form child fails loudly, never
+    # silently emits phantoms
+    sections = [
+        FormSection("RETURN_TRANSCRIPT", "TAX RETURN TRANSCRIPT\n", 4, 4),
+        FormSection("W-2", "Form W-2\nBox 1 Wages: $1.00\n", 5, 5),
+    ]
+    with pytest.raises(AssertionError, match="X2 guard"):
+        ingest._check_no_transcript_box_mix(sections)
+
+
 def test_embedded_headings_are_transcript_content_not_children(tmp_path):
     # the exact headings the old splitter cut on -- "Form 1040",
     # "Form W-2", "Schedule D" -- inside a transcript body
@@ -362,3 +376,100 @@ def test_embedded_headings_are_transcript_content_not_children(tmp_path):
     assert len(docs) == 1
     assert docs[0].form_type == "RETURN_TRANSCRIPT"
     assert docs[0].parent_doc_id is None  # not a split child
+
+
+# -- X2b: multi-page transcripts never split (regression) -----------------------
+#
+# The workstation's gate audit confirmed X2b fixed: the X2 document-level
+# transcript guard covers multi-page sources (105-page transcripts yield
+# exactly 1 document, no phantoms). These tests pin that behavior.
+
+def _build_docs_from_pages(pages, tmp_path, name):
+    """_build_documents over an explicit page list (I7: bronze first)."""
+    store = DocumentStore(tmp_path / "data")
+    bundle = ingest.PageBundle(pages=pages, route="native",
+                               text_source="native")
+    text = "\n".join(pages)
+    source_bytes = text.encode("utf-8")
+    sha = hashlib.sha256(source_bytes).hexdigest()
+    ingest._register_bronze(store, sha, source_bytes, name,
+                            encryption=None)
+    docs = ingest._build_documents(name, ingest.source_doc_id(source_bytes),
+                                   bundle, sha, store)
+    return docs
+
+
+def _filler_page(n):
+    # benign continuation body; embedded form/schedule headings that the
+    # R1 split would cut on (the audit's literal 105-page scenario)
+    return (f"Page {n} continuation\n"
+            f"Account activity detail line {n}.\n"
+            "Form 1099-B\n"
+            "Proceeds: $1.00\n"
+            "Schedule D\n"
+            f"Detail row {n}.\n")
+
+
+def _long_transcript(pages_total, title_page_idx, title_line,
+                     body_first):
+    pages = []
+    for i in range(pages_total):
+        if i == title_page_idx:
+            pages.append(_BOILERPLATE + title_line + body_first)
+        else:
+            pages.append(_filler_page(i + 1))
+    return pages
+
+
+@pytest.mark.parametrize("title_line,form_type", [
+    ("Form 1040 Tax Return Transcript For TY2025\n",
+     "RETURN_TRANSCRIPT"),
+    ("Wage and Income Transcript For TY2025\n",
+     "WAGE_INCOME_TRANSCRIPT"),
+    ("Form 1040 Record of Account For TY2025\n",
+     "RECORD_OF_ACCOUNT"),
+])
+def test_105_page_transcripts_never_split(tmp_path, title_line, form_type):
+    # the audit's acceptance: 105-page transcripts with embedded
+    # "Form 1099-B" / "Schedule D" headings on every filler page yield
+    # exactly 1 document each
+    pages = _long_transcript(
+        105, 0, title_line,
+        "Tax Year: 2025\nAdjusted Gross Income: $85,420.00\n")
+    docs = _build_docs_from_pages(pages, tmp_path, "long.txt")
+    assert len(docs) == 1
+    assert docs[0].form_type == form_type
+    _no_box_form_docs(docs)
+
+
+
+
+def test_title_on_page_four_is_not_detected():
+    # the detector scans page-1 title lines only: a title past page 1
+    # is invisible to it and falls through to the ordinary split path
+    # by design (the X2 guard stays the loud backstop there)
+    pages = ["Cover\n", "Cover\n", "Cover\n",
+             "Form 1040 Tax Return Transcript For TY2025\nbody\n"]
+    assert detect_transcript_type(pages) is None
+
+
+def test_broker_boilerplate_on_page_five_not_mistyped(tmp_path):
+    # "record of account" boilerplate deep in a long broker statement
+    # must not type the document as a transcript
+    pages = [
+        "SYNTHETIC BROKERAGE MONTHLY STATEMENT\nAccount: 99-111\n",
+        "Holdings summary\nPosition detail\n",
+        "Activity detail\nDividend detail\n",
+        "Fee schedule\nTax documents enclosed\n",
+        ("You may request a record of account at any time by calling "
+         "the number above.\nForm 1099-B\nProceeds: $2.00\n"),
+    ]
+    assert detect_transcript_type(pages) is None
+    docs = _build_docs_from_pages(pages, tmp_path, "broker.txt")
+    assert all(d.form_type != "RECORD_OF_ACCOUNT" for d in docs)
+    assert all(d.form_type not in
+               ("RETURN_TRANSCRIPT", "ACCOUNT_TRANSCRIPT",
+                "WAGE_INCOME_TRANSCRIPT") for d in docs)
+
+
+
