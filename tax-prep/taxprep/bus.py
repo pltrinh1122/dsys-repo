@@ -414,18 +414,26 @@ def list_messages(
     """
     _check_topic(topic)
     topic_dir = resolve_bus_dir(bus_dir, store_dir) / topic
-    messages: list[dict] = []
+    paths: list = []
     if topic_dir.is_dir():
-        for path in sorted(topic_dir.glob("*.json")):
-            msg = _read_message(path)
-            if msg is not None:
-                messages.append(msg)
-    messages.sort(key=lambda m: (m["ts"], m["id"]))
+        paths = sorted(topic_dir.glob("*.json"))
     if since_id is not None:
-        ids = [m["id"] for m in messages]
-        if since_id in ids:
-            messages = messages[ids.index(since_id) + 1 :]
-        # unknown cursor -> return everything (catch up)
+        # Filename pre-filter: filenames embed the publish timestamp and
+        # sort in the same order as (ts, id), so files at or before the
+        # cursor's file are never even read -- the watermark avoids
+        # re-reading, not just re-delivery. since_id is matched by suffix;
+        # no path is ever constructed from it.
+        cursor_names = [p.name for p in paths if p.name.endswith(f"-{since_id}.json")]
+        if cursor_names:
+            cutoff = cursor_names[0]
+            paths = [p for p in paths if p.name > cutoff]
+        # unknown cursor id -> read everything (catch up), as before
+    messages: list[dict] = []
+    for path in paths:
+        msg = _read_message(path)
+        if msg is not None:
+            messages.append(msg)
+    messages.sort(key=lambda m: (m["ts"], m["id"]))
     if exclude_from is not None:
         messages = [m for m in messages if m.get("from") != exclude_from]
     return messages
@@ -464,8 +472,15 @@ def _load_cursor(cursor_path: Path) -> dict:
 
 
 def _save_cursor(cursor_path: Path, cursor: dict) -> None:
+    # Atomic: tmp + fsync + os.replace (the D1 pattern). A crash mid-write
+    # must never leave a torn cursor that forces a full-history re-delivery.
     cursor_path.parent.mkdir(parents=True, exist_ok=True)
-    cursor_path.write_text(json.dumps(cursor, indent=2) + "\n", encoding="utf-8")
+    tmp_path = cursor_path.with_name(cursor_path.name + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(cursor, indent=2) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, cursor_path)
 
 
 def poll_once(

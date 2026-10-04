@@ -146,6 +146,40 @@ def test_list_messages_ordering_and_since_id(busdir, tuning_path):
     assert len(list_messages("t", since_id="msg_deadbeef00", bus_dir=busdir)) == 3
 
 
+def test_list_messages_since_id_does_not_reread_old_files(busdir, tuning_path, monkeypatch):
+    # The watermark avoids re-READING, not just re-delivery: files at or
+    # before the cursor's file are never opened.
+    import taxprep.bus as busmod
+    for i in range(4):
+        publish("t", "x", {"n": i}, SESSION_A, bus_dir=busdir, tuning_path=tuning_path)
+    msgs = list_messages("t", bus_dir=busdir)
+    assert len(msgs) == 4
+    calls = []
+    real_read = busmod._read_message
+    def counting(path):
+        calls.append(path.name)
+        return real_read(path)
+    monkeypatch.setattr(busmod, "_read_message", counting)
+    rest = list_messages("t", since_id=msgs[1]["id"], bus_dir=busdir)
+    assert [m["id"] for m in rest] == [m["id"] for m in msgs[2:]]
+    # only the 2 newer files were read; the 2 older ones never opened
+    assert len(calls) == 2
+    # unknown cursor still catches up (reads everything)
+    calls.clear()
+    assert len(list_messages("t", since_id="msg_deadbeef00", bus_dir=busdir)) == 4
+    assert len(calls) == 4
+
+
+def test_save_cursor_is_atomic(tmp_path):
+    # tmp + fsync + os.replace: no torn cursor, no leftover tmp file.
+    from taxprep.bus import _save_cursor, _load_cursor
+    cursor = tmp_path / "cursor.json"
+    _save_cursor(cursor, {"sessions": {"s": {"t": "msg_abc"}}})
+    assert _load_cursor(cursor) == {"sessions": {"s": {"t": "msg_abc"}}}
+    assert not (tmp_path / "cursor.json.tmp").exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 def test_topics(busdir, tuning_path):
     assert topics(bus_dir=busdir) == []
     publish("tax-prep.build", "x", {}, SESSION_A, bus_dir=busdir, tuning_path=tuning_path)
