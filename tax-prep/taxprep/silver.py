@@ -288,22 +288,30 @@ def derive_artifacts(doc, bundle=None, *, bronze_hash: str,
     Deterministic: the same ``(doc.fields, bronze_hash, page,
     derivation_version, config_hash)`` always yields byte-identical
     rows (I5). ``bundle`` (the ingest PageBundle) is accepted for
-    signature compatibility and future R15 geometry; per-page offsets
-    are not produced by the current extractors, so ``offsets_json`` is
-    None.
+    signature compatibility.
+
+    R15: each field entry's ``provenance`` dict (recorded at extraction
+    time) is mirrored into the field artifact's ``offsets_json``; the
+    1099-B ``lots`` entry's ``lot_provenance`` list feeds the per-lot
+    artifacts' ``offsets_json`` in lot order.
     """
     page = best_page_for_doc(doc)
     fields = getattr(doc, "fields", None) or {}
     doc_id = getattr(doc, "doc_id", "")
     out: list[dict] = []
 
-    def _row(artifact_type: str, anchor: str, value_json: str) -> dict:
+    def _row(artifact_type: str, anchor: str, value_json: str,
+             offsets_json: str | None = None) -> dict:
         return _artifact_row(
             doc_id=doc_id, bronze_hash=bronze_hash, page=page,
             artifact_type=artifact_type, anchor=anchor,
-            value_json=value_json, offsets_json=None,
+            value_json=value_json, offsets_json=offsets_json,
             derivation_version=derivation_version, config_hash=config_hash,
         )
+
+    def _provenance_json(entry) -> str | None:
+        prov = entry.get("provenance") if isinstance(entry, dict) else None
+        return canonical_json(prov) if isinstance(prov, dict) else None
 
     # One 'field' artifact per fields-dict key (bookkeeping excluded).
     for key in sorted(fields):
@@ -313,7 +321,8 @@ def derive_artifacts(doc, bundle=None, *, bronze_hash: str,
         out.append(_row(
             FIELD, key,
             field_artifact_value(entry if isinstance(entry, dict)
-                                 else {"value": entry})))
+                                 else {"value": entry}),
+            _provenance_json(entry)))
     # One 'payer' artifact per payer block.
     for payer_key in sorted(_payer_groups(fields)):
         out.append(_row(PAYER, payer_key,
@@ -321,10 +330,17 @@ def derive_artifacts(doc, bundle=None, *, bronze_hash: str,
     # One 'lot' artifact per 1099-B lot.
     lots = _lot_list(fields)
     if lots is not None:
+        lot_prov = _lot_provenance_list(fields)
         for i, lot in enumerate(lots):
+            offsets = None
+            if lot_prov is not None and i < len(lot_prov):
+                lp = lot_prov[i]
+                offsets = (canonical_json(lp)
+                           if isinstance(lp, dict) else None)
             out.append(_row(LOT, f"lot:{i}",
                             canonical_json(lot if isinstance(lot, dict)
-                                           else {"value": lot})))
+                                           else {"value": lot}),
+                            offsets))
     # One 'section' artifact for an R1 split section.
     section_anchor = _section_anchor(doc)
     if section_anchor is not None:
@@ -335,6 +351,15 @@ def derive_artifacts(doc, bundle=None, *, bronze_hash: str,
             "parent_doc_id": getattr(doc, "parent_doc_id", None),
         })))
     return out
+
+
+def _lot_provenance_list(fields: dict) -> list | None:
+    """The 1099-B lots entry's per-lot provenance, or None."""
+    lots = fields.get("lots")
+    if isinstance(lots, dict):
+        prov = lots.get("lot_provenance")
+        return prov if isinstance(prov, list) else None
+    return None
 
 
 def artifact_anchors(artifacts: list[dict]) -> set[tuple[str, str]]:

@@ -256,17 +256,22 @@ def test_version_bump_rebuilds_silver_preserves_decisions(
                      confirm_form_type=True, confirm_tax_year=True)
     assert store.get(doc.doc_id).status == "validated"
 
-    # extractor v3: box "1" re-derives differently, box "2" vanishes.
+    # extractor bump: box "1" re-derives differently, box "2" vanishes.
+    # (The bumped version is computed, not hardcoded: the tree's real
+    # EXTRACTOR_VERSION moves with R15 and friends.)
+    _bumped = str(int(extractors.EXTRACTOR_VERSION) + 1)
+
     def _v3(form_type, text, year):
         return ({"1": {"value": "99999.99", "confidence": "high",
                        "raw_text": ""}}, "transcribed")
 
     monkeypatch.setattr(ingest, "_extract_for_type", _v3)
-    monkeypatch.setattr(extractors, "EXTRACTOR_VERSION", "3")
+    monkeypatch.setattr(extractors, "EXTRACTOR_VERSION", _bumped)
     again = ingest_file(src, store)[0]
 
     # validated values win; vanished validated fields drop; re_review set.
-    assert again.status == "validated"
+    # R13: the disagreeing re-derivation moves validated -> rereview.
+    assert again.status == "rereview"
     assert again.fields["1"]["value"] == "12345.67"
     assert "2" not in again.fields
     assert again.re_review is True
@@ -279,7 +284,7 @@ def test_version_bump_rebuilds_silver_preserves_decisions(
     current = silver.field_artifact_anchors(again.fields)
     cur_versions = {a["derivation_version"] for a in arts
                     if (a["artifact_type"], a["anchor"]) in current}
-    assert cur_versions == {"3"}
+    assert cur_versions == {_bumped}
     # ...and the vanished field's validate decision is flagged orphaned
     # (append-only: the original row is untouched).
     validates = store.decisions_for(doc_id=doc.doc_id, kind="validate")

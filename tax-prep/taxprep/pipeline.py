@@ -201,9 +201,10 @@ def _scoped(store, year: int | None) -> list:
 
 def _review_queue(store, year: int | None) -> list:
     """Docs awaiting human validation -- the same definition as the
-    review UI queue (review.queue_html): transcribed or needs_review."""
+    review UI queue (review.queue_html): transcribed, needs_review, or
+    errored (R13: error-route docs keep their old visibility)."""
     return [d for d in _scoped(store, year)
-            if d.status in ("transcribed", "needs_review")]
+            if d.status in ("transcribed", "needs_review", "errored")]
 
 
 def _r_ingestion(store, ctx: dict) -> dict:

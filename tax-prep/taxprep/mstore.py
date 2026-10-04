@@ -69,6 +69,14 @@ _DECISION_KINDS = frozenset({
     "supersedes_ruling",
     "conflict_choice",
     "relevance_override",
+    # R19: the Operator's explicit "verified against original" verdict --
+    # the fail-closed escape hatch for confirming a field with no visual
+    # evidence. Append-only like every other decision kind.
+    "verify_original",
+    # R13 (Arc C, W1): per-document lifecycle events
+    # {event, from, to, reason_code} (metadata only) -- the append-only
+    # event log the lifecycle state machine replays.
+    "lifecycle",
 })
 
 # Columns hashed by db_digest(), per table. Volatile bookkeeping columns
@@ -76,8 +84,9 @@ _DECISION_KINDS = frozenset({
 # ingest-twice idempotency comparisons stay stable: re-ingesting the same
 # bytes may only bump "seen at" bookkeeping (I2).
 _DIGEST_COLS = {
-    "bronze": ["hash", "size", "source_root", "selection_state",
-               "encryption", "text_fingerprint", "blocked_reason"],
+    "bronze": ["hash", "size", "source_root", "source_relpath",
+               "selection_state", "encryption", "text_fingerprint",
+               "blocked_reason"],
     "bronze_alias": ["hash", "path"],
     "bronze_bytes_ref": ["hash", "rel_path"],
     "bronze_text": ["hash", "page", "text_source", "engine",
@@ -232,6 +241,24 @@ class MedallionStore:
                                      check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._apply_pragmas()
+        self._migrate_columns()
+
+    # Additive, idempotent column migrations for databases created by an
+    # older DDL. Each ALTER is guarded by PRAGMA table_info, so opening
+    # an up-to-date database is a no-op.
+    _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+        ("bronze", "source_relpath", "TEXT"),     # R15 source identity
+        ("bronze", "source_mtime", "INTEGER"),    # R15 source identity
+    )
+
+    def _migrate_columns(self) -> None:
+        with self._op_lock:
+            for table, column, ddl in self._COLUMN_MIGRATIONS:
+                cols = {r["name"] for r in self._conn.execute(
+                    f"PRAGMA table_info({table})")}
+                if column not in cols:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def _init_at(self, tmp: Path) -> None:
         """Build a fully-initialized database at `tmp`.
@@ -364,19 +391,25 @@ class MedallionStore:
 
     # -- bronze ----------------------------------------------------------
     def register_bronze(self, sha: str, size: int, source_root: str | None = None,
-                        encryption: str | None = None) -> bool:
+                        encryption: str | None = None,
+                        source_relpath: str | None = None,
+                        source_mtime: int | None = None) -> bool:
         """Register a bronze object. True if newly created.
 
         Re-registering the same bytes is a no-op for state (I2): only
         last_seen is bumped. Never changes selection/blocked state.
+        R15 source identity (source_relpath/source_mtime) is recorded on
+        first insert; re-registering never clobbers it.
         """
         now = _utcnow()
         with self.txn():
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO bronze "
-                "(hash, size, source_root, first_seen, last_seen, "
-                " encryption) VALUES (?, ?, ?, ?, ?, ?)",
-                (sha, size, source_root, now, now, encryption),
+                "(hash, size, source_root, source_relpath, source_mtime, "
+                " first_seen, last_seen, encryption) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (sha, size, source_root, source_relpath, source_mtime,
+                 now, now, encryption),
             )
             if cur.rowcount == 1:
                 return True
@@ -385,6 +418,12 @@ class MedallionStore:
                 (now, sha),
             )
             return False
+
+    def bronze_hashes(self) -> list[str]:
+        """All bronze content hashes, ordered. Metadata only."""
+        with self._op_lock:
+            return [r["hash"] for r in self._conn.execute(
+                "SELECT hash FROM bronze ORDER BY hash")]
 
     def _set_blocked_reason(self, sha: str, reason: str) -> None:
         self.set_blocked_reason(sha, reason)

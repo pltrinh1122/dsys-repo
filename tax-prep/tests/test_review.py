@@ -19,6 +19,8 @@ from taxprep.review import (
     apply_validation,
     evidence_status,
     highlight_ocr,
+    highlight_page,
+    highlight_pages,
     make_server,
     queue_html,
 )
@@ -40,6 +42,15 @@ Box 1 Interest income 412.55
 
 def _fixture_store(tmp_path) -> DocumentStore:
     store = DocumentStore(tmp_path / "data")
+
+    def _prov(raw: str) -> dict:
+        # R15: the fixture's fields carry real char_spans into W2_OCR
+        start = W2_OCR.index(raw)
+        return {"page": 0, "bbox_pdf": None, "bbox_source": None,
+                "char_span": {"page": 0, "start": start,
+                              "end": start + len(raw)},
+                "extractor": "extractors:3"}
+
     w2 = Document(
         doc_id="w2-acme-2024",
         tax_year=2024,
@@ -48,11 +59,15 @@ def _fixture_store(tmp_path) -> DocumentStore:
         ocr_text_ref="",
         fields={
             "box1_wages": {"value": 85000.0, "confidence": "high",
-                           "raw_text": "Box 1 Wages 85000.00"},
+                           "raw_text": "Box 1 Wages 85000.00",
+                           "provenance": _prov("Box 1 Wages 85000.00")},
             "box2_withheld": {"value": 12750.0, "confidence": "medium",
-                              "raw_text": "Box 2 Federal income tax withheld 12750.00"},
+                              "raw_text": "Box 2 Federal income tax withheld 12750.00",
+                              "provenance": _prov(
+                                  "Box 2 Federal income tax withheld 12750.00")},
             "employer_ein": {"value": "12-3456789", "confidence": "low",
-                             "raw_text": "EIN 12-3456789"},
+                             "raw_text": "EIN 12-3456789",
+                             "provenance": _prov("EIN 12-3456789")},
         },
         status="transcribed",
     )
@@ -221,19 +236,52 @@ VALIDATE_PAYLOAD = {
 
 # -- highlighting ---------------------------------------------------
 
-def test_highlight_marks_raw_spans():
-    out = highlight_ocr(W2_OCR, {
-        "a": {"raw_text": "Box 1 Wages 85000.00"},
-        "b": {"raw_text": ""},
+def _prov(page, start, end):
+    return {"provenance": {"page": page, "bbox_pdf": None,
+                           "bbox_source": None,
+                           "char_span": {"page": page, "start": start,
+                                         "end": end},
+                           "extractor": "extractors:3"}}
+
+
+def test_highlight_marks_exact_span_per_field():
+    # R15/P4: exactly one span per field, by char offset -- a repeated
+    # amount is tied to the occurrence the value came from, not every
+    # occurrence.
+    text = "Box 1 Wages 85000.00\nBox 5 Medicare wages 85000.00\n"
+    box1 = text.index("85000.00")  # first occurrence only
+    out = highlight_ocr(text, {
+        "1": {"raw_text": "Box 1 Wages 85000.00",
+              **_prov(0, 0, len("Box 1 Wages 85000.00"))},
+        "b": {"raw_text": ""},  # no provenance: never marked
     })
+    assert out.count("<mark>") == 1
     assert "<mark>Box 1 Wages 85000.00</mark>" in out
-    assert "EIN 12-3456789" in out  # unmatched text survives unmarked
+    # the second 85000.00 is NOT marked (mark-every-occurrence is gone)
+    assert out.count("85000.00") == 2
 
 
 def test_highlight_escapes_html():
-    out = highlight_ocr("<b>Box 1</b> Wages 5", {"a": {"raw_text": "Box 1"}})
+    out = highlight_ocr("<b>Box 1</b> Wages 5",
+                        {"a": _prov(0, 3, 8)})
     assert "<b>" not in out and "&lt;b&gt;" in out
     assert "<mark>Box 1</mark>" in out
+
+
+def test_highlight_pages_keeps_page_boundaries():
+    pages = ["page one Box 1", "page two Box 1"]
+    out = highlight_pages(pages, {"a": _prov(1, 9, 14)})
+    assert "<mark>" not in out[0]
+    assert "<mark>Box 1</mark>" in out[1]
+
+
+def test_highlight_overlaps_resolve_longest_first():
+    out = highlight_ocr("Box 1 Wages 85000.00", {
+        "a": _prov(0, 0, 5),    # "Box 1"
+        "b": _prov(0, 0, 20),   # whole line: wins the overlap
+    })
+    assert out.count("<mark>") == 1
+    assert "<mark>Box 1 Wages 85000.00</mark>" in out
 
 
 # -- queue page -----------------------------------------------------

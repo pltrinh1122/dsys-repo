@@ -390,8 +390,9 @@ Account Balance: $500.00
 
 def test_account_transcript_exact_shape():
     r = parse_account_transcript(ACCOUNT_TRANSCRIPT)
-    assert set(r) == {"lines", "line_raw_text", "transactions",
-                      "unparsed_lines"}
+    assert set(r) == {"lines", "line_raw_text", "line_spans",
+                      "line_confidence", "transactions",
+                      "unparsed_lines", "unparsed_spans"}
 
 
 def test_account_transcript_lines_decimal_safe():
@@ -444,7 +445,7 @@ def test_account_transcript_transactions_all_code_families():
     # every transaction carries exactly the contract keys
     for t in r["transactions"]:
         assert set(t) == {"code", "description", "cycle", "date",
-                          "amount"}
+                          "amount", "raw", "span"}
 
 
 def test_account_transcript_unparsed_kept():
@@ -548,12 +549,14 @@ Account Balance: $0.00
 def test_roa_exact_shape():
     r = parse_record_of_account(ROA)
     assert set(r) == {"return_section", "account_section",
-                      "unparsed_lines"}
+                      "unparsed_lines", "unparsed_spans"}
     assert r["unparsed_lines"] == []
 
 
 def test_roa_sections_reuse_parsers():
-    # the sections are parsed by the same functions on the section text
+    # the sections are parsed by the same functions on the section text;
+    # R15: the ROA shifts the sections' char spans into full-document
+    # coordinates, so span-bearing keys are compared shift-aware.
     lines = ROA.splitlines()
     acct_idx = next(i for i, line in enumerate(lines)
                     if line.strip().upper() == "TAX ACCOUNT TRANSCRIPT")
@@ -562,8 +565,29 @@ def test_roa_sections_reuse_parsers():
     return_text = "\n".join(lines[ret_idx:acct_idx])
     account_text = "\n".join(lines[acct_idx:])
     r = parse_record_of_account(ROA)
-    assert r["return_section"] == _parse_return_transcript(return_text)
-    assert r["account_section"] == parse_account_transcript(account_text)
+    for section, standalone, shift in (
+        ("return_section", _parse_return_transcript(return_text),
+         ROA.index(return_text)),
+        ("account_section", parse_account_transcript(account_text),
+         ROA.index(account_text)),
+    ):
+        got, want = r[section], standalone
+        for key in ("lines", "line_raw_text", "line_confidence",
+                    "unparsed_lines"):
+            assert got[key] == want[key], (section, key)
+        assert got.get("tax_year") == want.get("tax_year"), section
+        assert got["line_spans"] == {
+            k: (s + shift, e + shift) for k, (s, e)
+            in want["line_spans"].items()}, section
+        assert got["unparsed_spans"] == [
+            (s + shift, e + shift) for s, e in want["unparsed_spans"]], section
+        assert len(got["transactions"]) == len(want["transactions"])
+        for g, w in zip(got["transactions"], want["transactions"]):
+            assert {k: v for k, v in g.items()
+                    if k not in ("raw", "span")} == \
+                   {k: v for k, v in w.items() if k not in ("raw", "span")}
+            assert g["raw"] == w["raw"]
+            assert g["span"] == (w["span"][0] + shift, w["span"][1] + shift)
 
 
 def test_roa_return_section_content():
@@ -605,7 +629,18 @@ def test_roa_overlap_sanity_against_standalone_return():
     s = _parse_return_transcript(standalone, tax_year=2024)
     assert r["return_section"]["tax_year"] == s["tax_year"] == 2024
     assert r["return_section"]["lines"] == s["lines"]
-    assert r["return_section"]["transactions"] == s["transactions"]
+    # transactions carry shifted R15 spans in the ROA: compare the
+    # contract payload, then check the spans point at the same raw lines
+    got_txns = r["return_section"]["transactions"]
+    want_txns = s["transactions"]
+    assert len(got_txns) == len(want_txns)
+    for g, w in zip(got_txns, want_txns):
+        assert {k: v for k, v in g.items()
+                if k not in ("raw", "span")} == \
+               {k: v for k, v in w.items() if k not in ("raw", "span")}
+        assert g["raw"] == w["raw"]
+        gs, ge = g["span"]
+        assert ROA[gs:ge] == w["raw"]  # span is valid in document coords
 
 
 # ---------------------------------------------------------------------------
@@ -620,10 +655,12 @@ import re as _re
 
 _MONEY_LEAK_RE = _re.compile(r"\$\d")
 
-_ACCOUNT_TOP_KEYS = {"lines", "line_raw_text", "transactions",
-                     "unparsed_lines"}
-_ROA_TOP_KEYS = {"return_section", "account_section", "unparsed_lines"}
-_TXN_KEYS = {"code", "description", "cycle", "date", "amount"}
+_ACCOUNT_TOP_KEYS = {"lines", "line_raw_text", "line_spans",
+                     "line_confidence", "transactions",
+                     "unparsed_lines", "unparsed_spans"}
+_ROA_TOP_KEYS = {"return_section", "account_section", "unparsed_lines",
+                 "unparsed_spans"}
+_TXN_KEYS = {"code", "description", "cycle", "date", "amount", "raw", "span"}
 _RETURN_LINE_VOCAB = {key for _, key in
                       __import__("taxprep.transcript",
                                  fromlist=["_RETURN_LABEL_TABLE"])
@@ -664,7 +701,8 @@ def test_blind_sweep_roa_parser_output():
     assert set(r) == _ROA_TOP_KEYS
     _sweep_section(r["return_section"],
                    _ACCOUNT_TOP_KEYS | {"tax_year"}, _RETURN_LINE_VOCAB,
-                   txn_keys={"code", "description", "date", "amount"},
+                   txn_keys={"code", "description", "date", "amount",
+                             "raw", "span"},
                    decimal_safe_amounts=False)
     _sweep_section(r["account_section"], _ACCOUNT_TOP_KEYS,
                    _ACCOUNT_LINE_VOCAB)

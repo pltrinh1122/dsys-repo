@@ -46,7 +46,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from . import lifecycle
 from . import silver
+from . import console as _console
+from . import evidence as _evidence
 from .models import FORM_TYPES, Document
 from .store import DocumentStore
 
@@ -82,8 +85,28 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .prog{margin:8px 0;font-size:14px}
 .banner{background:#fdecea;border:2px solid #c62828;padding:12px;margin-bottom:12px;font-size:14px}
 .evnote{color:#666;font-size:12px;font-style:italic;margin:0 0 8px}
+/* R19 evidence pane */
+#pageview{max-height:82vh;overflow:auto;background:#333;padding:12px;border:1px solid #999}
+.pagewrap{position:relative;display:inline-block;min-width:100%;margin:0 auto 16px;background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.4)}
+.pageimg{display:block;height:auto}
+.bbox{position:absolute;border:2px solid #ff3d00;background:rgba(255,61,0,.12);cursor:pointer;box-sizing:border-box}
+.bbox:hover{background:rgba(255,61,0,.30)}
+.bbox.sel{border-color:#1565c0;background:rgba(21,101,192,.25);box-shadow:0 0 0 2px #90caf9}
+.pagenav{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
+.pagenav button{font-size:13px;padding:4px 12px}
+.zoomlabel{font-size:13px;color:#555}
+img.snap{max-width:220px;border:1px solid #888;display:block;margin:2px 0}
+.lineage{font-size:12px;background:#e8f0fe;border:1px solid #90caf9;padding:6px;max-width:260px}
+.lineage code{background:#fff;padding:0 4px}
+.noev{font-size:12px;color:#8a1c1c;background:#fdecea;border:1px solid #e0a0a0;padding:6px;max-width:260px}
+.vorig{font-size:12px;margin-top:4px;padding:3px 10px}
+.vok{font-size:12px;color:#2e7d32;margin-top:4px}
+.orignote{font-size:11px;color:#5d4037;font-style:italic}
+.edithist{font-size:11px;color:#5d4037}
+tr.field-row.selrow td{box-shadow:inset 0 0 0 2px #1565c0}
+tr.field-row{cursor:pointer}
+.evcell{min-width:180px}
 """
-
 
 # -- HTML rendering -------------------------------------------------
 
@@ -92,23 +115,85 @@ def _badge(conf: str) -> str:
     return f'<span class="badge {cls}">{html.escape(conf or "?")}</span>'
 
 
-def highlight_ocr(text: str, fields: dict) -> str:
-    """Escape OCR text to HTML and <mark> each field's raw_text span.
+def highlight_page(page_text: str, fields: dict, page_0: int) -> str:
+    """Escape page text to HTML and <mark> each field's char_span.
 
-    Case-insensitive, longest-first, single pass (no nested marks).
+    R15/P4: highlighting is by exact character offset, never by string
+    search -- exactly one span per field, from the field's provenance
+    ``char_span``. Repeated amounts or labels can finally be tied to the
+    occurrence the value came from. Fields without a char_span on this
+    page are not marked. Overlapping spans resolve longest-first; a span
+    overlapping an already-placed one is skipped (no nested marks).
     Degrades to plain escaped text when no spans match.
     """
-    spans = {
-        (f.get("raw_text") or "").strip()
-        for f in fields.values()
-        if isinstance(f, dict)
-    }
-    spans.discard("")
-    if not spans:
-        return html.escape(text)
-    escaped = sorted((html.escape(s) for s in spans), key=len, reverse=True)
-    pattern = re.compile("|".join(re.escape(p) for p in escaped), re.IGNORECASE)
-    return pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", html.escape(text))
+    spans: list[tuple[int, int]] = []
+    for f in fields.values():
+        if not isinstance(f, dict):
+            continue
+        prov = f.get("provenance") or {}
+        cs = prov.get("char_span") or {}
+        if cs.get("page") == page_0:
+            s, e = cs.get("start"), cs.get("end")
+            if (isinstance(s, int) and isinstance(e, int)
+                    and 0 <= s < e <= len(page_text)):
+                spans.append((s, e))
+    # Longest-first placement (deterministic); overlaps skipped.
+    spans.sort(key=lambda se: (-(se[1] - se[0]), se[0]))
+    placed: list[tuple[int, int]] = []
+    for s, e in spans:
+        if all(e <= ps or s >= pe for ps, pe in placed):
+            placed.append((s, e))
+    placed.sort()
+    out: list[str] = []
+    pos = 0
+    for s, e in placed:
+        out.append(html.escape(page_text[pos:s]))
+        out.append(f"<mark>{html.escape(page_text[s:e])}</mark>")
+        pos = e
+    out.append(html.escape(page_text[pos:]))
+    return "".join(out)
+
+
+def highlight_pages(pages: list[str], fields: dict) -> list[str]:
+    """Highlight each page's text by the fields' char_spans (R15/P4)."""
+    return [highlight_page(page, fields, i)
+            for i, page in enumerate(pages)]
+
+
+def highlight_ocr(text: str, fields: dict) -> str:
+    """Highlight a single page of text (page 0) by field char_spans.
+
+    Backward-compatible shim over :func:`highlight_page`; for
+    multi-page documents use :func:`highlight_pages` so page boundaries
+    survive (P4).
+    """
+    return highlight_page(text or "", fields, 0)
+
+
+def _doc_page_texts(store: DocumentStore,
+                    doc: Document) -> list[str] | None:
+    """Per-page stored text for a document, or None when unavailable.
+
+    Authoritative source: the ``bronze_text`` rows for the doc's bronze
+    at its current derivation, in page order (the char_span page indexes
+    address exactly these pages). Falls back to the joined OCR text as a
+    single page.
+    """
+    sha = silver.bronze_hash_for_doc(store, doc)
+    if sha:
+        try:
+            ctx = silver.derivation_for_doc(store, doc.doc_id)
+            rows = store.read_bronze_text(
+                sha, derivation_version=ctx.derivation_version,
+                config_hash=ctx.config_hash)
+            if rows:
+                return [r["text"] for r in rows]
+        except Exception:
+            pass
+    try:
+        return [store.load_ocr(doc.doc_id)]
+    except (FileNotFoundError, OSError):
+        return None
 
 
 def _pdf_page_images(doc: Document) -> tuple[list[str], str | None]:
@@ -131,9 +216,10 @@ def _pdf_page_images(doc: Document) -> tuple[list[str], str | None]:
         return [], "pdf2image not installed (page-image evidence unavailable)"
     page_range = getattr(doc, "page_range", None)
     kwargs: dict = {"dpi": 110}
-    if page_range:
-        kwargs["first_page"] = int(page_range[0])
-        kwargs["last_page"] = int(page_range[1])
+    # page_range arrives as a (first, last) tuple or a "3-5"/"3" string.
+    pair = _evidence.page_range_pair(page_range)
+    if pair is not None:
+        kwargs["first_page"], kwargs["last_page"] = pair
     try:
         images = _convert_from_path(str(pdf_path), **kwargs)
     except Exception as exc:
@@ -191,32 +277,246 @@ def _source_evidence_html(store: DocumentStore, doc: Document) -> tuple[str, boo
             f'<img src="data:image/jpeg;base64,{p}" alt="source page">' for p in images
         )
         return f'<div class="src">{imgs}</div>', False
-    try:
-        text = store.load_ocr(doc.doc_id)
-    except (FileNotFoundError, OSError):
-        text = None
+    # Text evidence is rendered per page (R15/P4): char_spans address
+    # per-page text, so pages are never joined into one blob here.
+    pages = _doc_page_texts(store, doc)
     if ev["mode"] == "text":
-        body = highlight_ocr(text or "", doc.fields)
+        if not pages:
+            banner = ('<div class="banner">⚠ No source evidence is '
+                      "available. Validation is <b>BLOCKED</b>.</div>")
+            return banner + ('<div class="src"><i>No source evidence '
+                             "available.</i></div>"), True
+        body = "".join(
+            f'<div class="srcpage">{p}</div>'
+            for p in highlight_pages(pages, doc.fields))
         note = '<p class="evnote">Text evidence: the source is a text file.</p>'
         return f'<div class="src">{note}{body}</div>', False
     # degraded or unavailable: blocking banner, fail closed
+    if pages is None:
+        text_pages: list[str] = []
+    else:
+        text_pages = highlight_pages(pages, doc.fields)
     banner = (
         '<div class="banner">⚠ Page images unavailable'
         f' ({html.escape(ev["reason"] or "unknown reason")}). '
         + ("Extracted text is shown ONLY as a degraded fallback — it cannot "
-           "verify the extraction. " if text is not None
+           "verify the extraction. " if text_pages
            else "No source evidence is available. ")
         + "Validation is <b>BLOCKED</b> until page images render.</div>"
     )
-    if text is None:
+    if not text_pages:
         return banner + '<div class="src"><i>No source evidence available.</i></div>', True
-    return banner + f'<div class="src">{highlight_ocr(text, doc.fields)}</div>', True
+    body = "".join(f'<div class="srcpage">{p}</div>' for p in text_pages)
+    return banner + f'<div class="src">{body}</div>', True
+
+
+# -- R19/R19a evidence pane --------------------------------------------
+
+_NOEV_TEXT = {
+    _evidence.REASON_NO_GEOMETRY: "no geometry recorded at extraction",
+    _evidence.REASON_MANUAL_ENTRY: "manually added — no source region",
+    _evidence.REASON_NO_LINEAGE: "computed field without lineage",
+    _evidence.REASON_OUT_OF_BOUNDS: "recorded box lies outside the page",
+    _evidence.REASON_SNAPSHOT_FAILED: "snapshot could not be derived",
+    _evidence.REASON_NO_RENDERER: "no PDF renderer available",
+    _evidence.REASON_NO_BRONZE: "no immutable bronze copy linked",
+}
+
+
+def _overlays_for_page(store: DocumentStore, doc: Document,
+                       page_0based: int) -> str:
+    """Bounding-box overlay divs for one page (% coordinates).
+
+    Boxes whose recorded bbox falls outside the page are SKIPPED, never
+    drawn -- a wrong box is worse than no box (fail-closed).
+    """
+    bronze_path = _evidence.bronze_path_for_doc(store, doc)
+    if bronze_path is None:
+        return ""
+    size = _evidence.page_size_pt(bronze_path, page_0based)
+    if size is None:
+        return ""
+    w_pt, h_pt = size
+    w_px = w_pt * _evidence.PAGE_DPI / 72.0
+    h_px = h_pt * _evidence.PAGE_DPI / 72.0
+    divs = []
+    for code, f in _field_rows(doc).items():
+        g = _evidence.field_geometry(f if isinstance(f, dict) else None)
+        if g is None:
+            continue
+        # page_0based is bronze-frame; geometry pages are document-relative.
+        if _evidence.bronze_page_for(doc, g["page"]) != page_0based:
+            continue
+        if _evidence.bbox_within_bounds(g["bbox_pdf"], size) is False:
+            continue
+        x0, y0, x1, y1 = _evidence.pdf_to_px(
+            g["bbox_pdf"], h_pt, _evidence.PAGE_DPI)
+        divs.append(
+            f'<div class="bbox" data-box="{html.escape(code)}" title="{html.escape(code)}" '
+            f'style="left:{x0 / w_px * 100:.3f}%;top:{y0 / h_px * 100:.3f}%;'
+            f'width:{(x1 - x0) / w_px * 100:.3f}%;'
+            f'height:{(y1 - y0) / h_px * 100:.3f}%"></div>')
+    return "".join(divs)
+
+
+def _page_viewer_html(store: DocumentStore, doc: Document,
+                      base: str) -> tuple[str, bool]:
+    """R19 left pane: rendered pages, zoom/pan, bbox overlays.
+
+    Page images are served per-page from the bronze bytes (lazy
+    ``loading="lazy"`` -- a 200-page PDF does not render up front).
+    Returns ``(html, blocked)``; blocked=True degrades to the legacy
+    evidence path (same contract as :func:`_source_evidence_html`).
+    """
+    bronze_path = _evidence.bronze_path_for_doc(store, doc)
+    if bronze_path is None:
+        return "", True
+    n_bronze = _evidence.page_count(bronze_path)
+    if not n_bronze:
+        return "", True
+    # Commit to the viewer only when the first page actually renders;
+    # a render failure here degrades instead of showing a broken pane.
+    offset, count = _evidence.doc_page_window(doc)
+    first_bronze = offset
+    if first_bronze >= n_bronze:
+        return "", True
+    first, err = _evidence.render_page(store, doc, first_bronze)
+    if first is None:
+        return "", True
+    last_bronze = (first_bronze + count - 1) if count else (n_bronze - 1)
+    last_bronze = min(last_bronze, n_bronze - 1)
+    pages = []
+    for p in range(first_bronze, last_bronze + 1):
+        src = (f"{base}/api/evidence/page?doc_id={quote(doc.doc_id)}"
+               f"&page={p}&dpi={_evidence.PAGE_DPI}")
+        pages.append(
+            f'<div class="pagewrap" data-page="{p}">'
+            f'<img class="pageimg" loading="lazy" src="{src}" '
+            f'alt="source page {p + 1}">'
+            f"{_overlays_for_page(store, doc, p)}</div>")
+    n_shown = last_bronze - first_bronze + 1
+    orig = (f"{base}/api/evidence/original?doc_id={quote(doc.doc_id)}")
+    nav = (f'<div class="pagenav">'
+           f'<button id="zoomOut">−</button>'
+           f'<button id="zoomIn">+</button>'
+           f'<button id="zoomReset">reset</button>'
+           f'<span class="zoomlabel" id="zoomLabel">100%</span>'
+           f'<span class="zoomlabel">{n_shown} page(s)</span>'
+           f'<a href="{orig}" target="_blank" rel="noopener">'
+           f'Open original (immutable bronze)</a>'
+           f'</div>')
+    return nav + f'<div id="pageview">{"".join(pages)}</div>', False
+
+
+def _field_evidence_cell(store: DocumentStore, doc: Document, code: str,
+                         f: dict, base: str,
+                         images_mode: bool) -> tuple[str, bool]:
+    """One field row's evidence cell.
+
+    Returns ``(cell_html, confirm_disabled)``. The disabled flag is
+    computed server-side so the fail-closed rule never depends on JS.
+    """
+    ev = _evidence.field_evidence(f)
+    state = ev["state"]
+    snap_url = (f"{base}/api/evidence/snapshot?doc_id={quote(doc.doc_id)}"
+                f"&field={quote(code)}")
+    if state == _evidence.STATE_LINEAGE:
+        lin = ev["lineage"]
+        inputs = " ".join(
+            f'<a href="#row-{html.escape(c)}" class="inplink" '
+            f'data-box="{html.escape(c)}">{html.escape(c)}</a>'
+            for c in lin["inputs"])
+        cell = (f'<div class="lineage"><b>computed</b> — no source region.<br>'
+                f'formula: <code>{html.escape(lin["formula"])}</code>'
+                f'<br>inputs: {inputs}</div>')
+        return cell, False
+    if state in (_evidence.STATE_SNAPSHOT, _evidence.STATE_EDITED):
+        note = ""
+        if state == _evidence.STATE_EDITED:
+            hist = "".join(
+                f'<div class="edithist">edited {html.escape(str(e.get("ts", "")))}: '
+                f'{html.escape(str(e.get("old")))} → '
+                f'{html.escape(str(e.get("new")))} (operator)</div>'
+                for e in ev["history"]
+                if isinstance(e, dict) and e.get("old") is not None)
+            note = (f'<div class="orignote">original evidence — '
+                    f'the image never proves the edited value.</div>{hist}')
+        cell = (f'{note}<img class="snap" loading="lazy" src="{snap_url}" '
+                f'alt="source snapshot for {html.escape(code)}" '
+                f'onerror="this.outerHTML=\'<div class=&quot;noev&quot;>'
+                f'snapshot unavailable</div>\'">')
+        return cell, False
+    # STATE_NO_EVIDENCE -- explicit, never a guess.
+    reason = _NOEV_TEXT.get(ev["reason"], "no visual evidence")
+    verified = _evidence.verify_original_recorded(store, doc.doc_id, code)
+    cell = (f'<div class="noev"><b>no visual evidence</b><br>'
+            f'<span>{html.escape(reason)}</span></div>')
+    if verified:
+        cell += ('<div class="vok">✓ verified against original '
+                 '(logged)</div>')
+        return cell, False
+    cell += (f'<br><button type="button" class="vorig" '
+             f'data-box="{html.escape(code)}">'
+             f'verified against original</button>')
+    # Fail-closed: in images mode the confirm control stays disabled
+    # until evidence exists or the Operator records the verdict. Text
+    # sources keep their standing behavior (the text IS the evidence).
+    return cell, images_mode
+
+
+def evidence_fields_payload(store: DocumentStore, doc: Document) -> dict:
+    """Per-field evidence metadata for the pane (loopback only).
+
+    Deliberately value-free: states, reasons, page/bbox/extractor
+    metadata, overlay geometry, lineage, edit history stamps, and the
+    verified-against-original flag. No field values, no raw_text, and
+    never image bytes -- images travel only as served files.
+    """
+    bronze_path = _evidence.bronze_path_for_doc(store, doc)
+    out: dict = {}
+    for code, f in _field_rows(doc).items():
+        ev = _evidence.field_evidence(f)
+        entry: dict = {"state": ev["state"], "reason": ev["reason"]}
+        g = ev["geometry"]
+        if g is not None:
+            entry["page"] = g["page"]  # document-relative (contract)
+            bronze_page = _evidence.bronze_page_for(doc, g["page"])
+            entry["bronze_page"] = bronze_page
+            entry["bbox_source"] = g["bbox_source"]
+            entry["extractor"] = g["extractor"]
+            if bronze_path is not None:
+                size = _evidence.page_size_pt(bronze_path, bronze_page)
+                if (size is not None
+                        and _evidence.bbox_within_bounds(
+                            g["bbox_pdf"], size) is not False):
+                    x0, y0, x1, y1 = _evidence.pdf_to_px(
+                        g["bbox_pdf"], size[1], _evidence.PAGE_DPI)
+                    w_px = size[0] * _evidence.PAGE_DPI / 72.0
+                    h_px = size[1] * _evidence.PAGE_DPI / 72.0
+                    entry["overlay_pct"] = {
+                        "left": x0 / w_px * 100, "top": y0 / h_px * 100,
+                        "width": (x1 - x0) / w_px * 100,
+                        "height": (y1 - y0) / h_px * 100,
+                    }
+        if ev["lineage"] is not None:
+            entry["lineage"] = ev["lineage"]
+        if ev["history"]:
+            # Stamps only (who/when/that-an-edit-happened); the values
+            # live in the field record the Operator already sees.
+            entry["edits"] = [
+                {"ts": e.get("ts"), "edited": e.get("old") is not None}
+                for e in ev["history"] if isinstance(e, dict)]
+        entry["verified_original"] = _evidence.verify_original_recorded(
+            store, doc.doc_id, code)
+        out[code] = entry
+    return {"doc_id": doc.doc_id, "fields": out}
 
 
 def queue_html(store: DocumentStore, year: int | None, form: str | None,
                token: str | None = None,
                include_irrelevant: bool = False) -> str:
-    docs = [d for d in store.list() if d.status in ("transcribed", "needs_review")]
+    docs = [d for d in store.list()
+            if d.status in lifecycle.UNVALIDATED_EXTRACTED]
     if year is not None:
         docs = [d for d in docs if d.tax_year == year]
     if form:
@@ -255,6 +555,11 @@ def queue_html(store: DocumentStore, year: int | None, form: str | None,
                   if isinstance(f, dict) and f.get("confidence") == "low")
         nfields = sum(1 for c, f in d.fields.items()
                       if isinstance(f, dict) and not c.startswith("__"))
+        # R19: per-doc evidence coverage (geometry presence only --
+        # metadata, no rendering).
+        ngeom = sum(1 for c, f in d.fields.items()
+                    if isinstance(f, dict) and not c.startswith("__")
+                    and _evidence.field_geometry(f) is not None)
         rows.append(
             "<tr>"
             f'<td><a href="{base}/doc/{quote(d.doc_id)}">{html.escape(d.doc_id)}</a></td>'
@@ -264,9 +569,10 @@ def queue_html(store: DocumentStore, year: int | None, form: str | None,
             f"<td>{html.escape(d.relevance)}</td>"
             f"<td>{nfields}</td>"
             f"<td>{low}</td>"
+            f"<td>{ngeom}/{nfields}</td>"
             "</tr>"
         )
-    body = "\n".join(rows) if rows else '<tr><td colspan="7"><i>Queue empty — all validated.</i></td></tr>'
+    body = "\n".join(rows) if rows else '<tr><td colspan="8"><i>Queue empty — all validated.</i></td></tr>'
     hide_note = ""
     if hidden and not include_irrelevant:
         hide_note = (f'<div class="prog">{len(hidden)} irrelevant '
@@ -279,7 +585,7 @@ def queue_html(store: DocumentStore, year: int | None, form: str | None,
 {hide_note}
 <div class="filters">{' '.join(flinks)}</div>
 <table><tr><th>doc_id</th><th>year</th><th>form</th><th>status</th>
-<th>relevance</th><th>fields</th><th>low-conf</th></tr>{body}</table>
+<th>relevance</th><th>fields</th><th>low-conf</th><th>evidence</th></tr>{body}</table>
 </body></html>"""
 
 
@@ -291,8 +597,20 @@ def _fmt_value(v) -> str:
 
 def doc_html(store: DocumentStore, doc: Document,
              token: str | None = None) -> str:
-    evidence, evidence_blocked = _source_evidence_html(store, doc)
     base = _token_url_base(token)
+    # R19: PDF sources get the evidence pane (rendered pages + bbox
+    # overlays + per-field snapshots); everything else keeps the
+    # standing evidence path.
+    images_mode = evidence_status(store, doc)["mode"] == "images"
+    if images_mode:
+        evidence, evidence_blocked = _page_viewer_html(store, doc, base)
+        if evidence_blocked:
+            # Renderer failed despite the status check -- degrade to the
+            # legacy path, which surfaces the blocking banner.
+            evidence, evidence_blocked = _source_evidence_html(store, doc)
+            images_mode = False
+    else:
+        evidence, evidence_blocked = _source_evidence_html(store, doc)
     rows = []
     orig = {}
     for code, f in doc.fields.items():
@@ -304,16 +622,21 @@ def doc_html(store: DocumentStore, doc: Document,
         low = conf == "low"
         checked = "" if low else "checked"
         rowcls = "field-row lowconf" if low else "field-row"
+        evcell, ev_disabled = _field_evidence_cell(
+            store, doc, code, f, base, images_mode)
+        dis = "disabled" if ev_disabled else ""
         rows.append(
-            f'<tr class="{rowcls}" data-box="{html.escape(code)}">'
+            f'<tr class="{rowcls}" data-box="{html.escape(code)}" '
+            f'id="row-{html.escape(code)}">'
             f"<td>{html.escape(code)}</td>"
             f'<td class="valcell"><input class="fval" value="{html.escape(val, quote=True)}"></td>'
             f"<td>{_badge(conf)}</td>"
-            f'<td><input type="checkbox" class="fchk" {checked}></td>'
+            f'<td><input type="checkbox" class="fchk" {checked} {dis}></td>'
+            f'<td class="evcell">{evcell}</td>'
             "</tr>"
         )
     fields_html = "\n".join(rows) if rows else \
-        '<tr><td colspan="4"><i>No extracted fields.</i></td></tr>'
+        '<tr><td colspan="5"><i>No extracted fields.</i></td></tr>'
     orig_json = json.dumps(orig)
     form_opts = "".join(
         f'<option value="{t}"{" selected" if t == doc.form_type else ""}>{t}</option>'
@@ -339,7 +662,7 @@ def doc_html(store: DocumentStore, doc: Document,
 <td><input type="checkbox" id="yearChk"></td></tr>
 </table>
 <h2>Extracted fields</h2>
-<table><tr><th>box</th><th>value (editable)</th><th>confidence</th><th>confirm</th></tr>
+<table><tr><th>box</th><th>value (editable)</th><th>confidence</th><th>confirm</th><th>source evidence</th></tr>
 {fields_html}</table>
 <p><button id="validateBtn" disabled>Mark validated</button>
 <span id="msg"></span></p>
@@ -377,6 +700,70 @@ function refresh() {{
 document.querySelectorAll("input.fval,input.fchk").forEach(el =>
   el.addEventListener("input", refresh));
 refresh();
+// R19: bidirectional selection between field rows and bbox overlays
+function flashRow(row) {{
+  row.classList.add("selrow");
+  setTimeout(() => row.classList.remove("selrow"), 1200);
+}}
+document.querySelectorAll(".bbox").forEach(bx => {{
+  bx.addEventListener("click", () => {{
+    document.querySelectorAll(".bbox.sel").forEach(o => o.classList.remove("sel"));
+    bx.classList.add("sel");
+    const row = document.getElementById("row-" + bx.dataset.box);
+    if (row) {{ row.scrollIntoView({{block: "center"}}); flashRow(row); }}
+  }});
+}});
+document.querySelectorAll("tr.field-row td:first-child").forEach(td => {{
+  td.addEventListener("click", () => {{
+    const box = td.closest("tr").dataset.box;
+    const bx = document.querySelector('.bbox[data-box="' + box + '"]');
+    if (bx) {{
+      document.querySelectorAll(".bbox.sel").forEach(o => o.classList.remove("sel"));
+      bx.classList.add("sel");
+      bx.scrollIntoView({{block: "center"}});
+    }}
+  }});
+}});
+// R19: zoom -- overlays use % coordinates, so they track the image;
+// explicit pixel widths keep the shrink-wrapped page container aligned.
+let zoomPct = 100;
+function setZoom(z) {{
+  zoomPct = Math.min(300, Math.max(50, z));
+  document.querySelectorAll(".pageimg").forEach(im => {{
+    const apply = () => {{
+      im.style.width = Math.round(im.naturalWidth * zoomPct / 100) + "px";
+    }};
+    if (im.complete && im.naturalWidth) apply();
+    else im.addEventListener("load", apply, {{once: true}});
+  }});
+  const lbl = document.getElementById("zoomLabel");
+  if (lbl) lbl.textContent = zoomPct + "%";
+}}
+if (document.getElementById("zoomIn")) {{
+  document.getElementById("zoomIn").addEventListener("click", () => setZoom(zoomPct + 25));
+  document.getElementById("zoomOut").addEventListener("click", () => setZoom(zoomPct - 25));
+  document.getElementById("zoomReset").addEventListener("click", () => setZoom(100));
+}}
+// R19: "verified against original" -- the fail-closed escape hatch for
+// fields with no visual evidence (logged to the decision log).
+document.querySelectorAll("button.vorig").forEach(btn => {{
+  btn.addEventListener("click", async () => {{
+    const box = btn.dataset.box;
+    const r = await fetch("{base}/api/evidence/verify-original", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{doc_id: docId, field: box}})
+    }});
+    if (r.ok) {{
+      const row = document.getElementById("row-" + box);
+      row.querySelector("input.fchk").disabled = false;
+      btn.outerHTML = '<div class="vok">✓ verified against original (logged)</div>';
+      refresh();
+    }} else {{
+      btn.textContent = "recording failed — retry";
+    }}
+  }});
+}});
 document.getElementById("validateBtn").addEventListener("click", async () => {{
   const fields = {{}};
   const confirmed = [];
@@ -466,13 +853,22 @@ def _coerce_year(value) -> int | None:
 
 
 def _record_identity_edit(doc: Document, key: str, old, new, ts: str) -> None:
-    """Audit a form_type/tax_year correction, retaining the original value."""
+    """Audit a form_type/tax_year correction, retaining the original value.
+
+    R15/P5: the first edit records ``original_value``/``edited_by``/
+    ``edited_at``; later edits append to ``history`` but never overwrite
+    the original. The corrected value stays traceable to its original.
+    """
     entry = doc.fields.get(key)
     if not isinstance(entry, dict):
         entry = {"value": old, "confidence": "human-corrected",
                  "raw_text": "", "history": []}
         doc.fields[key] = entry
     entry.setdefault("history", []).append({"ts": ts, "old": old, "new": new})
+    if "original_value" not in entry:
+        entry["original_value"] = old
+        entry["edited_by"] = "operator"
+        entry["edited_at"] = ts
     entry["value"] = new
 
 
@@ -492,7 +888,12 @@ def apply_validation(store: DocumentStore, doc_id: str,
     ``fields`` may introduce box keys not already present — they are created
     with the corrected value and ``human-corrected`` confidence. Every
     Operator edit appends to the field's ``history`` ([{ts, old, new}, ...]);
-    history is never overwritten.
+    history is never overwritten. R15/P5: the first edit of a field
+    additionally records ``original_value``/``edited_by``/``edited_at`` --
+    the original extracted value survives every later edit, and the
+    corrected value stays traceable to its original evidence
+    (raw_text/provenance are extraction evidence and are never touched
+    by edits).
     """
     doc = store.get(doc_id)
     if doc is None:
@@ -545,54 +946,122 @@ def apply_validation(store: DocumentStore, doc_id: str,
     if not confirmed_boxes and not edited:
         reasons.append("nothing_confirmed")
 
+    # --- R19: per-field evidence gate (images mode only) ---
+    # A confirmed field must have visual evidence (a snapshot, lineage
+    # for computed fields, or original evidence for an edited field) or
+    # an Operator "verified against original" record in the decision
+    # log. Text-mode documents keep their standing behavior: the source
+    # text IS the evidence.
+    if ev["mode"] == "images":
+        for box in sorted(confirmed_boxes):
+            f = rows.get(box)
+            st = _evidence.field_evidence(
+                f if isinstance(f, dict) else {})
+            if st["state"] in (_evidence.STATE_SNAPSHOT,
+                               _evidence.STATE_LINEAGE,
+                               _evidence.STATE_EDITED):
+                continue
+            if _evidence.verify_original_recorded(store, doc_id, box):
+                continue
+            reasons.append("no_evidence_unverified")
+            break
+
     if reasons:
         raise ValidationRefused(doc_id, reasons)
 
     # --- apply: all gates passed ---
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # R13: the validate/fix_form_year events go through the lifecycle
+    # state machine (actor=operator -- this localhost UI is an Operator
+    # surface). The machine re-checks the identity/field guards as a
+    # backstop; a refusal raises ValidationRefused and flips nothing.
+    form_attested = confirm_form_type or form_changed
+    year_attested = confirm_tax_year or year_changed
+    validate_input = lifecycle.ValidateInput(
+        n_fields=len(rows) + len(new_boxes),
+        form_known=new_form != "UNKNOWN",
+        year_known=new_year is not None,
+        form_confirmed_or_corrected=form_attested,
+        year_confirmed_or_corrected=year_attested,
+        field_confirmed_or_edited=bool(confirmed_boxes) or edited)
+    old_form, old_year = doc.form_type, doc.tax_year
     edit_records: list[tuple[str, object, object]] = []
-    for box in new_boxes:
-        new_val = _coerce(str(fields[box]))
-        if box in rows:
-            f = rows[box]
-            old = f.get("value")
-            if old != new_val:
-                f.setdefault("history", []).append(
-                    {"ts": ts, "old": old, "new": new_val})
-                f["value"] = new_val
-                edit_records.append((box, old, new_val))
-        else:
-            doc.fields[box] = {
-                "value": new_val,
-                "confidence": "human-corrected",
-                "raw_text": "",
-                "history": [{"ts": ts, "old": None, "new": new_val}],
-            }
-            edit_records.append((box, None, new_val))
-    if form_changed:
-        old_form = doc.form_type
-        _record_identity_edit(doc, _FORM_TYPE_KEY, old_form, new_form, ts)
-        doc.form_type = new_form
-        edit_records.append((_FORM_TYPE_KEY, old_form, new_form))
-    if year_changed:
-        old_year = doc.tax_year
-        _record_identity_edit(doc, _TAX_YEAR_KEY, old_year, new_year, ts)
-        doc.tax_year = new_year
-        edit_records.append((_TAX_YEAR_KEY, old_year, new_year))
-    doc.status = "validated"
-    doc.validated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    validated_fields = sorted(
-        set(confirmed_boxes)
-        | {box for box, _, _ in edit_records
-           if not box.startswith(silver.BOOKKEEPING_PREFIX)})
-    bronze_hash = silver.bronze_hash_for_doc(store, doc)
-    page = silver.best_page_for_doc(doc)
-    # Contract section 5: fields_json + artifact mirror + decision log
-    # are updated together, in one transaction. The derivation stamp is
-    # preserved (upsert_silver_doc, never the facade "1" path) whenever
-    # the bronze linkage resolves; tombstone docs without artifacts fall
-    # back to the facade upsert, whose bronze handling re-attaches them.
     with store.txn():
+        if doc.status == lifecycle.BLOCKED:
+            # R13: a BLOCKED doc re-enters via fix_form_year (operator
+            # supplies the missing identity) before validate.
+            fix = lifecycle.transition(
+                doc, lifecycle.FIX_FORM_YEAR, actor=lifecycle.OPERATOR,
+                event_input=lifecycle.FixInput(form_type=new_form,
+                                              tax_year=new_year),
+                store=store)
+            if not fix.ok:
+                raise ValidationRefused(
+                    doc_id, [fix.reason_code or "fix_refused"])
+            # The transition applied the identity fix; audit it once
+            # here so the field-edit section below does not duplicate it.
+            if form_changed:
+                _record_identity_edit(doc, _FORM_TYPE_KEY, old_form,
+                                      new_form, ts)
+                edit_records.append((_FORM_TYPE_KEY, old_form, new_form))
+                form_changed = False
+            if year_changed:
+                _record_identity_edit(doc, _TAX_YEAR_KEY, old_year,
+                                      new_year, ts)
+                edit_records.append((_TAX_YEAR_KEY, old_year, new_year))
+                year_changed = False
+        for box in new_boxes:
+            new_val = _coerce(str(fields[box]))
+            if box in rows:
+                f = rows[box]
+                old = f.get("value")
+                if old != new_val:
+                    f.setdefault("history", []).append(
+                        {"ts": ts, "old": old, "new": new_val})
+                    # R15/P5: the original extracted value survives every
+                    # edit (recorded once, on the first edit).
+                    if "original_value" not in f:
+                        f["original_value"] = old
+                        f["edited_by"] = "operator"
+                        f["edited_at"] = ts
+                    f["value"] = new_val
+                    edit_records.append((box, old, new_val))
+            else:
+                doc.fields[box] = {
+                    "value": new_val,
+                    "confidence": "human-corrected",
+                    "raw_text": "",
+                    "history": [{"ts": ts, "old": None, "new": new_val}],
+                }
+                edit_records.append((box, None, new_val))
+        if form_changed:
+            _record_identity_edit(doc, _FORM_TYPE_KEY, old_form, new_form,
+                                  ts)
+            doc.form_type = new_form
+            edit_records.append((_FORM_TYPE_KEY, old_form, new_form))
+        if year_changed:
+            _record_identity_edit(doc, _TAX_YEAR_KEY, old_year, new_year,
+                                  ts)
+            doc.tax_year = new_year
+            edit_records.append((_TAX_YEAR_KEY, old_year, new_year))
+        done = lifecycle.transition(
+            doc, lifecycle.VALIDATE, actor=lifecycle.OPERATOR,
+            event_input=validate_input, store=store, now=ts)
+        if not done.ok:
+            raise ValidationRefused(
+                doc_id, [done.reason_code or "validate_refused"])
+        validated_fields = sorted(
+            set(confirmed_boxes)
+            | {box for box, _, _ in edit_records
+               if not box.startswith(silver.BOOKKEEPING_PREFIX)})
+        bronze_hash = silver.bronze_hash_for_doc(store, doc)
+        page = silver.best_page_for_doc(doc)
+        # Contract section 5: fields_json + artifact mirror + decision
+        # log are updated together, in one transaction. The derivation
+        # stamp is preserved (upsert_silver_doc, never the facade "1"
+        # path) whenever the bronze linkage resolves; tombstone docs
+        # without artifacts fall back to the facade upsert, whose bronze
+        # handling re-attaches them.
         if bronze_hash is None:
             store.upsert(doc)
             bronze_hash = silver.bronze_hash_for_doc(store, doc)
@@ -817,14 +1286,107 @@ class _Handler(BaseHTTPRequestHandler):
                 self._html(404, "<h1>404 — no such document</h1>")
             else:
                 self._html(200, doc_html(self.store, doc, self.token))
+        elif parsed.path.startswith("/api/evidence/"):
+            # R19 evidence endpoints -- the R10 gates above (Host
+            # allowlist, per-run token prefix) already ran.
+            self._serve_evidence(parsed)
+        elif parsed.path == "/console" or parsed.path.startswith("/console/"):
+            # R12 Operator console. The R10 gates above (Host allowlist,
+            # per-run token prefix) already ran -- every console GET
+            # inherits them.
+            page = _console.dispatch_get(self.store, parsed, self.token)
+            if page is None:
+                self._html(404, "<h1>404</h1>")
+            else:
+                self._html(200, page)
         else:
             self._html(404, "<h1>404</h1>")
+
+    def _send_file(self, path: Path, ctype: str) -> None:
+        """Serve a file from disk (evidence images, bronze originals)."""
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        # Deterministic content (content-addressed cache) -- private,
+        # never shared caches: this is PII on a loopback server.
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_evidence(self, parsed) -> None:
+        """R19 evidence endpoints (loopback only, R10-hardened).
+
+        GET /api/evidence/page?doc_id=&page=&dpi=  -> image/jpeg
+        GET /api/evidence/snapshot?doc_id=&field=  -> image/jpeg
+        GET /api/evidence/fields?doc_id=            -> application/json
+        GET /api/evidence/original?doc_id=          -> bronze bytes
+
+        Images are PII: served ONLY here, never from MCP tools, never
+        on the bus. Every failure is fail-closed (JSON error, never a
+        placeholder or guessed image).
+        """
+        qs = parse_qs(parsed.query)
+        doc_id = qs.get("doc_id", [""])[0]
+        doc = self.store.get(doc_id)
+        if doc is None:
+            self._json(404, {"ok": False, "error": "no such document"})
+            return
+        sub = parsed.path[len("/api/evidence/"):]
+        if sub == "page":
+            try:
+                page = int(qs.get("page", ["0"])[0])
+                dpi = int(qs.get("dpi", [str(_evidence.PAGE_DPI)])[0])
+            except (ValueError, TypeError):
+                self._json(400, {"ok": False, "error": "bad page/dpi"})
+                return
+            if page < 0 or dpi not in (72, 110, 150, 220, 300):
+                self._json(400, {"ok": False, "error": "bad page/dpi"})
+                return
+            path, err = _evidence.render_page(self.store, doc, page, dpi=dpi)
+            if path is None:
+                self._json(503, {"ok": False,
+                                 "error": err or "render_failed"})
+                return
+            self._send_file(path, "image/jpeg")
+        elif sub == "snapshot":
+            field = qs.get("field", [""])[0]
+            path, err = _evidence.field_snapshot(self.store, doc, field)
+            if path is None:
+                self._json(404, {"ok": False,
+                                 "error": err or "no_evidence"})
+                return
+            self._send_file(path, "image/jpeg")
+        elif sub == "fields":
+            self._json(200, evidence_fields_payload(self.store, doc))
+        elif sub == "original":
+            bronze_path = _evidence.bronze_path_for_doc(self.store, doc)
+            if bronze_path is None:
+                self._json(404, {"ok": False, "error": "no bronze copy"})
+                return
+            # Bronze objects are stored extensionless -- sniff, don't guess.
+            ctype, suffix = _evidence.bronze_mime(bronze_path)
+            data = bronze_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "private, max-age=86400")
+            self.send_header(
+                "Content-Disposition",
+                f'inline; filename="{doc.doc_id}{suffix}"')
+            self.end_headers()
+            self.wfile.write(data)
+        else:
+            self._json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:
         if not self._check_host():
             return
         eff = self._effective_path()
-        if eff is None or urlparse(eff).path != "/api/validate":
+        path = urlparse(eff).path if eff is not None else None
+        if eff is None or (path != "/api/validate"
+                           and path != "/api/evidence/verify-original"
+                           and not path.startswith("/console/api/")):
             self._json(404, {"ok": False, "error": "not found"})
             return
         if not self._check_json_content():
@@ -836,6 +1398,29 @@ class _Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length) or b"{}")
         except (ValueError, json.JSONDecodeError):
             self._json(400, {"ok": False, "error": "invalid JSON"})
+            return
+        if path.startswith("/console/api/"):
+            # R12 console API -- same R10 gates as /api/validate.
+            status, obj = _console.dispatch_post(self.store, path, payload)
+            self._json(status, obj)
+            return
+        if path == "/api/evidence/verify-original":
+            # R19 fail-closed escape hatch: the Operator records
+            # "verified against original" for a field with no visual
+            # evidence. Logged to the append-only decision log.
+            doc_id = payload.get("doc_id", "")
+            field = payload.get("field", "")
+            doc = self.store.get(doc_id)
+            if doc is None or not isinstance(field, str) or not field:
+                self._json(404, {"ok": False, "error": "not found"})
+                return
+            try:
+                seq = _evidence.record_verify_original(
+                    self.store, doc_id, field)
+            except ValueError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+                return
+            self._json(200, {"ok": True, "seq": seq})
             return
         doc_id = payload.get("doc_id", "")
         form_type = payload.get("form_type")

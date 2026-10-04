@@ -478,7 +478,10 @@ _ZERO_YIELD_MIN_CHARS = 200
 _PARSE_COVERAGE_MIN = 0.8
 _EXPECTED_COVERAGE_MIN = 0.75
 
-_EXTRACTABLE_STATUSES = ("transcribed", "validated", "needs_review")
+_EXTRACTABLE_STATUSES = ("transcribed", "validated", "needs_review",
+                         # R13: error-route docs keep the extractability
+                         # they had as needs_review.
+                         "errored")
 
 _TRANSCRIPT_FORMS = {"WAGE_INCOME_TRANSCRIPT", "RETURN_TRANSCRIPT",
                      "ACCOUNT_TRANSCRIPT", "RECORD_OF_ACCOUNT"}
@@ -518,6 +521,116 @@ _HINT_NGRAMS = {
     ("record", "of", "account"): "RECORD_OF_ACCOUNT",
     ("schedule", "d"): "SCHEDULE_D",
 }
+
+
+# -- Source-evidence blind check (R19/R19a) -------------------------------
+
+_PAYER_CODE_RE = re.compile(r"^payer\d+$")
+
+
+def _scrub_evidence_code(code: str) -> str:
+    """Redact payer names embedded in transcript field codes.
+
+    Mirrors mcp_server._scrub_code (kept local: verify.py must not import
+    the MCP layer). Blind-safe output never carries taxpayer names.
+    """
+    parts = str(code).split(".")
+    if len(parts) >= 3 and _PAYER_CODE_RE.fullmatch(parts[0]):
+        return f"{parts[0]}.[payer].{parts[-1]}"
+    return str(code)
+
+
+def verify_evidence(store, year: int) -> dict:
+    """R19/R19a: per-doc source-evidence coverage as blind metadata.
+
+    Counts, per document: extracted fields without a derivable snapshot
+    (no/invalid geometry, or a recorded box outside the page bounds),
+    computed fields without lineage, and boxes outside page bounds.
+    Page bounds come from the bronze PDF's vector page size -- no
+    rendering, no PII, and no renderer required.
+
+    Arming rule (mirrors the R17 precedent): the check reports
+    ``applicable=False`` and stays green until at least one field in the
+    year carries recorded geometry -- per-field geometry is the sibling
+    R15-P4 contract and has not landed yet, so a field without geometry
+    cannot have a snapshot and must not fail the suite for it. Once
+    geometry exists anywhere in the year, every extracted field without
+    a snapshot and every computed field without lineage fails.
+
+    Blind-safe: doc_ids, scrubbed box codes, counts, booleans -- never
+    values, raw_text, or image data.
+    """
+    from . import evidence as _evidence
+
+    docs = [d for d in store.list(year=year)]
+    per_doc: dict[str, dict] = {}
+    n_without_snapshot = 0
+    n_without_lineage = 0
+    n_out_of_bounds = 0
+    n_bounds_unknown = 0
+    out_of_bounds: list[dict] = []
+    any_geometry = False
+
+    for d in docs:
+        fields = {c: f for c, f in (d.fields or {}).items()
+                  if isinstance(f, dict) and not c.startswith("__")}
+        if not fields:
+            continue
+        bronze_path = _evidence.bronze_path_for_doc(store, d)
+        stat = {"n_fields": len(fields), "n_with_geometry": 0,
+                "n_without_snapshot": 0, "n_computed_without_lineage": 0,
+                "n_out_of_bounds": 0, "n_bounds_unknown": 0}
+        for code, f in fields.items():
+            ev = _evidence.field_evidence(f)
+            g = ev["geometry"]
+            if g is not None:
+                any_geometry = True
+                stat["n_with_geometry"] += 1
+            if _evidence.is_computed(f):
+                if ev["state"] == _evidence.STATE_NO_EVIDENCE:
+                    stat["n_computed_without_lineage"] += 1
+                    n_without_lineage += 1
+                continue
+            if g is None:
+                stat["n_without_snapshot"] += 1
+                n_without_snapshot += 1
+                continue
+            if bronze_path is None:
+                stat["n_bounds_unknown"] += 1
+                n_bounds_unknown += 1
+                continue
+            size = _evidence.page_size_pt(
+                bronze_path, _evidence.bronze_page_for(d, g["page"]))
+            verdict = _evidence.bbox_within_bounds(g["bbox_pdf"], size)
+            if verdict is None:
+                stat["n_bounds_unknown"] += 1
+                n_bounds_unknown += 1
+            elif verdict is False:
+                stat["n_out_of_bounds"] += 1
+                n_out_of_bounds += 1
+                stat["n_without_snapshot"] += 1
+                n_without_snapshot += 1
+                out_of_bounds.append(
+                    {"doc_id": d.doc_id,
+                     "field": _scrub_evidence_code(code)})
+        per_doc[d.doc_id] = stat
+
+    applicable = any_geometry
+    passed = (not applicable
+              or (n_without_snapshot == 0 and n_without_lineage == 0
+                  and n_out_of_bounds == 0))
+    return {
+        "passed": passed,
+        "applicable": applicable,
+        "reason": None if applicable else "no_recorded_geometry",
+        "n_docs": len(per_doc),
+        "n_extracted_fields_without_snapshot": n_without_snapshot,
+        "n_computed_fields_without_lineage": n_without_lineage,
+        "n_bbox_out_of_bounds": n_out_of_bounds,
+        "n_bbox_bounds_unknown": n_bounds_unknown,
+        "out_of_bounds": out_of_bounds,
+        "docs": per_doc,
+    }
 
 
 def verify_zero_yield(store, year: int) -> dict:
@@ -809,6 +922,8 @@ def verify_extraction_yield(store, year: int) -> dict:
         "expected_coverage": verify_expected_coverage(store, year),
         "type_hint_mismatch": verify_type_hint_mismatch(store, year),
         "cross_doc": verify_cross_doc(store, year),
+        # R19/R19a: source-evidence coverage (blind metadata only).
+        "evidence": verify_evidence(store, year),
     }
     return {
         "passed": all(c["passed"] for c in checks.values()),
@@ -968,13 +1083,77 @@ def verify_no_silent_drops(store) -> dict:
     }
 
 
+def verify_source_integrity(store) -> dict:
+    """R15/P2: every bronze object's recorded source still identifies it.
+
+    For each bronze object with recorded alias paths (the ingest-time
+    absolute paths): each alias must exist on disk AND its bytes must
+    still hash to the bronze hash. A rename/move surfaces as
+    "source_missing"; different bytes at the same path surface as
+    "hash_mismatch" (P2's byte-swap probe). Output is doc_ids and reason
+    codes only -- never paths (blind-orchestrator safe; local paths can
+    leak usernames).
+
+    Bronze objects with no aliases (tombstone/legacy rows) are reported
+    in n_unchecked -- they cannot be integrity-checked, never silently
+    passed.
+    """
+    failed: list[dict] = []
+    unchecked = 0
+    n_aliases = 0
+    for sha in store.bronze_hashes():
+        bronze = store.get_bronze(sha)
+        aliases = (bronze or {}).get("aliases") or []
+        doc_ids = sorted(
+            d.doc_id for d in store.list()
+            if getattr(d, "source_sha256", None) == sha)
+        if not aliases or (bronze or {}).get("blocked_reason"):
+            # Tombstone/legacy rows never captured source bytes: they
+            # cannot be integrity-checked, never silently passed.
+            unchecked += 1
+            continue
+        for alias in aliases:
+            n_aliases += 1
+            reason = _check_source_alias(sha, alias)
+            if reason is not None:
+                failed.append({"doc_ids": doc_ids,
+                               "reason_code": reason})
+                break  # one entry per bronze object
+    return {
+        "passed": not failed,
+        "n_bronze": len(store.bronze_hashes()),
+        "n_aliases": n_aliases,
+        "n_unchecked": unchecked,
+        "failed": failed,
+    }
+
+
+def _check_source_alias(sha: str, alias: str) -> str | None:
+    """None when the alias path still identifies the bronze bytes, else a
+    stable reason code ("source_missing" | "hash_mismatch")."""
+    import hashlib
+
+    path = Path(alias)
+    try:
+        if not path.is_file():
+            return "source_missing"
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return "source_missing"
+    return None if h.hexdigest() == sha else "hash_mismatch"
+
+
 def verify_all(store, year: int | None = None) -> dict:
     """Run every check. With year=None, per-year checks run for each year
-    present in the store (keyed "name:year"); completeness and
-    no_silent_drops are global."""
+    present in the store (keyed "name:year"); completeness,
+    no_silent_drops, and source_integrity are global."""
     checks: dict[str, dict] = {
         "completeness": verify_completeness(store),
         "no_silent_drops": verify_no_silent_drops(store),
+        "source_integrity": verify_source_integrity(store),
     }
     if year is not None:
         years = [year]

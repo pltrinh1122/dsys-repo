@@ -84,6 +84,9 @@ UNRESOLVED_CONFLICT = "unresolved_conflict"
 BLOCKED_DOCUMENT = "blocked_document"
 EXCLUDED_LOT = "excluded_lot"
 INCOMPLETE_LOT = "incomplete_lot"
+# R13 (Arc C, W1): an in-scope doc whose lifecycle state is neither
+# validated nor excluded.
+LIFECYCLE_NOT_READY = "lifecycle_not_ready"
 
 GOLD_REASON_CODES = (
     UNRESOLVED_DUPLICATE,
@@ -92,7 +95,16 @@ GOLD_REASON_CODES = (
     BLOCKED_DOCUMENT,
     EXCLUDED_LOT,
     INCOMPLETE_LOT,
+    LIFECYCLE_NOT_READY,
 )
+
+# R13: lifecycle states that let gold run. Everything else --
+# discovered, selected, unselected, transcribed, needs_review,
+# validated-by-nobody, BLOCKED, errored, rereview, ORPHANED,
+# MULTI_FORM -- refuses with lifecycle_not_ready. Relevance is
+# orthogonal and never exempts: an irrelevant doc still needs
+# validated or excluded.
+_GOLD_READY_STATES = frozenset({"validated", "excluded"})
 
 # carryforward_blockers reason codes that are lot-integrity (G2) failures.
 _G2_LOT_CODES = frozenset({"zero_lots", "lot_term_unknown",
@@ -403,6 +415,62 @@ def _blocked_doc_blockers(conn: Any, year: int) -> list[dict[str, Any]]:
     return blockers
 
 
+def _lifecycle_gate_blockers(store: Any, year: int,
+                             medallion: bool) -> list[dict[str, Any]]:
+    """R13: gold runs only when every in-scope doc is validated/excluded.
+
+    In-scope: docs with tax_year == year, plus tax_year NULL
+    (fail-closed, mirroring the G2 year scoping). Exempt: docs ruled
+    out by disposed duplicate/supersedes rulings, and docs the Operator
+    excluded (lifecycle status "excluded", the exclusions file, or a
+    medallion doc-level exclude decision). Relevance never exempts.
+    Metadata only -- doc ids, statuses, counts.
+    """
+    from . import exclusions as _excl
+
+    conn = _connection(store) if medallion else None
+    ruled_out: set[str] = set()
+    excluded: set[str] = set()
+    rows: list[tuple[str, Any, str]] = []  # (doc_id, tax_year, status)
+    if medallion and conn is not None:
+        ruled_out = _ruled_out_doc_ids(conn)
+        for doc_id, tax_year, status in conn.execute(
+                "SELECT doc_id, tax_year, status FROM silver_doc "
+                "ORDER BY doc_id"):
+            rows.append((doc_id, tax_year, status))
+    else:
+        try:
+            for d in store.list():
+                rows.append((d.doc_id, getattr(d, "tax_year", None),
+                             getattr(d, "status", None)))
+        except Exception:
+            return []
+    data_dir = getattr(store, "data_dir", None)
+    if data_dir is not None:
+        try:
+            excluded = {e["doc_id"]
+                        for e in _excl.list_exclusions(data_dir)}
+        except Exception:
+            excluded = set()
+    excluded |= carryforward._medallion_doc_exclusions(store)
+    blockers: list[dict[str, Any]] = []
+    for doc_id, tax_year, status in rows:
+        if tax_year is not None and tax_year != year:
+            continue  # another year's doc: out of scope for this gate
+        if doc_id in ruled_out or doc_id in excluded:
+            continue
+        if status in _GOLD_READY_STATES:
+            continue
+        blockers.append({
+            "code": LIFECYCLE_NOT_READY,
+            "doc_id": doc_id,
+            "status": status,
+            "detail": f"lifecycle state {status!r} is not "
+                      f"validated/excluded for {year}",
+        })
+    return blockers
+
+
 def _g2_blockers(store: Any, year: int, medallion: bool) -> list[dict[str, Any]]:
     """Wire carryforward.carryforward_blockers through the gold vocabulary.
 
@@ -521,6 +589,7 @@ def gate_check(store: Any, year: int) -> list[dict[str, Any]]:
         blockers.extend(_dup_group_blockers(conn, year))
         blockers.extend(_conflict_blockers(conn, year))
         blockers.extend(_blocked_doc_blockers(conn, year))
+    blockers.extend(_lifecycle_gate_blockers(store, year, medallion))
     blockers.extend(_g2_blockers(store, year, medallion))
     # Dedupe on (code, primary id); deterministic order.
     seen: set[tuple] = set()

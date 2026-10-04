@@ -206,8 +206,9 @@ def validation_queue(tax_year: int | None = None, form_type: str | None = None,
     ``relevance_override`` tool). Includes per-year validated/total
     progress. Nothing downstream may consume unvalidated documents."""
     store = _store(data_dir)
+    from . import lifecycle as _lifecycle
     queue = [d for d in store.list(year=tax_year, form=form_type)
-             if d.status in ("transcribed", "needs_review")]
+             if d.status in _lifecycle.UNVALIDATED_EXTRACTED]
     excluded = sum(1 for d in queue if d.relevance == "irrelevant")
     if not include_irrelevant:
         queue = [d for d in queue if d.relevance != "irrelevant"]

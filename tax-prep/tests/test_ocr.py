@@ -525,8 +525,10 @@ def test_escalation_return_shape(tmp_path, fixtures, monkeypatch):
 def test_ocr_pdf_return_shape_with_fake_engine(tmp_path, fixtures, monkeypatch):
     _fake_engine(monkeypatch, "abc\n")
     res = ocr.ocr_pdf(fixtures["image_only"], "skip-text", tmp_path / "w")
+    # R15: the tesseract fallback also returns TSV-parsed "words"
+    # ([{text, bbox, conf, page}]) for field-geometry resolution
     assert set(res) == {"ok", "text", "mean_confidence", "attempts",
-                        "reason_code", "engine", "engine_version"}
+                        "reason_code", "engine", "engine_version", "words"}
 
 
 # ---------------------------------------------------------------------------

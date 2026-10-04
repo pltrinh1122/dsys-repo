@@ -37,6 +37,23 @@ output is kept verbatim in ``unparsed_lines``. Nothing is silently dropped.
 
 import re
 
+# R15: transcript parsing carries field provenance. The parsers record,
+# for every parsed key, the verbatim source line's character span in the
+# input text (``line_spans`` / box ``span``), so downstream field
+# builders carry real evidence instead of synthesized raw_text. Bump on
+# ANY parser-logic change (feeds the R15 extractor id "transcript:<n>").
+TRANSCRIPT_VERSION = "1"
+
+
+def _line_offsets(text: str) -> list[int]:
+    """Start offset of each line in ``text`` (splitlines order)."""
+    offsets: list[int] = []
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        offsets.append(pos)
+        pos += len(line)
+    return offsets
+
 # Structural lines: the transcript title / standalone tax-year declaration.
 # These are represented by form_type / tax_year, so they are consumed rather
 # than reported as unparsed.
@@ -379,13 +396,23 @@ def parse_return_transcript(text: str, tax_year: int | None = None) -> dict:
 
     lines: dict = {}
     line_raw_text: dict = {}  # key -> verbatim source line it was parsed from
+    line_spans: dict = {}     # R15: key -> (start, end) char span of that
+                              #   verbatim line in the input text
+    line_confidence: dict = {}  # R15: key -> "high" (exact label match) |
+                                #   "medium" (longest-prefix match). Derived
+                                #   from the match, never hardcoded.
     transactions: list = []
     unparsed_lines: list = []
+    unparsed_spans: list = []  # R15: parallel to unparsed_lines; the span
+                               #   of the verbatim raw line (the
+                               #   "AMBIGUOUS: "/"DUPLICATE " prefixes are
+                               #   display-only, never part of the span)
     # Track (line, offset) pairs that were consumed by transaction parsing so
     # they are not also treated as summary lines.
     consumed_as_transaction: set = set()
 
     raw_lines = text.splitlines()
+    offsets = _line_offsets(text)
 
     # First pass: transactions (3-digit code led lines).
     for idx, raw in enumerate(raw_lines):
@@ -411,6 +438,10 @@ def parse_return_transcript(text: str, tax_year: int | None = None) -> dict:
             "date": date,
             "amount": amount,
             "description": description,
+            # R15: verbatim evidence -- the full raw line, never the
+            # code/date/amount-stripped description.
+            "raw": raw,
+            "span": (offsets[idx], offsets[idx] + len(raw)),
         })
         consumed_as_transaction.add(idx)
 
@@ -427,34 +458,48 @@ def parse_return_transcript(text: str, tax_year: int | None = None) -> dict:
             continue
         candidate = _label_candidate(norm)
         key, label, ambiguous = _match_return_label(candidate)
+        span = (offsets[idx], offsets[idx] + len(raw))
         if ambiguous:
             # Matches several table entries: every candidate field stays
             # unset; the line is visible and flaggable, never a quiet
             # wrong value.
             unparsed_lines.append("AMBIGUOUS: " + raw)
+            unparsed_spans.append(span)
             continue
         if key is None:
             unparsed_lines.append(raw)
+            unparsed_spans.append(span)
             continue
         value = _summary_value(raw, key, label)
         if value is None:
             # Label recognized but no usable value: visible, not mapped.
             unparsed_lines.append(raw)
+            unparsed_spans.append(span)
             continue
         if key in lines:
             # Deterministic keep-first; the repeat stays visible rather
             # than being silently dropped.
             unparsed_lines.append(f"DUPLICATE {key}: " + raw)
+            unparsed_spans.append(span)
             continue
         lines[key] = value
         line_raw_text[key] = raw
+        line_spans[key] = span
+        # Derived confidence: exact label match -> high, longest-prefix
+        # match -> medium. (candidate == label) is exactly the
+        # exact-match case -- _match_label only returns a prefix hit
+        # when the next char is a separator.
+        line_confidence[key] = "high" if candidate == label else "medium"
 
     return {
         "tax_year": tax_year,
         "lines": lines,
         "line_raw_text": line_raw_text,
+        "line_spans": line_spans,
+        "line_confidence": line_confidence,
         "transactions": transactions,
         "unparsed_lines": unparsed_lines,
+        "unparsed_spans": unparsed_spans,
     }
 
 
@@ -556,11 +601,16 @@ def parse_account_transcript(text: str, tax_year: int | None = None) -> dict:
     """
     lines: dict = {}
     line_raw_text: dict = {}
+    line_spans: dict = {}       # R15: key -> (start, end) of the verbatim
+                                #   line in the input text
+    line_confidence: dict = {}  # R15: "high" (exact) | "medium" (prefix)
     transactions: list = []
     unparsed_lines: list = []
+    unparsed_spans: list = []   # R15: parallel to unparsed_lines
     consumed_as_transaction: set = set()
 
     raw_lines = text.splitlines()
+    offsets = _line_offsets(text)
 
     # First pass: transactions (3-digit code led lines, cycle-aware).
     for idx, raw in enumerate(raw_lines):
@@ -569,6 +619,9 @@ def parse_account_transcript(text: str, tax_year: int | None = None) -> dict:
         txn = _parse_account_transaction(raw)
         if txn is None:
             continue
+        # R15: verbatim evidence -- the full raw line and its span.
+        txn["raw"] = raw
+        txn["span"] = (offsets[idx], offsets[idx] + len(raw))
         transactions.append(txn)
         consumed_as_transaction.add(idx)
 
@@ -582,27 +635,37 @@ def parse_account_transcript(text: str, tax_year: int | None = None) -> dict:
             continue
         candidate = _label_candidate(norm)
         key, label, ambiguous = _match_label(candidate, _ACCOUNT_LABEL_TABLE)
+        span = (offsets[idx], offsets[idx] + len(raw))
         if ambiguous:
             unparsed_lines.append("AMBIGUOUS: " + raw)
+            unparsed_spans.append(span)
             continue
         if key is None:
             unparsed_lines.append(raw)
+            unparsed_spans.append(span)
             continue
         value = _account_summary_value(raw, label)
         if value is None:
             unparsed_lines.append(raw)
+            unparsed_spans.append(span)
             continue
         if key in lines:
             unparsed_lines.append(f"DUPLICATE {key}: " + raw)
+            unparsed_spans.append(span)
             continue
         lines[key] = value
         line_raw_text[key] = raw
+        line_spans[key] = span
+        line_confidence[key] = "high" if candidate == label else "medium"
 
     return {
         "lines": lines,
         "line_raw_text": line_raw_text,
+        "line_spans": line_spans,
+        "line_confidence": line_confidence,
         "transactions": transactions,
         "unparsed_lines": unparsed_lines,
+        "unparsed_spans": unparsed_spans,
     }
 
 
@@ -644,6 +707,23 @@ def _split_roa_sections(text: str) -> tuple[str, str, list]:
     return return_text, account_text, doc_level
 
 
+def _shift_spans(obj, delta: int) -> None:
+    """Shift R15 char spans in a parsed section by ``delta`` (in place).
+
+    Section parsers report spans relative to the section text; the
+    Record-of-Account parse must report them relative to the full
+    document text.
+    """
+    for key, span in (obj.get("line_spans") or {}).items():
+        obj["line_spans"][key] = (span[0] + delta, span[1] + delta)
+    obj["unparsed_spans"] = [(s + delta, e + delta)
+                             for s, e in (obj.get("unparsed_spans") or [])]
+    for txn in obj.get("transactions") or []:
+        if txn.get("span"):
+            s, e = txn["span"]
+            txn["span"] = (s + delta, e + delta)
+
+
 def parse_record_of_account(text: str, tax_year: int | None = None) -> dict:
     """Parse IRS Record of Account text into a dict.
 
@@ -654,14 +734,47 @@ def parse_record_of_account(text: str, tax_year: int | None = None) -> dict:
     / parse_account_transcript on the section text. Lines that fall
     outside both sections (document-level lines before the first section
     header) go to top-level unparsed_lines.
+
+    R15: the section parsers' char spans are shifted to full-document
+    coordinates so every field's evidence span is valid against the
+    stored per-page text.
     """
     return_text, account_text, doc_level = _split_roa_sections(text)
+    offsets = _line_offsets(text)
+    raw_lines = text.splitlines()
+    # Section texts are "\n".join slices of the document's lines; shift
+    # their parser-relative spans into full-document coordinates.
+    return_start = 0
+    account_start = 0
+    ret_idx = next(
+        (i for i, line in enumerate(raw_lines)
+         if _RETURN_SECTION_HEADER_RE.match(line)),
+        None,
+    )
+    if account_text:
+        acct_idx = next(
+            i for i, line in enumerate(raw_lines)
+            if _ACCOUNT_SECTION_HEADER_RE.match(line))
+        account_start = offsets[acct_idx]
+        return_start = offsets[ret_idx] if ret_idx is not None else 0
+    return_section = parse_return_transcript(return_text, tax_year=tax_year)
+    account_section = parse_account_transcript(account_text, tax_year=tax_year)
+    _shift_spans(return_section, return_start)
+    _shift_spans(account_section, account_start)
+    # Doc-level lines (before the first section header): verbatim spans
+    # in full-document coordinates, parallel to "unparsed_lines".
+    # Mirrors _split_roa_sections' doc_level construction exactly.
+    doc_spans = []
+    if account_text:
+        for i in range(ret_idx if ret_idx is not None else 0):
+            line = raw_lines[i]
+            if line.strip() and not _is_structural(line):
+                doc_spans.append((offsets[i], offsets[i] + len(line)))
     return {
-        "return_section": parse_return_transcript(
-            return_text, tax_year=tax_year),
-        "account_section": parse_account_transcript(
-            account_text, tax_year=tax_year),
+        "return_section": return_section,
+        "account_section": account_section,
         "unparsed_lines": doc_level,
+        "unparsed_spans": doc_spans,
     }
 
 
@@ -671,49 +784,104 @@ def parse_record_of_account(text: str, tax_year: int | None = None) -> dict:
 
 def _new_payer(payer: str, payer_ein: str | None, form_type: str) -> dict:
     return {"payer": payer, "payer_ein": payer_ein,
-            "form_type": form_type, "boxes": {}}
+            "form_type": form_type, "boxes": {},
+            # R15 evidence: box_spans[box] = {"raw", "span", "confidence"};
+            # header_* describe the payer-block header line (None when the
+            # block was started by a form-type lead with no header yet).
+            "box_spans": {},
+            "header_raw": None, "header_span": None,
+            "header_confidence": "low"}
 
 
-def _parse_box_line(raw: str) -> tuple[str, object] | None:
-    """Parse a 'Box N ... $X' line -> (box_key, value) or None."""
+def _parse_box_line(raw: str) -> tuple[str, object, bool, bool] | None:
+    """Parse a 'Box N ... $X' line -> (box_key, value, labeled, money)
+    or None.
+
+    ``labeled`` is True when the line carries the explicit "Box N"
+    keyword; ``money`` is True when the value parsed as money. Both
+    drive the derived confidence (R15): "high" when labeled and money,
+    "medium" otherwise.
+    """
     m = _BOX_RE.match(raw)
     if not m:
         return None
     box_key, rest = m.group(1).strip(), m.group(2).strip()
+    labeled = bool(re.match(r"(?i)^\s*box\b", raw))
     money = _parse_money(rest)
     if money is not None:
         # Require the box line to look money-ish: box labels are numeric.
         if re.search(r"\d", box_key):
-            return box_key, money
+            return box_key, money, labeled, True
         return None
     # Non-money box value: keep raw label -> value if it has substance.
     if len(rest) >= 2:
-        return box_key, rest
+        return box_key, rest, labeled, False
     return None
+
+
+def _box_confidence(labeled: bool, money: bool) -> str:
+    """Derived confidence for a wage & income box line (R15)."""
+    return "high" if (labeled and money) else "medium"
 
 
 def parse_wage_income_transcript(text: str, tax_year: int | None = None) -> dict:
     """Parse IRS Wage & Income Transcript text into a dict.
 
-    Returns {"tax_year", "payers", "unparsed_lines"} per the module contract.
+    Returns {"tax_year", "payers", "unparsed_lines", "unparsed_spans"} per
+    the module contract. Each payer dict additionally carries R15
+    evidence: ``box_spans`` maps each box key to {"raw", "span",
+    "confidence"} (the verbatim box line, its (start, end) char span in
+    the input text, and the derived confidence), and ``header_raw`` /
+    ``header_span`` / ``header_confidence`` describe the payer-block
+    header line ("high" with an EIN, "medium" without, "low" when the
+    block never got a header).
     """
     if tax_year is None:
         tax_year = _detect_tax_year(text) or _detect_tax_year_loose(text)
 
     payers: list = []
     unparsed_lines: list = []
+    unparsed_spans: list = []
     current: dict | None = None
     pending_form_type: str | None = None
+    offsets = _line_offsets(text)
 
     def flush_pending_header(name: str, ein: str | None) -> None:
         nonlocal current
         current = _new_payer(name, ein, pending_form_type or "UNKNOWN")
         payers.append(current)
 
-    for raw in text.splitlines():
+    def _record_box(payer: dict, raw: str, span: tuple[int, int]) -> bool:
+        """Parse one box line into the payer block. True when consumed."""
+        parsed = _parse_box_line(raw.strip())
+        if not parsed:
+            return False
+        key, value, labeled, money = parsed
+        if key in payer["boxes"]:
+            # Duplicate box label: keep both, suffix the repeat.
+            n = 2
+            while f"{key}({n})" in payer["boxes"]:
+                n += 1
+            key = f"{key}({n})"
+        payer["boxes"][key] = value
+        payer["box_spans"][key] = {
+            "raw": raw,
+            "span": span,
+            "confidence": _box_confidence(labeled, money),
+        }
+        return True
+
+    def _record_header(payer: dict, raw: str, span: tuple[int, int],
+                       ein: str | None) -> None:
+        payer["header_raw"] = raw
+        payer["header_span"] = span
+        payer["header_confidence"] = "high" if ein else "medium"
+
+    for idx, raw in enumerate(text.splitlines()):
         if not raw.strip():
             continue
         stripped = raw.strip()
+        span = (offsets[idx], offsets[idx] + len(raw))
 
         # Form-type line: attaches to the current payer block when it has
         # none yet (payer-first layout); otherwise starts a new block
@@ -759,38 +927,32 @@ def parse_wage_income_transcript(text: str, tax_year: int | None = None) -> dict
                 # Fill in the placeholder started by a form-type lead.
                 current["payer"] = name or "UNKNOWN"
                 current["payer_ein"] = ein
+                _record_header(current, raw, span, ein)
             else:
                 flush_pending_header(name or "UNKNOWN", ein)
+                _record_header(current, raw, span, ein)
             continue
 
         # Box line within a block.
         if current is not None:
-            box = _parse_box_line(stripped)
-            if box:
-                key, value = box
-                if key in current["boxes"]:
-                    # Duplicate box label: keep both, suffix the repeat.
-                    n = 2
-                    while f"{key}({n})" in current["boxes"]:
-                        n += 1
-                    key = f"{key}({n})"
-                current["boxes"][key] = value
+            if _record_box(current, raw, span):
                 continue
 
         # Standalone box-like line before any payer block: start an UNKNOWN
         # payer block rather than losing it.
-        box = _parse_box_line(stripped)
-        if box:
+        if _parse_box_line(stripped):
             current = _new_payer("UNKNOWN", None, pending_form_type or "UNKNOWN")
             payers.append(current)
-            current["boxes"][box[0]] = box[1]
+            _record_box(current, raw, span)
             continue
 
         if not _is_structural(raw):
             unparsed_lines.append(raw)
+            unparsed_spans.append(span)
 
     return {
         "tax_year": tax_year,
         "payers": payers,
         "unparsed_lines": unparsed_lines,
+        "unparsed_spans": unparsed_spans,
     }

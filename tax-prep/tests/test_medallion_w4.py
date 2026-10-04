@@ -580,6 +580,8 @@ def test_gold_refused_vocabulary(tmp_path):
         "unresolved_duplicate", "unresolved_supersedes",
         "unresolved_conflict", "blocked_document",
         "excluded_lot", "incomplete_lot",
+        # R13 (Arc C, W1): in-scope doc neither validated nor excluded.
+        "lifecycle_not_ready",
     }
     exc = gold.GoldRefused([{"code": "unresolved_duplicate",
                              "detail": "d"}])

@@ -94,6 +94,10 @@ def _pii_free(obj):
     if isinstance(obj, dict):
         for k, v in obj.items():
             assert k not in ("value", "raw_text"), f"PII key leaked: {k!r}"
+            # R15: geometry is PII-adjacent (positions, not values) --
+            # provenance bboxes / char spans never leave the workstation.
+            assert k not in ("bbox_pdf", "bbox_source", "char_span"), \
+                f"geometry key leaked: {k!r}"
             _pii_free(v)
     elif isinstance(obj, (list, tuple)):
         for v in obj:
@@ -129,10 +133,24 @@ def test_list_documents_shape_and_json(tmp_path):
     assert [r["doc_id"] for r in only_w2] == ["w2-a"]
 
 
+def _field_with_geometry(value, confidence="high", raw=""):
+    # R15: a field carrying the full provenance contract (geometry +
+    # char span) -- the blind sweep must still pass after scrubbing.
+    f = _field(value, confidence, raw)
+    f["provenance"] = {
+        "page": 0, "bbox_pdf": [72.0, 697.5, 300.1, 709.5],
+        "bbox_source": "pdfplumber",
+        "char_span": {"page": 0, "start": 37, "end": 77},
+        "extractor": "extractors:3",
+    }
+    return f
+
+
 def test_show_document_scrubbed_shape(tmp_path):
     store = _store_with(tmp_path, [
         _doc("w2-a", 2024, "W-2",
-             {"box1_wages": _field("85000", "high", "Box 1 $85,000"),
+             {"box1_wages": _field_with_geometry("85000", "high",
+                                                "Box 1 $85,000"),
               "employer_name": _field("ACME CORP", "high", "ACME CORP")},
              "validated"),
         # transcript field codes embed payer names -- must be redacted
@@ -165,7 +183,7 @@ def test_show_document_provenance_and_positional_payer_keys(tmp_path):
                 "payer1.name": _field("ACME CORP", "high", ""),
                 "payer1.1": _field(85000.0, "high", "")},
                "transcribed")
-    doc.text_source = "ocr"
+    doc.text_source = "ocr:redo-ocr"
     doc.reason_code = None
     doc.ocr_engine = "tesseract"
     doc.engine_version = "5.3.4"
@@ -185,7 +203,7 @@ def test_show_document_provenance_and_positional_payer_keys(tmp_path):
     rec = mcp_server.show_document("ocr-1", data_dir=dd)
     # provenance keys present (operational metadata, not taxpayer data)
     assert set(mcp_server.PROVENANCE_KEYS) <= set(rec)
-    assert rec["text_source"] == "ocr"
+    assert rec["text_source"] == "ocr:redo-ocr"
     assert rec["ocr_engine"] == "tesseract"
     assert rec["engine_version"] == "5.3.4"
     assert rec["ocr_mode"] == "redo-ocr"
@@ -328,7 +346,7 @@ def test_pii_sweep_all_tools(tmp_path, monkeypatch):
     ])
     # R5 provenance on one doc: the sweep below must cover the new keys
     prov = store.get("w2-a")
-    prov.text_source = "ocr"
+    prov.text_source = "ocr:skip-text"
     prov.ocr_engine = "tesseract"
     prov.engine_version = "5.3.4"
     prov.ocr_mode = "skip-text"

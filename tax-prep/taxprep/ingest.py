@@ -27,8 +27,11 @@ Split children compose as <hash>-p<page_range>-<section-hash> (the
 section hash disambiguates sections sharing a page range).
 Re-ingest is idempotent: validated status/values/edits are never
 overwritten; a version bump that disagrees with validated values keeps
-them and flags re_review; new text for the same source attaches to the
-same doc_id with provenance.
+them and moves the doc to ``rereview`` via the R13 lifecycle
+(taxprep/lifecycle.py); new text for the same source attaches to the
+same doc_id with provenance. Every status change in this module goes
+through ``lifecycle.transition()`` -- there are no direct ``.status``
+writes.
 ``taxprep sync`` marks bronze objects with zero on-disk alias paths as
 ORPHANED (their silver docs flip to ORPHANED, values preserved).
 
@@ -74,8 +77,10 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import extractors, silver, transcript
+from . import extractors, lifecycle, silver, transcript
 from .models import Document
+from .provenance import (GeometryResolver, attach_field_provenance,
+                         page_spans_for_joined)
 from .store import DocumentStore
 
 # R17: ACCOUNT_TRANSCRIPT + RECORD_OF_ACCOUNT have parsers in
@@ -119,12 +124,33 @@ RC_NEEDS_OCR = "needs-ocr"
 RC_OCR_INSUFFICIENT = "ocr-insufficient"
 
 # text_source vocabulary (Document.text_source provenance).
+#
+# R15: the value names WHICH text was actually used --
+#   native                  text layer of the source file
+#   sidecar:<relpath>       a same-basename .txt sidecar (P1: the record
+#                           must name the .txt, not just the PDF)
+#   form-field              AcroForm widget values (+ native text)
+#   ocr:<engine>/<mode>     OCR text, e.g. "ocr:tesseract/redo-ocr"
+#   broker-csv              broker CSV rows (brokercsv.py)
+#   error | blocked         no usable text
 TS_NATIVE = "native"
-TS_SIDECAR = "sidecar"
+TS_SIDECAR_PREFIX = "sidecar:"
 TS_FORM_FIELD = "form-field"
-TS_OCR = "ocr"
+TS_OCR_PREFIX = "ocr:"
 TS_ERROR = "error"
 TS_BLOCKED = "blocked"
+
+
+def _sidecar_text_source(relpath: str) -> str:
+    """text_source for sidecar-routed text (R15/P1)."""
+    return f"{TS_SIDECAR_PREFIX}{relpath}"
+
+
+def _ocr_text_source(engine: str | None, mode: str | None) -> str:
+    """text_source for OCR-routed text (R15)."""
+    if engine and mode:
+        return f"{TS_OCR_PREFIX}{engine}/{mode}"
+    return "ocr"
 
 
 class _SkipFile(Exception):
@@ -258,6 +284,49 @@ def _acroform_values(reader) -> dict[str, str]:
     return out
 
 
+def _acroform_rects(reader) -> dict:
+    """AcroForm widget rects: {name: {"page", "bbox", "line"}} (R15).
+
+    ``page`` is 0-based, ``bbox`` is [x0, y0, x1, y1] in PDF points
+    (bottom-left origin), and ``line`` is the "name: value" text the
+    form-field route appends to the page text -- the geometry resolver
+    matches a field's raw_text against it. Best effort: pages or
+    annotations that cannot be read are skipped, never fatal.
+    """
+    out: dict = {}
+    try:
+        pages = list(reader.pages)
+    except Exception:
+        return out
+    for i, page in enumerate(pages):
+        try:
+            annots = page.get("/Annots") or []
+        except Exception:
+            continue
+        for annot in annots:
+            try:
+                obj = annot.get_object()
+            except Exception:
+                continue
+            try:
+                if str(obj.get("/Subtype")) != "/Widget":
+                    continue
+                name = obj.get("/T")
+                rect = obj.get("/Rect")
+                if name is None or rect is None:
+                    continue
+                x0, y0, x1, y1 = (float(v) for v in rect)
+                # Widget rects are already bottom-left origin in PDF.
+                bbox = [round(min(x0, x1), 2), round(min(y0, y1), 2),
+                        round(max(x0, x1), 2), round(max(y0, y1), 2)]
+                out[str(name)] = {"page": i, "bbox": bbox}
+            except Exception:
+                continue
+    # The caller fills each entry's "line" ("name: value" as appended to
+    # the page text) once the widget values are known.
+    return out
+
+
 @dataclass
 class PageBundle:
     """Per-page text plus the R5 routing decision and provenance."""
@@ -273,6 +342,16 @@ class PageBundle:
     # X1: "owner-only" when the PDF carried only an owner password (empty
     # user password unlocked it); None otherwise. Operational metadata.
     encryption: str | None = None
+    # R15 geometry inputs (all optional; None = source unavailable):
+    # - pdf_path: the PDF the native/form-field text was read from, for
+    #   pdfplumber word boxes (None for sidecar/txt/image sources).
+    # - ocr_words: {page_0based: [word, ...]} tesseract TSV word boxes
+    #   (None on the ocrmypdf path -- its sidecar carries no word boxes).
+    # - acroform_rects: {field_name: {"page": p0, "bbox": [...],
+    #   "line": "name: value"}} widget rects for the form-field route.
+    pdf_path: Path | None = None
+    ocr_words: dict | None = None
+    acroform_rects: dict | None = None
 
 
 def _ocr_pdf(pdf_path: Path, mode: str, work_dir: Path) -> dict:
@@ -407,14 +486,23 @@ def _pdf_page_bundle(pdf_path: Path, store: DocumentStore) -> PageBundle:
         native = "\n".join(page_texts)
         form_lines = "\n".join(f"{k}: {v}"
                                for k, v in sorted(form_values.items()))
+        # R15: widget rects for the form-field geometry source. "line"
+        # is the exact appended text the resolver matches raw_text on.
+        rects = _acroform_rects(reader)
+        for name, value in form_values.items():
+            if name in rects:
+                rects[name]["line"] = f"{name}: {value}"
         return PageBundle([native + "\n" + form_lines] if native.strip()
                           else [form_lines],
                           "form-field", TS_FORM_FIELD,
-                          encryption=encryption)
+                          encryption=encryption,
+                          pdf_path=pdf_path,
+                          acroform_rects=rects or None)
 
     attempts: list = []
     engine = engine_version = None
     confidences: list[float] = []
+    ocr_words: dict[int, list] = {}
     if ocr_pages:
         from . import ocr as _ocr
 
@@ -447,6 +535,14 @@ def _pdf_page_bundle(pdf_path: Path, store: DocumentStore) -> PageBundle:
                 confidences.append(result["mean_confidence"])
             page_texts[i - 1] = result.get("text", "") if result.get(
                 "ok") else ""
+            # R15: tesseract TSV word boxes, keyed by 0-based bundle page.
+            # The OCR ran on a single-page PDF, so remap each word's
+            # page to the bundle page it belongs to.
+            words = result.get("words")
+            if words:
+                for word in words:
+                    word["page"] = i - 1
+                ocr_words[i - 1] = words
 
     full = "\n".join(page_texts)
     if ocr_pages and not full.strip():
@@ -457,23 +553,37 @@ def _pdf_page_bundle(pdf_path: Path, store: DocumentStore) -> PageBundle:
 
     route = "ocr" if ocr_pages else ("form-field" if form_values
                                     else "native")
-    text_source = TS_OCR if ocr_pages else (TS_FORM_FIELD if form_values
-                                            else TS_NATIVE)
+    ocr_mode = attempts[-1].get("mode") if attempts else None
+    # R15: text_source names WHICH text was used --
+    # "ocr:<engine>/<mode>", never a bare "ocr".
+    text_source = (_ocr_text_source(engine, ocr_mode) if ocr_pages
+                   else (TS_FORM_FIELD if form_values else TS_NATIVE))
     # If AcroForm values exist alongside OCR'd pages, append them so the
     # field data is not lost.
+    acroform_rects = None
     if form_values and ocr_pages:
         form_lines = "\n".join(f"{k}: {v}"
                                for k, v in sorted(form_values.items()))
         page_texts = list(page_texts)
         page_texts[-1] = page_texts[-1] + "\n" + form_lines
+        rects = _acroform_rects(reader)
+        for name, value in form_values.items():
+            if name in rects:
+                rects[name]["line"] = f"{name}: {value}"
+        acroform_rects = rects or None
     return PageBundle(
         page_texts, route, text_source,
         ocr_engine=engine, engine_version=engine_version,
-        ocr_mode=(attempts[-1].get("mode") if attempts else None),
+        ocr_mode=ocr_mode,
         attempts=attempts,
         mean_confidence=(sum(confidences) / len(confidences)
                          if confidences else None),
         encryption=encryption,
+        # R15: native/form-field text comes from this PDF (pdfplumber
+        # word boxes); OCR pages carry tesseract word boxes instead.
+        pdf_path=pdf_path if route in ("native", "form-field") else None,
+        ocr_words=ocr_words or None,
+        acroform_rects=acroform_rects,
     )
 
 
@@ -540,6 +650,57 @@ def extract_pdf_text(path: Path) -> str:
     return "\n".join(extract_pdf_pages(path))
 
 
+def _tfield(value, confidence, raw_text, span):
+    """One transcript field entry (R15).
+
+    ``raw_text`` is always the verbatim source line (never synthesized,
+    never "" for a field with an extracted value); ``confidence`` is
+    derived from the parse (never hardcoded); ``span`` is the transient
+    ``(start, end)`` extraction-text span for provenance attachment.
+    """
+    entry = {"value": value, "confidence": confidence,
+             "raw_text": raw_text}
+    if span is not None:
+        entry["_extract_span"] = span
+    return entry
+
+
+def _unparsed_field(unparsed: list, unparsed_spans: list) -> dict:
+    """The ``_unparsed_lines`` bookkeeping field.
+
+    raw_text is the verbatim unparsed lines joined (non-empty whenever
+    the value is non-empty); the span covers the first..last unparsed
+    line in extraction-text coordinates.
+    """
+    spans = [s for s in (unparsed_spans or []) if s is not None]
+    span = ((min(s for s, _ in spans), max(e for _, e in spans))
+            if spans else None)
+    return _tfield(unparsed, "low", "\n".join(unparsed), span)
+
+
+def _transcript_line_fields(parsed: dict) -> tuple[dict, list, list]:
+    """Shared builder for return/account transcript parsed dicts.
+
+    Returns (fields, unparsed_lines, unparsed_spans). Every field gets
+    verbatim raw_text, a derived confidence, and an extraction span.
+    """
+    line_raw = parsed.get("line_raw_text", {})
+    line_spans = parsed.get("line_spans", {})
+    line_conf = parsed.get("line_confidence", {})
+    fields = {
+        label: _tfield(val, line_conf.get(label, "medium"),
+                       line_raw.get(label, ""), line_spans.get(label))
+        for label, val in parsed.get("lines", {}).items()
+    }
+    for t in parsed.get("transactions", []):
+        code = f"tc_{t.get('code')}"
+        fields[code] = _tfield(
+            t.get("amount"), "medium",
+            t.get("raw", "") or t.get("description", ""), t.get("span"))
+    return (fields, parsed.get("unparsed_lines", []),
+            parsed.get("unparsed_spans", []))
+
+
 def _fields_from_transcript(form_type: str, text: str,
                             year: int | None) -> tuple[dict, str]:
     """Adapt transcript parser output to the Document fields shape.
@@ -547,96 +708,56 @@ def _fields_from_transcript(form_type: str, text: str,
     R8: positional payer keys (payer1.box1); the payer name is stored as
     a payer1.name field VALUE, never embedded in a key.
 
+    R15: every field carries verbatim raw_text (the actual source line),
+    a derived confidence, and an extraction span -- never synthesized
+    evidence, never hardcoded "high".
+
     R17: ACCOUNT_TRANSCRIPT maps balance/accrual lines as fields plus
     tc_<code> transaction fields, same field shape as the return branch.
-    RECORD_OF_ACCOUNT merges both sections' fields with section provenance
-    tagged in raw_text ("return section: <raw>" / "account section:
-    <raw>"); the account section is merged after the return section.
+    RECORD_OF_ACCOUNT merges both sections' fields; section provenance
+    is carried by each field's char_span (R15), not by a synthesized
+    tag prefix in raw_text.
     """
     if form_type == "WAGE_INCOME_TRANSCRIPT":
         parsed = transcript.parse_wage_income_transcript(text, tax_year=year)
         fields: dict = {}
         for i, payer in enumerate(parsed.get("payers", [])):
             prefix = f"payer{i + 1}"
-            fields[f"{prefix}.name"] = {
-                "value": payer.get("payer", "unknown"),
-                "confidence": "high",
-                "raw_text": "",
-            }
+            fields[f"{prefix}.name"] = _tfield(
+                payer.get("payer", "unknown"),
+                payer.get("header_confidence", "low"),
+                payer.get("header_raw") or "",
+                payer.get("header_span"),
+            )
+            box_spans = payer.get("box_spans", {})
             for box, val in payer.get("boxes", {}).items():
-                code = f"{prefix}.{box}"
-                fields[code] = {
-                    "value": val,
-                    "confidence": "high",
-                    "raw_text": f"{payer.get('form_type', '')} box {box}",
-                }
+                bs = box_spans.get(box, {})
+                fields[f"{prefix}.{box}"] = _tfield(
+                    val, bs.get("confidence", "medium"),
+                    bs.get("raw", ""), bs.get("span"))
         unparsed = parsed.get("unparsed_lines", [])
+        unparsed_spans = parsed.get("unparsed_spans", [])
     elif form_type == "ACCOUNT_TRANSCRIPT":
         parsed = transcript.parse_account_transcript(text, tax_year=year)
-        line_raw = parsed.get("line_raw_text", {})
-        fields = {
-            label: {"value": val, "confidence": "high",
-                    "raw_text": line_raw.get(label, "")}
-            for label, val in parsed.get("lines", {}).items()
-        }
-        for t in parsed.get("transactions", []):
-            code = f"tc_{t.get('code')}"
-            fields[code] = {
-                "value": t.get("amount"),
-                "confidence": "medium",
-                "raw_text": t.get("description", ""),
-            }
-        unparsed = parsed.get("unparsed_lines", [])
+        fields, unparsed, unparsed_spans = _transcript_line_fields(parsed)
     elif form_type == "RECORD_OF_ACCOUNT":
         parsed = transcript.parse_record_of_account(text, tax_year=year)
         fields = {}
         # Top-level unparsed (document lines outside both sections) plus
-        # each section's own unparsed, section-tagged so nothing is
-        # silently dropped.
+        # each section's own unparsed -- all verbatim, spans parallel.
         unparsed = list(parsed.get("unparsed_lines", []))
-        for section, tag in (("return_section", "return section"),
-                             ("account_section", "account section")):
+        unparsed_spans = list(parsed.get("unparsed_spans", []))
+        for section in ("return_section", "account_section"):
             sec = parsed.get(section, {})
-            line_raw = sec.get("line_raw_text", {})
-            for label, val in sec.get("lines", {}).items():
-                fields[label] = {
-                    "value": val,
-                    "confidence": "high",
-                    "raw_text": f"{tag}: {line_raw.get(label, '')}",
-                }
-            for t in sec.get("transactions", []):
-                code = f"tc_{t.get('code')}"
-                fields[code] = {
-                    "value": t.get("amount"),
-                    "confidence": "medium",
-                    "raw_text": f"{tag}: {t.get('description', '')}",
-                }
-            for u in sec.get("unparsed_lines", []):
-                unparsed.append(f"{tag}: {u}")
+            sec_fields, sec_unparsed, sec_spans = _transcript_line_fields(sec)
+            fields.update(sec_fields)
+            unparsed.extend(sec_unparsed)
+            unparsed_spans.extend(sec_spans)
     else:
         parsed = transcript.parse_return_transcript(text, tax_year=year)
-        # R15: raw_text carries the verbatim transcript line (D4), not a
-        # synthesized "" -- real evidence per field.
-        line_raw = parsed.get("line_raw_text", {})
-        fields = {
-            label: {"value": val, "confidence": "high",
-                    "raw_text": line_raw.get(label, "")}
-            for label, val in parsed.get("lines", {}).items()
-        }
-        for t in parsed.get("transactions", []):
-            code = f"tc_{t.get('code')}"
-            fields[code] = {
-                "value": t.get("amount"),
-                "confidence": "medium",
-                "raw_text": t.get("description", ""),
-            }
-        unparsed = parsed.get("unparsed_lines", [])
+        fields, unparsed, unparsed_spans = _transcript_line_fields(parsed)
     if unparsed:
-        fields["_unparsed_lines"] = {
-            "value": unparsed,
-            "confidence": "low",
-            "raw_text": "",
-        }
+        fields["_unparsed_lines"] = _unparsed_field(unparsed, unparsed_spans)
     status = "transcribed" if not unparsed else "needs_review"
     return fields, status
 
@@ -656,6 +777,47 @@ def _extract_for_type(
     if form_type in BOX_FORMS:
         return extractors.extract_fields(form_type, text)
     return {}, "needs_review"
+
+
+def _extractor_id_for(form_type: str) -> str:
+    """R15 extractor id: "<name>:<version>"."""
+    if form_type in TRANSCRIPT_FORMS:
+        return f"transcript:{transcript.TRANSCRIPT_VERSION}"
+    return f"extractors:{extractors.EXTRACTOR_VERSION}"
+
+
+def _geometry_for(bundle: PageBundle | None) -> GeometryResolver:
+    """Build the R15 geometry resolver for an ingest bundle.
+
+    Native/form-field text resolves word boxes from the source PDF via
+    pdfplumber (fillable forms try AcroForm widget rects first); OCR
+    text resolves tesseract TSV word boxes; sidecar/.txt text has no
+    layout source (char spans only).
+    """
+    if bundle is None:
+        return GeometryResolver()
+    if bundle.route == "ocr":
+        return GeometryResolver(ocr_words=bundle.ocr_words)
+    if bundle.route == "form-field":
+        return GeometryResolver(pdf_path=bundle.pdf_path,
+                                acroform_rects=bundle.acroform_rects)
+    if bundle.route == "native":
+        return GeometryResolver(pdf_path=bundle.pdf_path)
+    return GeometryResolver()
+
+
+def _attach_provenance(fields: dict, page_spans, form_type: str,
+                       bundle: PageBundle | None,
+                       page_texts: list[str] | None) -> dict:
+    """R15: replace transient extraction spans with provenance dicts.
+
+    ``page_spans`` maps the extraction text back to source pages;
+    ``page_texts`` is the stored per-page text (for word-box alignment;
+    None/empty degrades bboxes to None, char spans still compute).
+    """
+    return attach_field_provenance(
+        fields, page_spans, _extractor_id_for(form_type),
+        _geometry_for(bundle), page_texts or [])
 
 
 def _section_year(section: extractors.FormSection, full_text: str) -> int | None:
@@ -684,6 +846,94 @@ def _utcnow_iso() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# -- R13 lifecycle helpers -------------------------------------------------
+#
+# Every Document status change in ingest goes through
+# lifecycle.transition(). Helpers below fire the right event for each
+# call site; a refused transition is a loud RuntimeError (the table
+# guarantees these rows -- a refusal means the table or the caller is
+# wrong, never something to swallow).
+
+def _check_transition(res: "lifecycle.TransitionResult",
+                      doc: Document) -> "lifecycle.TransitionResult":
+    if not res.ok:
+        raise RuntimeError(
+            f"lifecycle {res.event} refused for {doc.doc_id} "
+            f"({res.from_state}, actor={res.actor}): {res.reason_code}")
+    return res
+
+
+def _fire_scan_select(store: DocumentStore, doc: Document) -> Document:
+    """New-doc preamble: scan (none -> discovered) then select.
+
+    Batch ingest runs under the standing auto-select policy (R13 table
+    row: discovered --select(system)--> selected, guard auto_select).
+    """
+    _check_transition(
+        lifecycle.transition(doc, lifecycle.SCAN, actor=lifecycle.SYSTEM,
+                             event_input=lifecycle.ScanInput(), store=store),
+        doc)
+    _check_transition(
+        lifecycle.transition(doc, lifecycle.SELECT, actor=lifecycle.SYSTEM,
+                             event_input=lifecycle.SelectInput(auto=True),
+                             store=store),
+        doc)
+    return doc
+
+
+def _ingest_input(bundle: PageBundle, *, clean: bool = True,
+                 multiform: bool = False) -> "lifecycle.IngestInput":
+    route = bundle.route
+    if multiform:
+        route = "multiform"
+    elif route == "blocked":
+        route = "blocked"
+    elif route == "error":
+        route = "error"
+    else:
+        route = "ok"
+    return lifecycle.IngestInput(route=route,
+                                route_reason=bundle.reason_code,
+                                clean=clean)
+
+
+def _fire_ingest(store: DocumentStore, doc: Document, bundle: PageBundle,
+                 *, clean: bool = True,
+                 multiform: bool = False) -> "lifecycle.TransitionResult":
+    """Fire the ingest event for doc's current lifecycle state.
+
+    Fresh docs (lifecycle.new_document) get the scan -> select preamble
+    first. Returns the TransitionResult; the caller persists when it is
+    not a no-op.
+    """
+    if lifecycle.is_fresh(doc):
+        _fire_scan_select(store, doc)
+    return _check_transition(
+        lifecycle.transition(doc, lifecycle.INGEST, actor=lifecycle.SYSTEM,
+                             event_input=_ingest_input(
+                                 bundle, clean=clean, multiform=multiform),
+                             store=store),
+        doc)
+
+
+def _fire_reextract(store: DocumentStore, doc: Document,
+                    values_differ: bool,
+                    reason: str = "extraction-disagrees"
+                    ) -> "lifecycle.TransitionResult":
+    """Fire re_extract on a validated/rereview doc (R4).
+
+    Validated values are always kept (the caller reconciles first);
+    disagreement moves validated -> rereview, agreement is a no-op.
+    """
+    return _check_transition(
+        lifecycle.transition(
+            doc, lifecycle.RE_EXTRACT, actor=lifecycle.SYSTEM,
+            event_input=lifecycle.ReextractInput(values_differ=values_differ,
+                                                reason=reason),
+            store=store),
+        doc)
 
 
 # -- Medallion silver write (I6/I7/R4; W2) -----------------------------------
@@ -913,19 +1163,24 @@ def _store_blocked_reingest(store: DocumentStore, existing: Document,
                             ctx: silver.DerivationContext) -> Document:
     """A failed re-ingest never destroys what we have (R4).
 
-    Keeps existing text/fields/status; refreshes provenance in memory.
+    Keeps existing text/fields; refreshes provenance in memory.
     Unvalidated docs move to BLOCKED (the file honestly is blocked now);
-    validated status is never overwritten. A no-op when nothing changed.
+    validated/rereview docs are never overwritten. A no-op when nothing
+    changed (same state and same reason: the transition is not logged).
     """
     _apply_provenance(existing, bundle, source_sha)
-    if existing.status != "validated" and bundle.route == "blocked":
-        if (existing.status != "BLOCKED"
-                or existing.status_reason != bundle.reason_code):
-            existing.status = "BLOCKED"
-            existing.status_reason = bundle.reason_code
-            _persist_silver_doc(
-                store, existing,
-                _stored_derivation(store, existing, ctx), source_sha)
+    if existing.status in (lifecycle.VALIDATED, lifecycle.REREVIEW):
+        return existing  # R4: validated values are never overwritten
+    if bundle.route != "blocked":
+        return existing
+    if (existing.status == lifecycle.BLOCKED
+            and existing.status_reason == bundle.reason_code):
+        return existing  # no-op: same state, same reason
+    res = _fire_ingest(store, existing, bundle)
+    if not res.noop:
+        _persist_silver_doc(
+            store, existing,
+            _stored_derivation(store, existing, ctx), source_sha)
     return existing
 
 
@@ -950,7 +1205,15 @@ def _store_version_bump(store: DocumentStore, existing: Document,
     # provenance history are Operator or Operator-visible state, never
     # reset by a re-derivation.
     existing.fields = result.fields
-    if result.re_review and not existing.re_review:
+    # R13: validated/rereview docs go through the re_extract event.
+    # reconcile_rederivation already kept the validated values;
+    # disagreement moves validated -> rereview (validated values kept),
+    # agreement is a logged no-op.
+    if existing.status in (lifecycle.VALIDATED, lifecycle.REREVIEW):
+        _fire_reextract(store, existing, result.re_review)
+    elif result.re_review and not existing.re_review:
+        # Unvalidated docs have no validated keys, so reconcile never
+        # flags them; kept as a fail-safe mirroring the old behavior.
         existing.re_review = True
         existing.status_reason = "extraction-disagrees"
     existing.ocr_text_ref = store.save_ocr(existing.doc_id, text)
@@ -968,18 +1231,27 @@ def _store_version_bump(store: DocumentStore, existing: Document,
 
 
 def _store_idempotent(store: DocumentStore, doc: Document, text: str,
-                      bundle: PageBundle, source_sha: str) -> Document:
+                      bundle: PageBundle, source_sha: str, *,
+                      clean: bool = True,
+                      multiform: bool = False) -> Document:
     """Medallion-aware idempotent doc write (I6/I7/R4).
 
-    - unknown doc_id -> fresh derivation (silver_doc + artifacts).
+    - unknown doc_id -> fresh derivation (silver_doc + artifacts); the
+      R13 preamble scan -> select (system auto-select) -> ingest fires
+      first, so the event log opens with the doc's full chain.
     - re-derivation refused/failed (blocked/error route) -> keep
-      existing text/fields/status; failed re-ingests never destroy.
+      existing text/fields; failed re-ingests never destroy validated
+      values (validated/rereview docs are untouched).
     - same (version, config), agreeing re-derivation -> true no-op
       (I2): no writes at all.
-    - same (version, config), disagreeing re-derivation -> validated:
-      keep validated values, flag re_review (status stays validated);
+    - same (version, config), disagreeing re-derivation -> validated/
+      rereview: validated values kept, re_extract -> rereview;
       unvalidated: the fresh extraction wins.
     - version/config bump -> I6 reconcile (see _store_version_bump).
+    - terminal states (excluded, ORPHANED): re-ingest never revives.
+
+    Every status change goes through lifecycle.transition(); a refused
+    transition is a loud RuntimeError, never a silent skip.
 
     Runs inside the caller's transaction (contract section 8: derive in
     ONE txn, I7).
@@ -987,7 +1259,11 @@ def _store_idempotent(store: DocumentStore, doc: Document, text: str,
     ctx = silver.DerivationContext.current()
     existing = store.get(doc.doc_id)
     if existing is None:
+        _fire_ingest(store, doc, bundle, clean=clean, multiform=multiform)
         return _derive_and_store(store, doc, text, bundle, source_sha, ctx)
+
+    if existing.status in (lifecycle.EXCLUDED, lifecycle.ORPHANED):
+        return existing  # terminal: re-ingest never revives a disposal
 
     if bundle.route in ("blocked", "error"):
         return _store_blocked_reingest(store, existing, doc, bundle,
@@ -1005,34 +1281,34 @@ def _store_idempotent(store: DocumentStore, doc: Document, text: str,
     # Same-version disagreement: unreachable with deterministic
     # extraction (same bytes -> same fields); kept as a fail-safe
     # mirroring the pre-medallion R4 semantics.
-    if existing.status == "validated":
-        changed = False
-        if not existing.re_review:
-            existing.re_review = True
-            changed = True
-        if existing.status_reason != "extraction-disagrees":
-            existing.status_reason = "extraction-disagrees"
-            changed = True
-        if changed:
+    if existing.status in (lifecycle.VALIDATED, lifecycle.REREVIEW):
+        # R13: validated values are kept (nothing to reconcile here --
+        # fields were NOT overwritten); disagreement -> rereview.
+        res = _fire_reextract(store, existing, True)
+        if not res.noop:
             _persist_silver_doc(store, existing, old_ctx, source_sha)
         return existing
     # Not validated: the fresh extraction wins (same doc_id; relevance
-    # and other Operator-visible state are preserved).
+    # and other Operator-visible state are preserved). The ingest event
+    # moves the existing doc to the fresh extraction's state.
+    res = _fire_ingest(store, existing, bundle,
+                       clean=(doc.status == "transcribed"))
     relevance = existing.relevance
     validated_at = existing.validated_at
-    doc.re_review = False
-    doc.ocr_text_ref = store.save_ocr(doc.doc_id, text)
-    _apply_provenance(doc, bundle, source_sha)
-    doc.relevance = relevance
-    doc.validated_at = validated_at
-    _persist_silver_doc(store, doc, ctx, source_sha)
+    existing.fields = doc.fields
+    existing.re_review = False
+    existing.ocr_text_ref = store.save_ocr(existing.doc_id, text)
+    _apply_provenance(existing, bundle, source_sha)
+    existing.relevance = relevance
+    existing.validated_at = validated_at
+    _persist_silver_doc(store, existing, ctx, source_sha)
     store.replace_artifacts(
-        doc.doc_id,
+        existing.doc_id,
         silver.derive_artifacts(
-            doc, bundle, bronze_hash=source_sha,
+            existing, bundle, bronze_hash=source_sha,
             derivation_version=ctx.derivation_version,
             config_hash=ctx.config_hash))
-    return doc
+    return existing
 
 
 def _child_document(
@@ -1052,6 +1328,10 @@ def _child_document(
     assert section.form_type is not None
     year = _section_year(section, full_text)
     fields, status = _extract_for_type(section.form_type, section.text, year)
+    # R15: extraction-time field provenance (char spans + geometry).
+    fields = _attach_provenance(
+        fields, section.page_spans, section.form_type, bundle,
+        bundle.pages if bundle is not None else None)
     # R4: <source-bytes-hash>-p<page_range>-<section-hash>. The section
     # hash keeps children unique when two sections share a page range
     # (e.g. a single-page .txt holding two forms); the mandated
@@ -1059,22 +1339,32 @@ def _child_document(
     section_hash = hashlib.sha256(
         section.text.encode("utf-8")).hexdigest()[:8]
     doc_id = f"{parent_doc_id}-p{_page_range_str(section)}-{section_hash}"
-    doc = Document(
+    # R13: fresh docs enter with no lifecycle state; the scan -> select
+    # -> ingest preamble fires inside _store_idempotent.
+    doc = lifecycle.new_document(
         doc_id=doc_id,
         tax_year=year,
         form_type=section.form_type,
         source_path=str(path),
         ocr_text_ref="",
         fields=fields,
-        status=status,
         page_range=_page_range_str(section),
         parent_doc_id=parent_doc_id,
     )
     if bundle is not None and source_sha is not None:
         return _store_idempotent(store, doc, section.text, bundle,
-                                 source_sha)
+                                 source_sha,
+                                 clean=(status == "transcribed"))
     # Legacy direct call (R1 tests): plain upsert, no provenance.
     doc.ocr_text_ref = store.save_ocr(doc_id, section.text)
+    _fire_scan_select(store, doc)
+    _check_transition(
+        lifecycle.transition(
+            doc, lifecycle.INGEST, actor=lifecycle.SYSTEM,
+            event_input=lifecycle.IngestInput(
+                route="ok", clean=(status == "transcribed")),
+            store=store),
+        doc)
     store.upsert(doc)
     return doc
 
@@ -1083,17 +1373,18 @@ def _blocked_document(path: Path, doc_id: str, bundle: PageBundle,
                       source_sha: str, store: DocumentStore,
                       form_type: str = "UNKNOWN") -> Document:
     """A BLOCKED or ERROR document: honest about the failure, with a
-    reason code -- never exception text, never an empty silent record."""
-    status = "BLOCKED" if bundle.route == "blocked" else "needs_review"
-    doc = Document(
+    reason code -- never exception text, never an empty silent record.
+
+    R13: the ingest event maps route "blocked" -> BLOCKED and route
+    "error" -> errored (previously error-route docs were needs_review).
+    """
+    doc = lifecycle.new_document(
         doc_id=doc_id,
         tax_year=None,
         form_type=form_type,
         source_path=str(path),
         ocr_text_ref="",
         fields={},
-        status=status,
-        status_reason=bundle.reason_code,
     )
     return _store_idempotent(store, doc, "", bundle, source_sha)
 
@@ -1111,18 +1402,25 @@ def _blocked_multi_form_document(
     single form_type.
     """
     year = extractors.detect_tax_year(text)
-    doc = Document(
+    doc = lifecycle.new_document(
         doc_id=parent_doc_id,
         tax_year=year,
         form_type="UNKNOWN",
         source_path=str(path),
         ocr_text_ref="",
         fields={},
-        status="MULTI_FORM",
     )
     if bundle is not None and source_sha is not None:
-        return _store_idempotent(store, doc, text, bundle, source_sha)
+        return _store_idempotent(store, doc, text, bundle, source_sha,
+                                 multiform=True)
     doc.ocr_text_ref = store.save_ocr(parent_doc_id, text)
+    _fire_scan_select(store, doc)
+    _check_transition(
+        lifecycle.transition(
+            doc, lifecycle.INGEST, actor=lifecycle.SYSTEM,
+            event_input=lifecycle.IngestInput(route="multiform"),
+            store=store),
+        doc)
     store.upsert(doc)
     return doc
 
@@ -1150,7 +1448,8 @@ def _build_documents(path: Path, doc_id: str, bundle: PageBundle,
         distinct = ["RECORD_OF_ACCOUNT"]
         typed = [
             extractors.FormSection(
-                "RECORD_OF_ACCOUNT", text, 1, max(len(pages), 1)
+                "RECORD_OF_ACCOUNT", text, 1, max(len(pages), 1),
+                page_spans=page_spans_for_joined(pages),
             )
         ]
 
@@ -1175,17 +1474,26 @@ def _build_documents(path: Path, doc_id: str, bundle: PageBundle,
     if year is None:
         year = extractors.detect_tax_year(text)
     fields, status = _extract_for_type(form_type, section_text, year)
+    # R15: extraction-time field provenance. With no typed sections the
+    # extraction text is "\n".join(pages) -- page boundaries survive via
+    # the joined-text page map (P4: never lose page boundaries).
+    page_spans = (typed[0].page_spans if typed
+                  else page_spans_for_joined(pages))
+    fields = _attach_provenance(fields, page_spans, form_type, bundle,
+                                bundle.pages)
 
-    doc = Document(
+    # R13: fresh docs enter with no lifecycle state; the scan -> select
+    # -> ingest preamble fires inside _store_idempotent.
+    doc = lifecycle.new_document(
         doc_id=doc_id,
         tax_year=year,
         form_type=form_type,
         source_path=str(path),
         ocr_text_ref="",
         fields=fields,
-        status=status,
     )
-    return [_store_idempotent(store, doc, section_text, bundle, source_sha)]
+    return [_store_idempotent(store, doc, section_text, bundle, source_sha,
+                              clean=(status == "transcribed"))]
 
 
 # -- Medallion ingest flow (contract section 8; W2) ----------------------------
@@ -1226,21 +1534,26 @@ def _sidecar_for(path: Path) -> Path | None:
 
 
 def _page_bundle_for(path: Path, source_bytes: bytes, suffix: str,
-                     store: DocumentStore) -> PageBundle:
+                     store: DocumentStore,
+                     source_root: Path | None = None) -> PageBundle:
     """Route one file to its PageBundle (R5 gate). May raise _SkipFile.
 
     Pure derivation: no store writes happen here, so a skip fails closed
     with zero bronze/silver rows (W4 bronze_accounted stays whole).
+    ``source_root`` is the ingest root the path is relative to (R11);
+    the sidecar text_source names the sidecar relative to it (R15/P1).
     """
     # A same-basename .txt sidecar wins as the OCR text for PDFs and
     # images (pre-existing OCR). The doc_id still derives from the
     # source file's bytes, so the sidecar text attaches to the same
-    # doc_id with provenance text_source="sidecar" (R4).
+    # doc_id with provenance text_source="sidecar:<relpath>" (R4/R15).
     if suffix in PDF_EXTS | IMAGE_EXTS:
         sidecar = _sidecar_for(path)
         if sidecar is not None:
             text = sidecar.read_bytes().decode("utf-8", errors="replace")
-            return PageBundle([text], "native", TS_SIDECAR)
+            return PageBundle([text], "native",
+                              _sidecar_text_source(
+                                  _relpath(source_root, sidecar)))
     if suffix in PDF_EXTS:
         return _pdf_page_bundle(path, store)
     if suffix in TXT_EXTS:
@@ -1262,18 +1575,40 @@ def _page_bundle_for(path: Path, source_bytes: bytes, suffix: str,
     raise _SkipFile(RC_UNSUPPORTED_TYPE)  # unreachable: caller pre-checks
 
 
+def _relpath(source_root: Path | None, path: Path) -> str:
+    """Root-relative path for provenance (R15); falls back to the file
+    name when no root is known or the path escapes it."""
+    if source_root is not None:
+        try:
+            return str(path.relative_to(source_root))
+        except ValueError:
+            pass
+    return path.name
+
+
 def _register_bronze(store: DocumentStore, sha: str, source_bytes: bytes,
-                     path: str, *, encryption: str | None) -> None:
+                     path: str, *, encryption: str | None,
+                     source_root: str | None = None,
+                     source_relpath: str | None = None,
+                     source_mtime: int | None = None) -> None:
     """Bronze steps (contract section 8).
 
     ``register_bronze`` runs FIRST so the first insert carries
     encryption (and source_root); re-registering never clobbers those.
     ``store_bronze_bytes`` re-registers idempotently inside.
+
+    R15 source identity: the bronze manifest records the sha256 of the
+    source bytes (the bronze hash itself), size, mtime, the path
+    relative to its source root, and the ingest-time absolute path
+    (via the alias table). ``verify_source_integrity`` checks alias
+    paths against the stored hash.
     """
     # R11 source root: deferred (nullable per contract); W1's facade
     # path also passes None. Populating it is a coordinator call.
-    store.register_bronze(sha, len(source_bytes), source_root=None,
-                          encryption=encryption)
+    store.register_bronze(sha, len(source_bytes), source_root=source_root,
+                          encryption=encryption,
+                          source_relpath=source_relpath,
+                          source_mtime=source_mtime)
     store.store_bronze_bytes(sha, source_bytes)
     store.add_alias(sha, path)
 
@@ -1329,24 +1664,38 @@ def _mark_stale_children(store: DocumentStore, old_ids: set[str],
         st = store.get(stale_id)
         if st is None or st.re_review:
             continue
-        st.re_review = True
-        st.status_reason = "derivation-superseded"
         arts = store.get_artifacts(stale_id)
         bronze_hash = arts[0]["bronze_hash"] if arts else st.source_sha256
-        _persist_silver_doc(store, st,
-                            _stored_derivation(store, st, ctx),
-                            bronze_hash)
+        if st.status in (lifecycle.VALIDATED, lifecycle.REREVIEW):
+            # R13: a superseded validated doc goes through re_extract ->
+            # rereview (validated values kept), not a bare flag flip.
+            res = _fire_reextract(store, st, True,
+                                  reason="derivation-superseded")
+            if not res.noop:
+                _persist_silver_doc(store, st,
+                                    _stored_derivation(store, st, ctx),
+                                    bronze_hash)
+        else:
+            st.re_review = True
+            st.status_reason = "derivation-superseded"
+            _persist_silver_doc(store, st,
+                                _stored_derivation(store, st, ctx),
+                                bronze_hash)
 
 
 def _ingest_file_medallion(path: Path, source_bytes: bytes, suffix: str,
                            store: DocumentStore, *,
-                           hook_notes: list[dict] | None = None
+                           hook_notes: list[dict] | None = None,
+                           source_root: Path | None = None
                            ) -> list[Document]:
     """One file through the medallion flow (contract section 8).
 
     sha -> derivation-cache check (I2 no-op on hit) -> R5 PageBundle ->
     bronze steps -> single-txn derive (I7: bronze_text-classify-split-
     extract-silver_doc-artifacts) -> W3 duplicate hooks (advisory).
+
+    ``source_root`` is the ingest root for R15 source identity
+    (root-relative path); None when ingesting a lone file.
     """
     sha = hashlib.sha256(source_bytes).hexdigest()
     doc_id = source_doc_id(source_bytes)
@@ -1357,9 +1706,17 @@ def _ingest_file_medallion(path: Path, source_bytes: bytes, suffix: str,
         store.register_bronze(sha, len(source_bytes))
         store.add_alias(sha, str(path))
         return _docs_for_bronze(store, sha)
-    bundle = _page_bundle_for(path, source_bytes, suffix, store)
+    bundle = _page_bundle_for(path, source_bytes, suffix, store,
+                              source_root=source_root)
+    try:
+        source_mtime = int(path.stat().st_mtime)
+    except OSError:
+        source_mtime = None
     _register_bronze(store, sha, source_bytes, str(path),
-                     encryption=bundle.encryption)
+                     encryption=bundle.encryption,
+                     source_root=(str(source_root) if source_root else None),
+                     source_relpath=_relpath(source_root, path),
+                     source_mtime=source_mtime)
     notes: list[dict] = []
     with store.txn():
         old_ids = {d.doc_id for d in _docs_for_bronze(store, sha)}
@@ -1380,7 +1737,8 @@ def _ingest_file_medallion(path: Path, source_bytes: bytes, suffix: str,
     return docs
 
 
-def ingest_file(path: Path, store: DocumentStore) -> list[Document]:
+def ingest_file(path: Path, store: DocumentStore,
+                *, source_root: str | Path | None = None) -> list[Document]:
     """Ingest one file; returns the Document(s) created.
 
     Usually one Document per file. A file holding several form sections
@@ -1391,7 +1749,8 @@ def ingest_file(path: Path, store: DocumentStore) -> list[Document]:
     R4: doc_id derives from the source bytes; re-ingest is idempotent
     and never overwrites validated values (a derivation-version bump
     that disagrees flags re_review). R5: PDFs go through the
-    text-sufficiency gate.
+    text-sufficiency gate. ``source_root`` feeds R15 source identity
+    (root-relative path); None for lone files.
     Raises _SkipFile for skipped files (R6 accounting); other
     exceptions propagate to ingest_dir's errored accounting.
     """
@@ -1403,7 +1762,9 @@ def ingest_file(path: Path, store: DocumentStore) -> list[Document]:
         raise _SkipFile(RC_READ_FAILED)
     if suffix not in PDF_EXTS | TXT_EXTS | IMAGE_EXTS:
         raise _SkipFile(RC_UNSUPPORTED_TYPE)
-    return _ingest_file_medallion(path, source_bytes, suffix, store)
+    root = Path(source_root) if source_root is not None else None
+    return _ingest_file_medallion(path, source_bytes, suffix, store,
+                                  source_root=root)
 
 
 # -- R6: directory walk + accounting ----------------------------------------
@@ -1496,7 +1857,8 @@ def ingest_dir(input_dir: str | Path, store: DocumentStore) -> IngestReport:
             notes: list[dict] = []
             docs = _ingest_file_medallion(path, source_bytes,
                                           path.suffix.lower(), store,
-                                          hook_notes=notes)
+                                          hook_notes=notes,
+                                          source_root=root)
             for n in notes:
                 report.hook_notes.append({"file": _rel(root, path), **n})
         except _SkipFile as skip:
@@ -1518,8 +1880,15 @@ def ingest_dir(input_dir: str | Path, store: DocumentStore) -> IngestReport:
             if source_bytes is not None:
                 source_sha = hashlib.sha256(source_bytes).hexdigest()
                 doc_id = source_doc_id(source_bytes)
+                try:
+                    source_mtime = int(path.stat().st_mtime)
+                except OSError:
+                    source_mtime = None
                 _register_bronze(store, source_sha, source_bytes,
-                                 str(path), encryption=None)
+                                 str(path), encryption=None,
+                                 source_root=str(root),
+                                 source_relpath=_relpath(root, path),
+                                 source_mtime=source_mtime)
             else:
                 doc_id = source_doc_id(
                     f"unreadable:{path}".encode("utf-8"))
@@ -1596,12 +1965,17 @@ def _mark_orphaned(store: DocumentStore, doc: Document,
                    bronze_hash: str | None) -> None:
     """Flip a silver doc to ORPHANED, preserving values and derivation.
 
-    Validated values are untouched (only status/status_reason change).
-    Tombstone/legacy docs (no bronze hash) go through the facade upsert,
-    whose bronze handling re-attaches them correctly.
+    R13: via the source_missing event (actor=system); validated values
+    are untouched (only status/status_reason change). Tombstone/legacy
+    docs (no bronze hash) go through the facade upsert, whose bronze
+    handling re-attaches them correctly.
     """
-    doc.status = "ORPHANED"
-    doc.status_reason = "source-missing"
+    res = _check_transition(
+        lifecycle.transition(doc, lifecycle.SOURCE_MISSING,
+                             actor=lifecycle.SYSTEM, store=store),
+        doc)
+    if res.noop:
+        return
     if bronze_hash is None:
         store.upsert(doc)
         return

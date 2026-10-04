@@ -23,12 +23,18 @@ signatures and return shapes):
         --deskew --rotate-pages --sidecar). Returns:
         {"ok": bool, "text": str, "mean_confidence": float | None,
          "attempts": [attempt, ...], "reason_code": str | None,
-         "engine": str | None, "engine_version": str | None}
+         "engine": str | None, "engine_version": str | None,
+         "words": [{"text", "bbox", "conf", "page"}] | None}
         where one attempt is
         {"mode": str, "engine": str | None, "engine_version": str | None,
          "ok": bool, "chars": int, "mean_confidence": float | None,
          "reason_code": str | None}.
         ``ocr_pdf`` itself always returns exactly one attempt record.
+        "words" (R15) carries tesseract TSV word boxes for the tesseract
+        fallback only: each word is {"text": str, "bbox": [x0,y0,x1,y1]
+        in PDF points bottom-left origin, "conf": float, "page": int
+        (0-based within src)}. None when the engine provides no word
+        boxes (ocrmypdf path) or OCR failed.
         Never modifies ``src``. All outputs go under ``work_dir``.
 
     ocr_with_escalation(src: Path, work_dir: Path,
@@ -272,7 +278,23 @@ def _fail(mode, reason_code, attempts=()):
         "reason_code": reason_code,
         "engine": None,
         "engine_version": None,
+        "words": None,
     }
+
+
+def _png_size(png: Path) -> tuple[int, int] | None:
+    """(width, height) of a PNG from its IHDR chunk (stdlib only)."""
+    try:
+        with open(png, "rb") as fh:
+            header = fh.read(33)
+        if len(header) < 33 or header[:8] != b"\x89PNG\r\n\x1a\n":
+            return None
+        import struct
+
+        width, height = struct.unpack(">II", header[16:25])
+        return width, height
+    except (OSError, struct.error):
+        return None
 
 
 def _pages_needing_ocr(src: Path, mode: str):
@@ -368,6 +390,8 @@ def _run_ocrmypdf(src, mode, work_dir, tmp, engine_version):
         "reason_code": reason,
         "engine": "ocrmypdf",
         "engine_version": engine_version,
+        # The plain-text sidecar carries no word boxes (R15).
+        "words": None,
     }
 
 
@@ -422,23 +446,39 @@ def _run_tesseract(src, mode, work_dir, tmp, engine_version):
             preexec_fn=lambda: os.umask(0o077),
         )
         if proc.returncode != 0:
-            return "", None
+            return "", None, None
         txt = out.with_suffix(".txt")
         tsv = out.with_suffix(".tsv")
         text = txt.read_text(encoding="utf-8",
                              errors="replace") if txt.exists() else ""
-        return text, _mean_confidence_from_tsv(tsv)
+        words = None
+        if tsv.exists():
+            from .provenance import words_from_tsv
+
+            size = _png_size(png)
+            if size is not None:
+                w, h = size
+                words = words_from_tsv(
+                    tsv.read_text(encoding="utf-8", errors="replace"),
+                    w, h, dpi=_DPI)
+                # 0-based page within src (n is 1-based).
+                for word in words:
+                    word["page"] = n - 1
+        return text, _mean_confidence_from_tsv(tsv), words
 
     texts, confs = [], []
+    all_words: list = []
     try:
         for n in pages:
             png = render_page(n)
             if png is None:
                 return fail(RC_OCR_FAILED)
-            text, conf = ocr_page(png, n)
+            text, conf, words = ocr_page(png, n)
             texts.append(text)
             if conf is not None:
                 confs.append(conf)
+            if words:
+                all_words.extend(words)
     except subprocess.TimeoutExpired:
         return fail(RC_TIMEOUT)
     except Exception:
@@ -456,6 +496,7 @@ def _run_tesseract(src, mode, work_dir, tmp, engine_version):
         "reason_code": None,
         "engine": "tesseract",
         "engine_version": engine_version,
+        "words": all_words or None,
     }
 
 

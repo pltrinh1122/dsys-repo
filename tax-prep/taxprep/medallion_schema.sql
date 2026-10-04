@@ -33,6 +33,10 @@ CREATE TABLE bronze (
     hash TEXT PRIMARY KEY,            -- sha256 hex of source bytes
     size INTEGER NOT NULL,            -- -1 = unknown (legacy tombstones)
     source_root TEXT,                 -- R11 source root, nullable
+    source_relpath TEXT,              -- R15: path relative to source_root
+                                      --   (ingest dir); NULL when unknown
+    source_mtime INTEGER,             -- R15: source mtime, epoch seconds
+                                      --   (volatile: excluded from db_digest)
     first_seen TEXT NOT NULL,         -- ISO-8601 UTC
     last_seen TEXT NOT NULL,
     selection_state TEXT NOT NULL DEFAULT 'selected',  -- selected|deselected

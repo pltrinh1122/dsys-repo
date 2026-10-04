@@ -91,7 +91,10 @@ _TRANSCRIPT_PARSERS = {
 
 # statuses a transcript may still be parsed under: a "needs_review" doc
 # whose only unparsed lines are headers is usable, not skipped.
-_USABLE_STATUSES = ("transcribed", "validated", "needs_review")
+_USABLE_STATUSES = ("transcribed", "validated", "needs_review",
+                    # R13: error-route docs keep the visibility they had as
+                    # needs_review (lifecycle.UNVALIDATED_EXTRACTED).
+                    "errored")
 
 
 def parser_for(form_type: str):

@@ -29,11 +29,17 @@ FORM_TYPES = [
 ]
 
 STATUSES = (
+    # R13 lifecycle states (taxprep/lifecycle.py owns the transition
+    # table). R1 legacy spellings retained verbatim for back-compat.
+    "discovered",
+    "selected",
+    "unselected",
     "transcribed",
     "needs_review",
     "validated",
-    # R1: multi-form / blocked / orphaned documents (other workstreams
-    # check these: R2 refuses validation, R3 refuses carryforward).
+    "rereview",
+    "errored",
+    "excluded",
     "MULTI_FORM",
     "BLOCKED",
     "ORPHANED",
@@ -69,8 +75,9 @@ class Document:
     re_review: bool = False
     # R5: text provenance -- operational metadata, not taxpayer data, so
     # these cross the MCP boundary as non-PII keys.
-    # text_source: "native" | "sidecar" | "form-field" | "ocr" |
-    #              "image-pdf" | "broker-csv" | "error" | "blocked"
+    # R15: text_source names WHICH text was actually used:
+    #   "native" | "sidecar:<relpath>" | "form-field" |
+    #   "ocr:<engine>/<mode>" | "broker-csv" | "error" | "blocked"
     text_source: str | None = None
     reason_code: str | None = None
     ocr_engine: str | None = None

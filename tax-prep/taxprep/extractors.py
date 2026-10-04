@@ -35,15 +35,17 @@ phrases or in a form header line.
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
 # Derivation version for the Arc B medallion (contract section 7, W2 owns).
 # "1" is the pre-medallion era (JSONL store, no artifact derivation).
-# Bump on ANY extraction-logic change: a bump rebuilds silver (I6) while
-# preserving Operator decisions. taxprep.silver.derivation_config()
-# carries this into the config hash.
-EXTRACTOR_VERSION = "2"
+# "2" added medallion derivation. "3" adds R15 field provenance
+# (extraction-time char spans, verbatim transcript evidence, derived
+# transcript confidences). Bump on ANY extraction-logic change: a bump
+# rebuilds silver (I6) while preserving Operator decisions.
+# taxprep.silver.derivation_config() carries this into the config hash.
+EXTRACTOR_VERSION = "3"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -89,8 +91,18 @@ def _paren_negated(m: "re.Match") -> bool:
     return pre.rstrip("$ \t").endswith("(")
 
 
-def _field(value, confidence, raw_text):
-    return {"value": value, "confidence": confidence, "raw_text": raw_text}
+def _field(value, confidence, raw_text, span=None):
+    """One field entry.
+
+    ``span`` is the transient ``(start, end)`` match offset in the
+    extraction text (R15): ingest's provenance attachment converts it to
+    the ``provenance`` dict and removes it, so it never persists.
+    """
+    entry = {"value": value, "confidence": confidence,
+             "raw_text": raw_text}
+    if span is not None:
+        entry["_extract_span"] = span
+    return entry
 
 
 def _missing_field():
@@ -99,11 +111,12 @@ def _missing_field():
 
 
 def _money_search(patterns, text):
-    """Return (value, raw_text, is_labeled) for the first money pattern that
-    matches. ``patterns`` is a list of (regex, labeled_bool). ``labeled``
+    """Return (value, raw_text, is_labeled, span) for the first money pattern
+    that matches. ``patterns`` is a list of (regex, labeled_bool). ``labeled``
     patterns drive "high" confidence; unlabeled ones drive "medium".
     Values are canonical Decimal-safe strings (see _parse_money);
     parenthesized negatives ("($1,234.56)") come back with a "-" prefix.
+    ``span`` is the (start, end) match offset in ``text`` (R15), or None.
     """
     for pattern, labeled in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
@@ -113,14 +126,15 @@ def _money_search(patterns, text):
                 continue
             if _paren_negated(m) and not value.startswith("-"):
                 value = "-" + value
-            return value, m.group(0), labeled
-    return None, "", False
+            return value, m.group(0), labeled, (m.start(), m.end())
+    return None, "", False, None
 
 
 def _str_search(patterns, text):
-    """Return (value, raw_text, is_labeled) for the first string pattern that
-    matches. ``patterns`` is a list of (regex, labeled_bool, group_index or
-    callable transforming the match into the value).
+    """Return (value, raw_text, is_labeled, span) for the first string pattern
+    that matches. ``patterns`` is a list of (regex, labeled_bool, group_index
+    or callable transforming the match into the value). ``span`` is the
+    (start, end) match offset in ``text`` (R15), or None.
     """
     for pattern, labeled, transform in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
@@ -130,8 +144,8 @@ def _str_search(patterns, text):
             else:
                 value = m.group(transform).strip()
             if value:
-                return value, m.group(0), labeled
-    return None, "", False
+                return value, m.group(0), labeled, (m.start(), m.end())
+    return None, "", False, None
 
 
 def _box_field(text, label_patterns, box_num, value_transform=None):
@@ -143,9 +157,9 @@ def _box_field(text, label_patterns, box_num, value_transform=None):
     high_pats = [(p, True) for p, _ in label_patterns]
     # Normalize: wrap each high pattern so group(1) is the amount. label
     # patterns are written with the money group as group(1).
-    value, raw, labeled = _money_search(high_pats, text)
+    value, raw, labeled, span = _money_search(high_pats, text)
     if value is not None:
-        return _field(value, "high", raw)
+        return _field(value, "high", raw, span)
     fallback = re.compile(
         r"Box\s*" + re.escape(str(box_num)) + r"[^\d\n]*?\$?" + _MONEY_RE_NODOLLAR,
         re.IGNORECASE,
@@ -156,7 +170,7 @@ def _box_field(text, label_patterns, box_num, value_transform=None):
         if value is not None:
             if _paren_negated(m) and not value.startswith("-"):
                 value = "-" + value
-            return _field(value, "medium", m.group(0))
+            return _field(value, "medium", m.group(0), (m.start(), m.end()))
     return _missing_field()
 
 
@@ -250,22 +264,28 @@ _FORM_REFERENCE_RE = re.compile(
 )
 
 
-def _strip_form_references(text: str) -> str:
-    """Remove parenthesized "(Form 1040)"-style mentions."""
-    return _FORM_REFERENCE_RE.sub(" ", text)
-
-
 def _find_title_anchors(text: str) -> list[tuple[int, int, str]]:
     """All (start, end, form_type) title-anchor matches, in position order.
 
     Overlaps resolve to the earliest start, then the longest match, then
     table order (so "Form 1040-X" beats "Form 1040" at the same start).
+
+    Parenthesized "(Form 1040)"-style mentions are references, not
+    titles: anchors overlapping a reference region are dropped. (The
+    section text itself is NOT stripped -- R15 needs it verbatim so
+    character offsets translate exactly into stored per-page text.)
     """
+    ref_spans = [m.span() for m in _FORM_REFERENCE_RE.finditer(text)]
+
+    def _in_reference(start: int, end: int) -> bool:
+        return any(rs < end and start < re_ for rs, re_ in ref_spans)
+
     cands: list[tuple[int, int, str]] = []
     order = {ft: i for i, (ft, _p, _l) in enumerate(_FORM_TITLE_ANCHORS)}
     for form_type, rx in _ANCHOR_RES:
         for m in rx.finditer(text):
-            cands.append((m.start(), m.end(), form_type))
+            if not _in_reference(m.start(), m.end()):
+                cands.append((m.start(), m.end(), form_type))
     # Bare "RETURN TRANSCRIPT" counts as a transcript title only with 1040
     # nearby (legacy rule, kept).
     if "1040" in text.upper() and not re.search(
@@ -305,6 +325,13 @@ class FormSection:
     ``form_type`` is None for untyped spans (no title anchor) and for
     excluded instruction/notice sections. ``page_start``/``page_end`` are
     1-based, inclusive.
+
+    ``page_spans`` (R15) maps ``text`` offsets back to source pages:
+    ``[(page_1based, start, end), ...]`` with
+    ``text[start:end]`` verbatim from that page's stored text. The
+    section text is built from verbatim page substrings (form
+    references are filtered at anchor-detection time, never stripped
+    from the text), so character offsets translate exactly.
     """
 
     form_type: str | None
@@ -312,6 +339,7 @@ class FormSection:
     page_start: int
     page_end: int
     excluded: bool = False
+    page_spans: list = field(default_factory=list)
 
 
 def split_form_sections(pages: list[str]) -> list[FormSection]:
@@ -327,11 +355,14 @@ def split_form_sections(pages: list[str]) -> list[FormSection]:
     """
     sections: list[FormSection] = []
     for pageno, page in enumerate(pages, start=1):
-        text = _strip_form_references(page)
-        head, tail = text, ""
-        m = _EXCLUDED_HEADING_RE.search(text)
+        # NOTE (R15): the section text keeps the page VERBATIM -- form
+        # references are filtered inside _find_title_anchors, never
+        # stripped from the text, so page_spans offsets translate
+        # exactly into stored per-page text.
+        head, tail = page, ""
+        m = _EXCLUDED_HEADING_RE.search(page)
         if m:
-            head, tail = text[: m.start()], text[m.start():]
+            head, tail = page[: m.start()], page[m.start():]
         anchors = _find_title_anchors(head)
         cur_type: str | None = None
         cur_start = 0
@@ -340,12 +371,14 @@ def split_form_sections(pages: list[str]) -> list[FormSection]:
                 chunk = head[cur_start:start]
                 if cur_type is not None or chunk.strip():
                     sections.append(
-                        FormSection(cur_type, chunk, pageno, pageno)
+                        FormSection(cur_type, chunk, pageno, pageno,
+                                    page_spans=[(pageno, 0, len(chunk))])
                     )
                 cur_type, cur_start = form_type, start
         rest = head[cur_start:]
         if cur_type is not None or rest.strip():
-            sections.append(FormSection(cur_type, rest, pageno, pageno))
+            sections.append(FormSection(cur_type, rest, pageno, pageno,
+                                        page_spans=[(pageno, 0, len(rest))]))
         if tail.strip():
             sections.append(
                 FormSection(None, tail, pageno, pageno, excluded=True)
@@ -359,7 +392,11 @@ def split_form_sections(pages: list[str]) -> list[FormSection]:
             and not merged[-1].excluded
         ):
             prev = merged[-1]
+            base = len(prev.text)
             prev.text += sec.text
+            prev.page_spans.extend(
+                (p, base + s, base + e) for p, s, e in sec.page_spans
+            )
             prev.page_end = sec.page_end
         else:
             merged.append(sec)
@@ -514,7 +551,7 @@ def _extract_w2(text: str) -> dict:
 
     # Box 12: code + amount, value as string like "D 9500.00".
     # Decimal-exact (never float): the string is the contract.
-    v, raw, labeled = _str_search(
+    v, raw, labeled, span = _str_search(
         [
             (
                 r"Box\s*12[^\nA-Z]*?\b([A-Z]{1,2})\s+" + _MONEY_RE_NODOLLAR,
@@ -530,13 +567,13 @@ def _extract_w2(text: str) -> dict:
         text,
     )
     fields["12"] = (
-        _field(v, "high" if labeled else "medium", raw)
+        _field(v, "high" if labeled else "medium", raw, span)
         if v is not None
         else _missing_field()
     )
 
     # Box 14: other, free-form string.
-    v, raw, labeled = _str_search(
+    v, raw, labeled, span = _str_search(
         [
             (r"Other\s+14\s*[:\-]?\s*([^\n]{1,60})", True, 1),
             (r"\b14\b\s*[:\-]?\s*([^\n]{1,60})", False, 1),
@@ -544,13 +581,13 @@ def _extract_w2(text: str) -> dict:
         text,
     )
     fields["14"] = (
-        _field(v, "high" if labeled else "medium", raw)
+        _field(v, "high" if labeled else "medium", raw, span)
         if v is not None
         else _missing_field()
     )
 
     # Employer EIN.
-    v, raw, labeled = _str_search(
+    v, raw, labeled, span = _str_search(
         [
             (r"EIN\b[^\d]*(\d{2}-\d{7})", True, 1),
             (r"Employer'?s?\s+(?:federal\s+)?identification\s+number[^\d]*(\d{2}-\d{7})", True, 1),
@@ -559,13 +596,13 @@ def _extract_w2(text: str) -> dict:
         text,
     )
     fields["employer_ein"] = (
-        _field(v, "high" if labeled else "medium", raw)
+        _field(v, "high" if labeled else "medium", raw, span)
         if v is not None
         else _missing_field()
     )
 
     # Employer name.
-    v, raw, labeled = _str_search(
+    v, raw, labeled, span = _str_search(
         [
             (r"Employer'?s?\s+name[^\n:]*[:\-]?\s*([^\n]{1,60})", True, 1),
             (r"Box\s*[bc]\s*[:\-]?\s*([^\n]{1,60})", False, 1),
@@ -573,7 +610,7 @@ def _extract_w2(text: str) -> dict:
         text,
     )
     fields["employer_name"] = (
-        _field(v, "high" if labeled else "medium", raw)
+        _field(v, "high" if labeled else "medium", raw, span)
         if v is not None
         else _missing_field()
     )
@@ -757,12 +794,12 @@ def _extract_one_lot(segment: str) -> tuple[dict, bool]:
     lot: dict = {}
     proceeds_labeled = False
     for key, pats in _LOT_MONEY_PATTERNS.items():
-        v, _raw, labeled = _money_search(pats, segment)
+        v, _raw, labeled, _span = _money_search(pats, segment)
         lot[key] = v
         if key == "proceeds_1d" and v is not None:
             proceeds_labeled = labeled
     for key, pats in _LOT_STR_PATTERNS.items():
-        v, _raw, _labeled = _str_search(pats, segment)
+        v, _raw, _labeled, _span = _str_search(pats, segment)
         lot[key] = v.strip() if isinstance(v, str) else None
         if not lot[key]:
             lot[key] = None
@@ -884,12 +921,13 @@ def _extract_summary_totals(text: str) -> dict:
     the document, never fails it)."""
     totals: dict = {}
     raw_spans: list[str] = []
+    match_spans: list[tuple[int, int]] = []
     for cat, cat_label in (("short", r"Short[\s-]*term"),
                            ("long", r"Long[\s-]*term")):
         cat_totals: dict = {}
         for key, labels in _SUMMARY_KINDS.items():
             label_alt = "(?:" + "|".join(labels) + ")"
-            v, raw, _labeled = _money_search(
+            v, raw, _labeled, span = _money_search(
                 [
                     (r"(?:Totals?|Subtotals?)\s+" + cat_label + r"\s+"
                      + label_alt + r"[^\n\d$]*" + _MONEY_RE, True),
@@ -901,11 +939,15 @@ def _extract_summary_totals(text: str) -> dict:
             if v is not None:
                 cat_totals[key] = v
                 raw_spans.append(raw)
+                if span is not None:
+                    match_spans.append(span)
         if cat_totals:
             totals[cat] = cat_totals
     if not totals:
         return _missing_field()
-    return _field(totals, "high", "\n".join(raw_spans))
+    span = ((min(s for s, _ in match_spans),
+             max(e for _, e in match_spans)) if match_spans else None)
+    return _field(totals, "high", "\n".join(raw_spans), span)
 
 
 def _extract_1099_b(text: str) -> dict:
@@ -915,6 +957,7 @@ def _extract_1099_b(text: str) -> dict:
     all_labeled = True
     any_proceeds = False
     lot_raw: list[str] = []
+    lot_spans: list[tuple[int, int]] = []  # R15: per-lot evidence spans
     # F1b: section headings ("Short-term covered", ...) name the term
     # and covered flag for every lot in the section. A lot's own
     # segment wins when it names them; otherwise the nearest preceding
@@ -932,6 +975,10 @@ def _extract_1099_b(text: str) -> dict:
         # A heading line inside a segment's span belongs to the
         # section, not to the lot: strip it before per-lot detection
         # so one section's heading cannot set the previous lot's term.
+        # The R15 span covers the whole original segment (heading lines
+        # included): it is the lot's evidence region, and the strip only
+        # affects term/covered detection, never the stored offsets.
+        seg_span = (start, start + len(seg))
         seg = _strip_heading_lines(seg)
         lot, proceeds_labeled = _extract_one_lot(seg)
         if lot["term"] is None or lot["covered"] is None:
@@ -949,21 +996,26 @@ def _extract_1099_b(text: str) -> dict:
             continue  # no lot-like content in this segment
         lots.append(lot)
         lot_raw.append(seg.strip())
+        lot_spans.append(seg_span)
         if lot["proceeds_1d"] is not None:
             any_proceeds = True
             all_labeled = all_labeled and proceeds_labeled
     if lots and any_proceeds:
         fields["lots"] = _field(
-            lots, "high" if all_labeled else "medium", "\n".join(lot_raw))
+            lots, "high" if all_labeled else "medium", "\n".join(lot_raw),
+            (lot_spans[0][0], lot_spans[-1][1]))
+        fields["lots"]["_lot_spans"] = lot_spans
     elif lots:
         # Lots parsed but no proceeds anywhere: present but malformed.
-        fields["lots"] = _field(lots, "low", "\n".join(lot_raw))
+        fields["lots"] = _field(lots, "low", "\n".join(lot_raw),
+                                (lot_spans[0][0], lot_spans[-1][1]))
+        fields["lots"]["_lot_spans"] = lot_spans
     else:
         fields["lots"] = _missing_field()
 
     fields["summary_totals"] = _extract_summary_totals(text)
 
-    v, raw, labeled = _str_search(
+    v, raw, labeled, span = _str_search(
         [
             (r"Payer'?s?\s+name[^\n:]*[:\-]?\s*([^\n]{1,60})", True, 1),
             (r"Broker[^\n:]*[:\-]?\s*([^\n]{1,60})", True, 1),
@@ -971,7 +1023,7 @@ def _extract_1099_b(text: str) -> dict:
         text,
     )
     fields["broker"] = (
-        _field(v, "high" if labeled else "medium", raw)
+        _field(v, "high" if labeled else "medium", raw, span)
         if v is not None
         else _missing_field()
     )
@@ -1031,7 +1083,7 @@ def _extract_1099_r(text: str) -> dict:
     fields["2a"] = _box_field(
         text, [(r"Taxable\s+amount[^\n\d$]*" + _MONEY_RE, 1)], "2a"
     )
-    v, raw, labeled = _str_search(
+    v, raw, labeled, span = _str_search(
         [
             (r"Distribution\s+code\s*(?:\(s\))?\s*[:\-]?\s*([A-Z0-9]{1,3})", True, 1),
             (r"\bcode\s*7\b\s*[:\-]?\s*([A-Z0-9]{1,3})", False, 1),
@@ -1040,7 +1092,7 @@ def _extract_1099_r(text: str) -> dict:
         text,
     )
     fields["7"] = (
-        _field(v, "high" if labeled else "medium", raw)
+        _field(v, "high" if labeled else "medium", raw, span)
         if v is not None
         else _missing_field()
     )

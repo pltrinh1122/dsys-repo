@@ -490,7 +490,8 @@ def test_verify_all_year_scoping(tmp_path):
                                 "transcript_reconciliation",
                                 "carryforward_ready",
                                 "extraction_yield",
-                                "roa_corroboration"}
+                                "roa_corroboration",
+                                "source_integrity"}  # R15
     assert r["checks"]["extraction_yield"]["checks"]["zero_yield"]["passed"] is True
     assert r["checks"]["roa_corroboration"]["applicable"] is True  # R17 landed
     _pii_free(r["checks"]["extraction_yield"])

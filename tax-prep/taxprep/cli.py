@@ -12,6 +12,7 @@ from pathlib import Path
 
 from . import bus as bus_mod
 from . import config as taxprep_config
+from . import lifecycle
 from .ingest import ingest_dir
 from .models import FORM_TYPES
 from .review import DEFAULT_PORT, add_token_argument, serve_forever
@@ -539,7 +540,7 @@ def cmd_relevance_override(args: argparse.Namespace) -> int:
 def cmd_validation_queue(args: argparse.Namespace) -> int:
     store = _store(args.data_dir)
     docs = [d for d in store.list(year=args.year, form=args.form)
-            if d.status in ("transcribed", "needs_review")]
+            if d.status in lifecycle.UNVALIDATED_EXTRACTED]
     hidden = [d for d in docs if d.relevance == "irrelevant"]
     if not args.include_irrelevant:
         docs = [d for d in docs if d.relevance != "irrelevant"]
@@ -608,6 +609,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 def cmd_exclude(args: argparse.Namespace) -> int:
     from . import exclusions as excl_mod
+    from . import silver as silver_mod
 
     store = _store(args.data_dir)
     doc_id = _resolve_doc_id(store, args.doc_id)
@@ -616,6 +618,29 @@ def cmd_exclude(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    doc = store.get(doc_id)
+    # R13: the exclusion also moves the doc through the lifecycle
+    # (any non-terminal --exclude(operator)--> excluded). Terminal
+    # docs keep the file record; the transition refusal is loud.
+    if doc is not None:
+        with store.txn():
+            res = lifecycle.transition(
+                doc, lifecycle.EXCLUDE, actor=lifecycle.OPERATOR,
+                event_input=lifecycle.ExcludeInput(reason=args.reason),
+                store=store)
+            if not res.ok:
+                print(f"warning: lifecycle exclude refused "
+                      f"({res.reason_code}); doc stays {doc.status}",
+                      file=sys.stderr)
+            elif not res.noop:
+                bronze_hash = silver_mod.bronze_hash_for_doc(store, doc)
+                if bronze_hash is None:
+                    store.upsert(doc)
+                else:
+                    silver_mod.persist_silver_doc(
+                        store, doc,
+                        silver_mod.derivation_for_doc(store, doc.doc_id),
+                        bronze_hash)
     # Medallion record (Arc B): the exclusion also lands in the append-only
     # decision log so gold's input digest and audit trail see the same
     # disposal. Best-effort -- the file record above is authoritative.

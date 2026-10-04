@@ -150,7 +150,9 @@ def test_reingest_disagreement_keeps_validated_values_flags_rereview(
     monkeypatch.setattr(ingest, "_extract_for_type", _disagree)
     monkeypatch.setattr(extractors, "EXTRACTOR_VERSION", "9")
     again = ingest_file(src, iso["store"])[0]
-    assert again.status == "validated"          # status never overwritten
+    # R13: disagreement moves validated -> rereview (validated values
+    # kept); it no longer stays "validated".
+    assert again.status == "rereview"
     assert again.fields["1"]["value"] == validated_value  # kept
     assert again.re_review is True
     assert again.status_reason == "extraction-disagrees"
@@ -168,7 +170,8 @@ def test_sidecar_text_attaches_to_same_doc_id(iso):
     assert len(iso["store"]) == 1
     d2 = iso["store"].get(first_id)
     assert d2 is not None
-    assert d2.text_source == "sidecar"
+    # R15/P1: text_source names the sidecar that was actually used
+    assert d2.text_source == "sidecar:scan.txt"
     assert "Box 1 Wages" in iso["store"].load_ocr(first_id)
     assert rep.files_seen == 1  # the sidecar is claimed, not a 2nd file
 
@@ -312,7 +315,9 @@ def test_ocr_path_records_provenance(iso, monkeypatch):
     monkeypatch.setattr("taxprep.ocr.available", lambda: True)
 
     doc = ingest_file(png, iso["store"])[0]
-    assert doc.text_source == "ocr"
+    # R15: text_source names the engine and mode actually used
+    assert doc.text_source == f"ocr:tesseract/{doc.ocr_mode}"
+    assert doc.text_source.startswith("ocr:")
     assert doc.ocr_engine == "tesseract"
     assert doc.engine_version == "5.3.4"
     assert doc.ocr_mode in ("skip-text", "redo-ocr", "force-ocr")
@@ -373,7 +378,8 @@ def test_errored_uses_reason_code_not_exception_text(iso, monkeypatch):
     blob = repr(rep.summary())
     assert "Kaboom" not in blob and "secret" not in blob
     err_doc = rep.docs[0]
-    assert err_doc.status == "needs_review"
+    # R13: the error route is its own lifecycle state (was needs_review).
+    assert err_doc.status == "errored"
     assert err_doc.status_reason == "extract-failed"
     assert "Kaboom" not in iso["store"].load_ocr(err_doc.doc_id)
 
@@ -456,16 +462,25 @@ ROA_TEXT = ("RECORD OF ACCOUNT\nTax Year: 2024\n"
 def test_account_transcript_fields_branch():
     fields, status = ingest._fields_from_transcript(
         "ACCOUNT_TRANSCRIPT", ACCOUNT_TEXT, 2024)
-    # balance/accrual lines: high confidence, verbatim raw_text (R15)
-    assert fields["account_balance"] == {
-        "value": "1234.56", "confidence": "high",
-        "raw_text": "Account Balance: $1,234.56"}
+    # balance/accrual lines: derived confidence, verbatim raw_text (R15)
+    assert fields["account_balance"]["value"] == "1234.56"
+    assert fields["account_balance"]["confidence"] == "high"
+    assert fields["account_balance"]["raw_text"] == \
+        "Account Balance: $1,234.56"
+    # the extraction span addresses the verbatim line in the input text
+    span = fields["account_balance"].pop("_extract_span")
+    assert ACCOUNT_TEXT[span[0]:span[1]] == "Account Balance: $1,234.56"
     assert fields["accrued_interest"]["value"] == "12.34"
     assert fields["accrued_interest"]["confidence"] == "high"
-    # tc_<code> transaction fields, same shape as the return branch
-    assert fields["tc_150"] == {
-        "value": "1234.56", "confidence": "medium",
-        "raw_text": "Tax return filed"}
+    # tc_<code> transaction fields: verbatim raw line (R15/P3), never the
+    # code/date/amount-stripped description
+    tc150 = fields["tc_150"]
+    assert tc150["value"] == "1234.56"
+    assert tc150["confidence"] == "medium"
+    assert tc150["raw_text"] == \
+        "150 Tax return filed 20241205 04-15-2025 $1,234.56"
+    span = tc150.pop("_extract_span")
+    assert ACCOUNT_TEXT[span[0]:span[1]] == tc150["raw_text"]
     assert fields["tc_846"]["value"] == "384.56"
     assert "_unparsed_lines" not in fields
     assert status == "transcribed"
@@ -482,20 +497,29 @@ def test_account_transcript_fields_needs_review():
 def test_roa_fields_merge_both_sections_with_provenance():
     fields, status = ingest._fields_from_transcript(
         "RECORD_OF_ACCOUNT", ROA_TEXT, 2024)
-    # return-section fields carry "return section: <raw>" provenance
+    # R15: raw_text is the verbatim source line (never a synthesized
+    # "section: <raw>" tag); section provenance rides the extraction
+    # span, which addresses the verbatim line in the input text.
     assert fields["agi"]["value"] == 85420.0
     assert fields["agi"]["raw_text"] == \
-        "return section: Adjusted Gross Income: $85,420.00"
+        "Adjusted Gross Income: $85,420.00"
     assert fields["agi"]["confidence"] == "high"
-    # account-section fields carry "account section: <raw>" provenance
+    span = fields["agi"].pop("_extract_span")
+    assert ROA_TEXT[span[0]:span[1]] == fields["agi"]["raw_text"]
     assert fields["account_balance"]["value"] == "0.00"
     assert fields["account_balance"]["raw_text"] == \
-        "account section: Account Balance: $0.00"
-    # tc_<code> fields from both sections, provenance-tagged
+        "Account Balance: $0.00"
+    span = fields["account_balance"].pop("_extract_span")
+    assert ROA_TEXT[span[0]:span[1]] == "Account Balance: $0.00"
+    # tc_<code> fields from both sections, verbatim raw lines
     assert fields["tc_150"]["raw_text"] == \
-        "return section: Tax return filed"
+        "150 Tax return filed 04-15-2025 $12,340.00"
+    span = fields["tc_150"].pop("_extract_span")
+    assert ROA_TEXT[span[0]:span[1]] == fields["tc_150"]["raw_text"]
     assert fields["tc_846"]["raw_text"] == \
-        "account section: Refund issued"
+        "846 Refund issued 20243207 10-05-2025 $0.00"
+    span = fields["tc_846"].pop("_extract_span")
+    assert ROA_TEXT[span[0]:span[1]] == fields["tc_846"]["raw_text"]
     assert status == "transcribed"
 
 
@@ -516,8 +540,11 @@ def test_roa_fields_section_unparsed_tagged():
                             "TAX ACCOUNT TRANSCRIPT\nmystery acct line\n")
     fields, status = ingest._fields_from_transcript(
         "RECORD_OF_ACCOUNT", text, 2024)
-    assert fields["_unparsed_lines"]["value"] == \
-        ["account section: mystery acct line"]
+    # R15: unparsed lines stay verbatim (no synthesized section tag);
+    # the span locates the line in the input text.
+    assert fields["_unparsed_lines"]["value"] == ["mystery acct line"]
+    span = fields["_unparsed_lines"].pop("_extract_span")
+    assert text[span[0]:span[1]] == "mystery acct line"
     assert status == "needs_review"
 
 
@@ -540,8 +567,21 @@ def test_record_of_account_ingests_end_to_end(iso):
     doc = ingest_file(src, iso["store"])[0]
     assert doc.form_type == "RECORD_OF_ACCOUNT"
     assert doc.status == "transcribed"
-    # both sections present, section provenance in raw_text
+    # both sections present; R15: verbatim raw_text + real char_spans
+    # (the transient _extract_span is replaced by provenance at ingest)
     assert doc.fields["agi"]["value"] == 85420.0  # return parser emits floats (pre-existing)
-    assert "return section" in doc.fields["agi"]["raw_text"]
+    assert doc.fields["agi"]["raw_text"] == \
+        "Adjusted Gross Income: $85,420.00"
+    prov = doc.fields["agi"]["provenance"]
+    assert prov["extractor"] == "transcript:1"
+    cs = prov["char_span"]
+    assert cs["page"] == 0
+    assert ROA_TEXT[cs["start"]:cs["end"]] == \
+        "Adjusted Gross Income: $85,420.00"
+    assert "_extract_span" not in doc.fields["agi"]
     assert doc.fields["tc_846"]["value"] == "0.00"
-    assert "account section" in doc.fields["tc_846"]["raw_text"]
+    assert doc.fields["tc_846"]["raw_text"] == \
+        "846 Refund issued 20243207 10-05-2025 $0.00"
+    cs = doc.fields["tc_846"]["provenance"]["char_span"]
+    assert ROA_TEXT[cs["start"]:cs["end"]] == \
+        doc.fields["tc_846"]["raw_text"]
