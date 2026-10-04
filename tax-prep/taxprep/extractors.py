@@ -38,6 +38,13 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
+# Derivation version for the Arc B medallion (contract section 7, W2 owns).
+# "1" is the pre-medallion era (JSONL store, no artifact derivation).
+# Bump on ANY extraction-logic change: a bump rebuilds silver (I6) while
+# preserving Operator decisions. taxprep.silver.derivation_config()
+# carries this into the config hash.
+EXTRACTOR_VERSION = "2"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

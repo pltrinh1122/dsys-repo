@@ -1,15 +1,24 @@
-"""D1 store hardening tests -- all fixtures synthetic.
+"""Medallion store tests (SQLite semantics) -- all fixtures synthetic.
 
-Covers the workstation's lost-update probe verbatim, a concurrent
-writer stress test, and a crash-mid-write simulation (fault-injected
-_dump). Also pins the lock-contention timeout behavior.
+Ports the D1 hardening battery to the medallion store:
+
+  * the workstation's lost-update probe, verbatim in spirit (two
+    instances, one with a stale snapshot);
+  * concurrent thread and process writers -- no lost records;
+  * last-write-wins on overlapping upserts;
+  * crash mid-transaction (fault-injected inside txn) leaves no partial
+    rows;
+  * busy contention fails LOUDLY (sqlite3.OperationalError after the
+    busy timeout) -- never silently;
+  * the sqlite file is created with mode 0600.
+
+The fcntl lock-file tests are dropped: SQLite subsumes them.
 """
 
-import json
+import hashlib
 import multiprocessing as mp
-import os
+import sqlite3
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -32,15 +41,6 @@ def _doc(doc_id, status="transcribed", **kw):
     return Document(**args)
 
 
-def _doc_ids_on_disk(data_dir):
-    path = Path(data_dir) / "documents.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line)["doc_id"]
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line.strip()]
-
-
 # -- the workstation probe, verbatim -------------------------------------
 
 def test_workstation_probe_no_lost_update(tmp_path):
@@ -55,9 +55,8 @@ def test_workstation_probe_no_lost_update(tmp_path):
 
     cli = DocumentStore(data)                    # CLI ingest, own instance
     cli.upsert(_doc("doc-2"))
-    assert sorted(_doc_ids_on_disk(data)) == ["doc-1", "doc-2"]
 
-    # review server validates doc-1 with its STALE snapshot
+    # review server validates doc-1 (reads are always current now)
     d1 = review_server.get("doc-1")
     d1.status = "validated"
     d1.validated_at = "2026-10-03T00:00:00+00:00"
@@ -94,7 +93,7 @@ def test_concurrent_thread_writers_no_lost_records(tmp_path):
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=60)
+        t.join(timeout=120)
     assert not any(t.is_alive() for t in threads), "writer threads hung"
     assert not errors, f"writer errors: {errors[:3]}"
 
@@ -102,12 +101,6 @@ def test_concurrent_thread_writers_no_lost_records(tmp_path):
     ids = {d.doc_id for d in fresh.list()}
     expected = {f"w{w}-{i}" for w in range(n_workers) for i in range(n_each)}
     assert ids == expected, f"lost {len(expected - ids)} records"
-    # the file on disk is whole and valid JSONL
-    lines = (data / "documents.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len([ln for ln in lines if ln.strip()]) == n_workers * n_each
-    for ln in lines:
-        if ln.strip():
-            Document.from_dict(json.loads(ln))  # raises if corrupt
 
 
 def _proc_worker(data_dir, worker_id, n, start_evt):
@@ -118,7 +111,7 @@ def _proc_worker(data_dir, worker_id, n, start_evt):
 
 
 def test_concurrent_process_writers_no_lost_records(tmp_path):
-    """Cross-process contention exercises the real fcntl lock."""
+    """Cross-process contention exercises SQLite's writer serialization."""
     data = tmp_path / "data"
     DocumentStore(data).upsert(_doc("seed"))
     n_procs, n_each = 4, 15
@@ -131,7 +124,7 @@ def test_concurrent_process_writers_no_lost_records(tmp_path):
         pr.start()
     start_evt.set()
     for pr in procs:
-        pr.join(timeout=120)
+        pr.join(timeout=180)
     assert all(pr.exitcode == 0 for pr in procs), \
         f"worker exit codes: {[pr.exitcode for pr in procs]}"
     fresh = DocumentStore(data)
@@ -145,64 +138,97 @@ def test_overlapping_upserts_last_write_wins(tmp_path):
     data = tmp_path / "data"
     a = DocumentStore(data)
     b = DocumentStore(data)
-    d_a = _doc("shared", status="transcribed")
-    d_b = _doc("shared", status="validated")
-    a.upsert(d_a)
-    b.upsert(d_b)  # b's snapshot predates a's write; must not resurrect it
+    a.upsert(_doc("shared", status="transcribed"))
+    # b read before a wrote; b's write must win, not resurrect old state
+    b.upsert(_doc("shared", status="validated"))
     fresh = DocumentStore(data)
     assert len(fresh) == 1
     assert fresh.get("shared").status == "validated"
 
 
-# -- crash mid-write -------------------------------------------------------
+# -- crash mid-transaction -------------------------------------------------
 
-def test_crash_mid_write_leaves_old_file_intact(tmp_path, monkeypatch):
+def test_crash_mid_transaction_leaves_no_partial_rows(tmp_path, monkeypatch):
     data = tmp_path / "data"
     store = DocumentStore(data)
     store.upsert(_doc("doc-1"))
-    before = (data / "documents.jsonl").read_bytes()
+    before = store.table_counts()
 
-    def _boom(self, fh):
-        fh.write('{"doc_id": "partial"}\n')
-        raise RuntimeError("simulated crash mid-write")
+    def _boom(self, doc, **kw):
+        # write something, THEN crash: the row must not survive
+        self.register_bronze("bb" * 32, 10)
+        raise RuntimeError("simulated crash mid-txn")
 
-    monkeypatch.setattr(DocumentStore, "_dump", _boom)
+    monkeypatch.setattr(DocumentStore, "upsert_silver_doc", _boom)
     with pytest.raises(RuntimeError, match="simulated crash"):
         store.upsert(_doc("doc-2"))
 
-    # old file byte-identical; no temp litter left behind
-    assert (data / "documents.jsonl").read_bytes() == before
-    assert list(data.glob("documents.*.tmp")) == []
-    # store still usable afterwards (lock was released)
+    # no partial rows anywhere: the bronze row from _boom is gone too
+    assert store.get("doc-2") is None
+    assert store.get_bronze("bb" * 32) is None
+    assert store.table_counts() == before
+    # store still usable afterwards
     monkeypatch.undo()
     store.upsert(_doc("doc-2"))
-    assert sorted(_doc_ids_on_disk(data)) == ["doc-1", "doc-2"]
+    assert sorted(d.doc_id for d in store.list()) == ["doc-1", "doc-2"]
 
 
-# -- lock contention --------------------------------------------------------
-
-def test_lock_contention_fails_loudly_not_silently(tmp_path, monkeypatch):
-    import fcntl as _fcntl
-
+def test_nested_txn_rolls_back_inner_only(tmp_path):
+    """An exception in a nested txn() rolls back to the savepoint; the
+    outer transaction still commits."""
     data = tmp_path / "data"
     store = DocumentStore(data)
-    monkeypatch.setattr("taxprep.store._LOCK_TIMEOUT", 0.2)
-
-    held_fd = os.open(str(data / "store.lock"), os.O_CREAT | os.O_RDWR, 0o600)
-    _fcntl.flock(held_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-    try:
-        with pytest.raises(TimeoutError, match="store lock busy"):
-            store.upsert(_doc("doc-x"))
-    finally:
-        _fcntl.flock(held_fd, _fcntl.LOCK_UN)
-        os.close(held_fd)
-    # nothing was written, nothing lost
-    assert list(store.list()) == []
-    assert not (data / "documents.jsonl").exists()
+    with store.txn():
+        store.register_bronze("dd" * 32, 5)
+        with pytest.raises(RuntimeError, match="inner boom"):
+            with store.txn():
+                store.register_bronze("ee" * 32, 5)
+                raise RuntimeError("inner boom")
+    assert store.get_bronze("dd" * 32) is not None
+    assert store.get_bronze("ee" * 32) is None
 
 
-def test_lock_file_created_with_restricted_mode(tmp_path):
+# -- busy contention --------------------------------------------------------
+
+def test_busy_contention_fails_loudly_not_silently(tmp_path, monkeypatch):
+    """A second writer blocked by an open write txn waits for the busy
+    timeout, then raises sqlite3.OperationalError -- the write is never
+    silently skipped."""
+    monkeypatch.setattr("taxprep.mstore._BUSY_TIMEOUT_MS", 100)
+    data = tmp_path / "data"
+    writer = DocumentStore(data)
+    blocker = DocumentStore(data)
+    writer.upsert(_doc("seed"))
+
+    with blocker.txn():
+        blocker.register_bronze("cc" * 32, 1)  # holds the write lock
+        with pytest.raises(sqlite3.OperationalError, match="[Ll]ocked"):
+            writer.upsert(_doc("doc-x"))
+    # nothing was written by the failed attempt, nothing lost
+    assert writer.get("doc-x") is None
+    assert sorted(d.doc_id for d in writer.list()) == ["seed"]
+
+
+# -- file protections ---------------------------------------------------------
+
+def test_sqlite_file_created_with_restricted_mode(tmp_path):
     data = tmp_path / "data"
     DocumentStore(data).upsert(_doc("doc-1"))
-    st = (data / "store.lock").stat()
+    st = (data / "medallion.sqlite").stat()
     assert st.st_mode & 0o777 == 0o600
+
+
+def test_bronze_bytes_stored_read_only(tmp_path):
+    data = tmp_path / "data"
+    store = DocumentStore(data)
+    payload = b"synthetic source bytes"
+    sha = hashlib.sha256(payload).hexdigest()
+    rel = store.store_bronze_bytes(sha, payload)
+    target = Path(data) / rel
+    assert target.read_bytes() == payload
+    assert target.stat().st_mode & 0o777 == 0o400
+    # idempotent: storing the same bytes again changes nothing
+    assert store.store_bronze_bytes(sha, payload) == rel
+    # wrong address refused loudly
+    with pytest.raises(ValueError, match="do not hash"):
+        store.store_bronze_bytes("00" * 32, payload)

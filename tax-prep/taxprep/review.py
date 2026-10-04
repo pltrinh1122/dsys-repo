@@ -46,6 +46,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from . import silver
 from .models import FORM_TYPES, Document
 from .store import DocumentStore
 
@@ -549,6 +550,7 @@ def apply_validation(store: DocumentStore, doc_id: str,
 
     # --- apply: all gates passed ---
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    edit_records: list[tuple[str, object, object]] = []
     for box in new_boxes:
         new_val = _coerce(str(fields[box]))
         if box in rows:
@@ -558,6 +560,7 @@ def apply_validation(store: DocumentStore, doc_id: str,
                 f.setdefault("history", []).append(
                     {"ts": ts, "old": old, "new": new_val})
                 f["value"] = new_val
+                edit_records.append((box, old, new_val))
         else:
             doc.fields[box] = {
                 "value": new_val,
@@ -565,16 +568,94 @@ def apply_validation(store: DocumentStore, doc_id: str,
                 "raw_text": "",
                 "history": [{"ts": ts, "old": None, "new": new_val}],
             }
+            edit_records.append((box, None, new_val))
     if form_changed:
-        _record_identity_edit(doc, _FORM_TYPE_KEY, doc.form_type, new_form, ts)
+        old_form = doc.form_type
+        _record_identity_edit(doc, _FORM_TYPE_KEY, old_form, new_form, ts)
         doc.form_type = new_form
+        edit_records.append((_FORM_TYPE_KEY, old_form, new_form))
     if year_changed:
-        _record_identity_edit(doc, _TAX_YEAR_KEY, doc.tax_year, new_year, ts)
+        old_year = doc.tax_year
+        _record_identity_edit(doc, _TAX_YEAR_KEY, old_year, new_year, ts)
         doc.tax_year = new_year
+        edit_records.append((_TAX_YEAR_KEY, old_year, new_year))
     doc.status = "validated"
     doc.validated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    store.upsert(doc)
+    validated_fields = sorted(
+        set(confirmed_boxes)
+        | {box for box, _, _ in edit_records
+           if not box.startswith(silver.BOOKKEEPING_PREFIX)})
+    bronze_hash = silver.bronze_hash_for_doc(store, doc)
+    page = silver.best_page_for_doc(doc)
+    # Contract section 5: fields_json + artifact mirror + decision log
+    # are updated together, in one transaction. The derivation stamp is
+    # preserved (upsert_silver_doc, never the facade "1" path) whenever
+    # the bronze linkage resolves; tombstone docs without artifacts fall
+    # back to the facade upsert, whose bronze handling re-attaches them.
+    with store.txn():
+        if bronze_hash is None:
+            store.upsert(doc)
+            bronze_hash = silver.bronze_hash_for_doc(store, doc)
+        else:
+            silver.persist_silver_doc(
+                store, doc, silver.derivation_for_doc(store, doc.doc_id),
+                bronze_hash)
+        store.log_decision(
+            actor="operator", kind="validate", doc_id=doc.doc_id,
+            payload={"doc_id": doc.doc_id,
+                     "validated_fields": validated_fields, "ts": ts})
+        for box, old, new in edit_records:
+            artifact_id = None
+            if (bronze_hash is not None
+                    and not box.startswith(silver.BOOKKEEPING_PREFIX)):
+                artifact_id = silver.artifact_id_for(
+                    doc.doc_id, bronze_hash, page, silver.FIELD, box)
+            store.log_decision(
+                actor="operator", kind="edit", artifact_id=artifact_id,
+                doc_id=doc.doc_id,
+                payload={"field": box, "old": old, "new": new, "ts": ts})
+        _sync_field_artifacts(store, doc)
     return doc
+
+
+def _sync_field_artifacts(store: DocumentStore, doc: Document) -> None:
+    """Mirror validated/edited fields into silver_artifact rows.
+
+    Each field artifact's value_json is refreshed to the canonical
+    current field entry; operator-added fields gain artifacts;
+    payer/lot/section artifacts pass through untouched. Full replace
+    per doc (contract section 5).
+    """
+    bronze_hash = silver.bronze_hash_for_doc(store, doc)
+    if bronze_hash is None:
+        return
+    page = silver.best_page_for_doc(doc)
+    ctx = silver.derivation_for_doc(store, doc.doc_id)
+    arts = store.get_artifacts(doc.doc_id) or []
+    by_key = {(a["artifact_type"], a["anchor"]): dict(a) for a in arts}
+    changed = False
+    for code, f in _field_rows(doc).items():
+        key = (silver.FIELD, code)
+        value_json = silver.field_artifact_value(f)
+        if key in by_key:
+            if by_key[key].get("value_json") != value_json:
+                by_key[key]["value_json"] = value_json
+                changed = True
+        else:
+            by_key[key] = {
+                "artifact_id": silver.artifact_id_for(
+                    doc.doc_id, bronze_hash, page, silver.FIELD, code),
+                "page": page,
+                "artifact_type": silver.FIELD,
+                "anchor": code,
+                "value_json": value_json,
+                "offsets_json": None,
+                "derivation_version": ctx.derivation_version,
+                "config_hash": ctx.config_hash,
+            }
+            changed = True
+    if changed:
+        store.replace_artifacts(doc.doc_id, list(by_key.values()))
 
 
 # -- request hardening (R10) -----------------------------------------

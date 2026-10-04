@@ -14,7 +14,7 @@ from pypdf import PdfReader, PdfWriter
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
-from taxprep import ingest
+from taxprep import extractors, ingest
 from taxprep.ingest import (
     RC_ENCRYPTED,
     RC_HEIC_UNSUPPORTED,
@@ -138,13 +138,17 @@ def test_reingest_disagreement_keeps_validated_values_flags_rereview(
     validated_value = doc.fields["1"]["value"]
     iso["store"].upsert(doc)
 
-    # re-extraction (e.g. better OCR sidecar) disagrees on a value
+    # re-extraction (e.g. better OCR sidecar) disagrees on a value.
+    # Disagreement is only reachable through a derivation change: same
+    # bytes always re-derive identically (I2 no-op), so the disagreeing
+    # extractor rides a version bump (I6).
     def _disagree(form_type, text, year):
         fields = {"1": {"value": "99999.99", "confidence": "high",
                         "raw_text": ""}}
         return fields, "transcribed"
 
     monkeypatch.setattr(ingest, "_extract_for_type", _disagree)
+    monkeypatch.setattr(extractors, "EXTRACTOR_VERSION", "9")
     again = ingest_file(src, iso["store"])[0]
     assert again.status == "validated"          # status never overwritten
     assert again.fields["1"]["value"] == validated_value  # kept

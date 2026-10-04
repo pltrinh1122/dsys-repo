@@ -4,16 +4,24 @@ Deterministic, metadata-only rules. The verdict is a LABEL persisted on
 the Document -- nothing is ever deleted or hidden. Conservative by
 construction: anything ambiguous lands in ``needs_human``, never
 ``irrelevant``. Irrelevant means "provably outside the amendment task"
-(year out of scope, or a byte-identical duplicate scan).
+(year out of scope). Text-duplicate scans are NOT auto-dropped: they are
+raised to the operator as needs_human (see duplicate_of below).
 
 Reason codes (stable strings, safe for the blind orchestrator):
     year_out_of_scope   tax_year is not None and outside scope_years
     carryover_seed      tax_year below min(scope_years) but the form can
                         seed the capital-loss carryforward chain -- kept
                         relevant (N2), never year_out_of_scope
-    duplicate_of:<id>   sha256 of OCR text matches another doc; the
-                        lexicographically-first doc_id is kept, the rest
-                        are duplicates
+    duplicate_of:<id>   sha256 of OCR text matches another doc. Raised to
+                        the operator as needs_human -- never auto-resolved.
+                        (Arc B: L1 byte-identical duplicates are solved
+                        structurally by bronze aliases -- one bronze row,
+                        N aliases, counted once -- so there is no second
+                        doc to judge; L2 text-identical duplicates are
+                        raised via duplicates.dup_group and disposed by
+                        explicit operator ruling. This rule keeps the
+                        detection signal but must not double-handle what
+                        the medallion duplicate machinery owns.)
     unclassified        form_type == UNKNOWN (needs a human, never auto-dropped)
     validated_by_operator
                         status == validated: human judgment dominates --
@@ -114,9 +122,14 @@ def assess_relevance(store, scope_years: list[int],
                 "reasons": ["operator_override"],
             }
         elif d.doc_id in duplicate_of:
-            # Byte-identical OCR: provably redundant whatever the year.
+            # Text-identical to an earlier doc: RAISED to the operator as
+            # needs_human, never auto-resolved. Arc B owns L1/L2
+            # disposition (bronze aliases; dup_group + explicit ruling);
+            # the mechanical relevance triage must not double-handle it
+            # by dropping the loser. Precedence over year/seed rules is
+            # kept: the duplication signal is still detected first.
             verdicts[d.doc_id] = {
-                "verdict": "irrelevant",
+                "verdict": "needs_human",
                 "reasons": [f"duplicate_of:{duplicate_of[d.doc_id]}"],
             }
         elif (

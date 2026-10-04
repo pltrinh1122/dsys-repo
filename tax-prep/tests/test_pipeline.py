@@ -220,7 +220,8 @@ def test_pipeline_run_needs_input_dir_for_ingestion_slice(tmp_path):
 
 def test_validated_doc_is_never_irrelevant(tmp_path):
     store = _store_with(tmp_path, [
-        # out of scope AND a duplicate: every mechanical rule says drop it
+        # out of scope AND a duplicate: year rule would drop it, but the
+        # validated status dominates everything mechanical
         _doc("old-dup", 2019, "W-2", status="validated"),
     ])
     # make a second doc with byte-identical OCR so old-dup is a duplicate
@@ -234,8 +235,9 @@ def test_validated_doc_is_never_irrelevant(tmp_path):
     assert verdicts["old-dup"]["verdict"] == "relevant"
     assert verdicts["old-dup"]["reasons"] == ["validated_by_operator"]
     assert store.get("old-dup").relevance == "relevant"
-    # the non-validated duplicate is still dropped by the mechanical rule
-    assert verdicts["old-dup-2"]["verdict"] == "irrelevant"
+    # the non-validated duplicate is raised to the operator, not dropped
+    assert verdicts["old-dup-2"]["verdict"] == "needs_human"
+    assert verdicts["old-dup-2"]["reasons"] == ["duplicate_of:old-dup"]
 
 
 def test_validated_beats_recorded_override(tmp_path):

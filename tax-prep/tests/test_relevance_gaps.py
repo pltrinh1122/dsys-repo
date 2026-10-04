@@ -51,13 +51,16 @@ def test_year_out_of_scope_is_irrelevant(store):
     assert v["w-old"]["reasons"] == ["year_out_of_scope"]
 
 
-def test_duplicate_ocr_is_irrelevant_keep_first(store):
+def test_duplicate_ocr_raised_to_human_never_auto_dropped(store):
+    # Arc B: text-duplicates are L2 candidates raised to the operator via
+    # dup_group + explicit ruling. Relevance keeps the detection signal
+    # but must not mechanically resolve it.
     _with_ocr(store, _doc("b-scan", 2024, "1099-B"), "same scan text")
     _with_ocr(store, _doc("a-scan", 2024, "1099-B"), "same scan text")
     v = R.assess_relevance(store, SCOPE, persist=False)
-    # lexicographically first doc_id is kept
+    # lexicographically first doc_id is the reference
     assert v["a-scan"]["verdict"] == "relevant"
-    assert v["b-scan"]["verdict"] == "irrelevant"
+    assert v["b-scan"]["verdict"] == "needs_human"
     assert v["b-scan"]["reasons"] == ["duplicate_of:a-scan"]
 
 
@@ -132,15 +135,15 @@ def test_seed_form_above_scope_still_out_of_scope(store):
     assert v["sched-d-27"]["reasons"] == ["year_out_of_scope"]
 
 
-def test_duplicate_beats_carryover_seed(store):
-    # byte-identical seed docs: the kept copy seeds the chain, the
-    # duplicate is still provably redundant.
+def test_duplicate_still_detected_before_carryover_seed(store):
+    # The duplication signal still takes precedence over the seed rule,
+    # but the duplicate is raised (needs_human), not auto-dropped.
     _with_ocr(store, _doc("b-sched", 2022, "SCHEDULE_D"), "same seed text")
     _with_ocr(store, _doc("a-sched", 2022, "SCHEDULE_D"), "same seed text")
     v = R.assess_relevance(store, SCOPE, persist=False)
     assert v["a-sched"] == {"verdict": "relevant",
                             "reasons": ["carryover_seed"]}
-    assert v["b-sched"]["verdict"] == "irrelevant"
+    assert v["b-sched"]["verdict"] == "needs_human"
     assert v["b-sched"]["reasons"] == ["duplicate_of:a-sched"]
 
 

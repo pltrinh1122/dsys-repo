@@ -119,6 +119,45 @@ the stage's reason code. `--from`/`--to` slice the sequence
 (stage names, counts, doc_ids, reason codes only); the full
 PII-bearing carryforward report stays operator-local.
 
+### Medallion storage & the silver layer (Arc B)
+
+Ingested bytes land in a medallion store (`<data_dir>/medallion.sqlite`,
+WAL; DDL in `taxprep/medallion_schema.sql`):
+
+- **bronze** — exact source bytes, content-addressed by sha256, with
+  one alias row per path the bytes were seen at. Same bytes under any
+  name or path = one bronze object (I1/I3): re-ingesting is a no-op
+  for state (I2), and duplicates can never double-count.
+- **silver** — one `silver_doc` per document (mirrors the operational
+  field store in `fields_json`) plus typed **artifacts**
+  (`taxprep/silver.py`, W2): `field` per fields-dict key, `payer` per
+  payer block, `lot` per 1099-B lot, `section` per R1 split section.
+  Artifact ids are stable —
+  `sha256(doc_id:bronze_hash:page:type:anchor)[:32]` (the doc_id is
+  included because one bronze routinely feeds many silver docs: R1 split
+  children, CSV rows) — so re-running a
+  derivation reproduces byte-identical rows (I5).
+- **decision log** — append-only: every validate/edit (review),
+  exclusion, duplicate/supersedes ruling, conflict choice, and
+  relevance override is recorded with actor + timestamp. Decisions
+  survive re-derivation (I6).
+
+Derivations are versioned: `EXTRACTOR_VERSION` (`taxprep/extractors.py`,
+currently `"2"`; `"1"` is the pre-medallion era) plus a config hash over
+the derivation config (`taxprep/silver.py: derivation_config()`).
+Ingest skips derivation entirely on a cache hit for
+`(bronze, EXTRACTOR_VERSION, config_hash)`. On a version bump, silver is
+rebuilt with Operator decisions preserved: validated values win over
+re-derived values (changed → keep + `re_review` flag); a validated
+field that vanished from the new extraction is dropped and its
+decisions are flagged `orphaned` in the log (rows are never deleted).
+
+`taxprep sync` applies the bronze-level orphan rule: a bronze object
+with zero on-disk alias paths has its silver docs flipped to
+`ORPHANED` (values preserved). The duplicate-assessment hooks
+(`taxprep/duplicates.py`: `assess_new_bronze`, `assess_silver_doc`) run
+after every ingest; they are advisory and never fail the ingest.
+
 ### Encrypted PDFs
 
 Encryption is detected with pypdf and the **empty password is tried
@@ -197,7 +236,13 @@ taxprep/
   models.py      Document record: {doc_id, tax_year, form_type, source_path,
                  ocr_text_ref, fields: {box: {value, confidence, raw_text}},
                  status: transcribed|needs_review|validated}
-  store.py       JSONL store (append/upsert/list/query by year+form)
+  store.py       thin shim: DocumentStore = MedallionStore (mstore.py)
+  mstore.py      medallion storage (Arc B, W1): SQLite
+                 <data_dir>/medallion.sqlite (WAL, busy_timeout, mode 0600),
+                 bronze/silver/decision_log/gold tables per
+                 medallion_schema.sql; Document-compatible facade +
+                 medallion API (txn, register_bronze, artifacts, decisions)
+  medallion_schema.sql  DDL for the medallion store (single source of truth)
   ingest.py      directory walk, PDF text extraction (pypdf, pdfplumber
                  fallback), .txt OCR sidecars, classification, year detection
   extractors.py  box-level field extractors (regex/positional heuristics)
@@ -207,6 +252,12 @@ taxprep/
   carryforward.py  capital-loss carryforward engine: per-year Schedule D
                  worksheet logic (Decimal-only), 2023-2026 chaining,
                  from_store() adapter over validated 1099-Bs
+  gold.py        gated gold layer (Arc B): gate_check refuses with
+                 structured reason codes while any duplicate/supersedes/
+                 conflict/blocked/excluded-lot/incomplete-lot item is
+                 unresolved; gated_carryforward records input/output
+                 digests and persists gold_run rows; blind_audit exposes
+                 the workstation's five metadata-only invariants
   mcp_server.py  local MCP server (FastMCP, stdio transport only):
                  blind-orchestrator contract -- show_document scrubs fields
                  to {box_code, confidence, has_value}; compute_carryforward
@@ -214,6 +265,12 @@ taxprep/
                  {report_path, years_covered, n_warnings, status}; no
                  validate tool (human-only validation); verify_* tools
                  wrap verify.py
+  duplicates.py  duplicate taxonomy L0-L4 + conflicts (Arc B, W3):
+                 normalize/text fingerprints (L2), salted field + lot
+                 fingerprints (L3), corroboration groups, supersedes (L4),
+                 conflict raising; explicit-only rule_on_group /
+                 choose_conflict; blind-safe open_groups/open_conflicts
+                 counts
   verify.py      mechanical verification suite (blind-safe): completeness,
                  validation gate, 1099-B lot integrity, transcript
                  reconciliation (EIN/name/1:1 matching, 1-cent tolerance),
@@ -225,6 +282,70 @@ tests/
   test_transcript.py   synthetic transcript samples
   test_review.py       review server: queue, filters, review page,
                        validate API, loopback-only binding
+
+### Storage layer — medallion (Arc B)
+
+SQLite at `<data_dir>/medallion.sqlite` (WAL, `busy_timeout=5000`, file
+mode 0600) subsumes the old JSONL + fcntl lock-file store. DDL lives in
+`taxprep/medallion_schema.sql` (single source of truth):
+
+- **bronze**: content-addressed source objects (`hash` = sha256 of source
+  bytes); `bronze_alias` records every path a hash was seen at (I1–I3);
+  `bronze_bytes_ref` points at the read-only bytes under
+  `<data_dir>/bronze/xx/<sha>` (mode 0400); `bronze_text` holds per-page
+  derived text keyed per I5 (W2's ingestion path).
+- **silver**: `silver_doc` mirrors the Document record (`fields_json` is
+  the operational field store); `silver_artifact` mirrors fields as typed
+  artifacts with stable ids
+  (`sha256(doc_id:bronze_hash:page:type:anchor)[:32]` — doc_id included
+  so one bronze's many docs never collide);
+  `doc_provenance` carries doc-level R5 text provenance (additive only
+  — no contract §3 table altered).
+- **decisions**: `decision_log` is append-only (I6) — enforced by DB
+  triggers, not just the API; `dup_group`/`dup_member` and
+  `conflict`/`conflict_option` are W3's.
+- **gold**: `gold_run` records gated outputs with input digests (W4).
+
+`MedallionStore` (`taxprep/mstore.py`; `taxprep/store.py` is a thin
+`DocumentStore` shim) offers the Document-compatible facade
+(`upsert`/`get`/`list`/`counts`/`needs_review`/`refresh`/`__len__`/
+`save_ocr`/`load_ocr` — same behavior as before; reads are now always
+current) plus the medallion API: `txn()` (single transaction, nested =
+savepoint), `register_bronze`/`add_alias`/`store_bronze_bytes`/
+`get_bronze`, `upsert_silver_doc`/`replace_artifacts`/`get_artifacts`,
+`log_decision`/`decisions_for`, `db_digest`/`table_counts`.
+Concurrency: SQLite serializes writers; a contended write waits for the
+busy timeout then fails loudly (`OperationalError`) — never silently.
+
+First open migrates a legacy `documents.jsonl` inside one transaction
+(bronze rows, aliases, silver docs, mirror artifacts, synthesized
+validate decisions; unrecoverable sources become `legacy-<doc_id>`
+tombstones with `blocked_reason="legacy-no-source"`). The JSONL is left
+in place as a backup and never written again.
+
+Blind-orchestrator note: `db_digest()`/`table_counts()` expose digests
+and counts only — never values.
+
+### Arc B integration notes (coordinator amendments to the workstream contract)
+
+- **Artifact ids include doc_id** (`sha256(doc_id:bronze_hash:page:type:anchor)[:32]`).
+  The contract's bronze-only formula collided for multi-doc bronzes (R1
+  split children, one-doc-per-CSV-row); doc_id is content-derived and
+  stable, so I5 determinism holds.
+- **`txn()` yields a handle** exposing both the store API and `execute()`
+  for workstream-owned tables (duplicates, gold). The append-only decision
+  log stays protected by DB triggers even through raw SQL.
+- **`replace_artifacts` is a true full replace** (delete-all-then-insert);
+  `field_fingerprint` cascades on artifact delete (fingerprints are
+  derived data, recomputed per assessment).
+- **Gold is ruling-aware**: disposed `keep_one`/`merge`/`authoritative`
+  rulings remove the losing members' docs from gold's input (input
+  digest, gate G2 wire-through, and sums); `distinct`/`corroborates`
+  count every member. `carryforward.from_store` /
+  `carryforward_blockers` take an optional `exclude_doc_ids` set for this.
+- **L4 is order-independent** (a CORRECTED doc ingested before its
+  original still raises supersedes) and 1099-B changed values are
+  compared at lot level (box-level key boxes carry no amounts).
 
 ## Phase 2 scope
 
@@ -246,6 +367,87 @@ Typical loop: `ingest` → `review` (validate everything) →
 `carryforward`. The 2023-2025 rows drive the 1040-X amendments; the
 `Carryforward into 2026` line is the figure to enter in the upcoming
 TurboTax return (2026 lots are partial-year until December).
+
+## Duplicates & conflicts (Arc B)
+
+`taxprep/duplicates.py` implements the R16a taxonomy and the conflicts
+absolute rule. Ingest calls two hooks (contract §8):
+
+- `assess_new_bronze(store, bronze_hash)` — after bronze registration:
+  L2 (text-identical, different bytes → `dup_group` class `L2`,
+  status `open`, never auto-merged) and L4 (`CORRECTED` marker or same
+  payer/form/year with changed values → class `supersedes`). L1
+  (byte-identical) is structural — one bronze row, N aliases — and
+  creates no group.
+- `assess_silver_doc(store, doc_id)` — after the silver write: L3
+  salted field fingerprints per form type
+  (form, year, normalized payer EIN/name, masked recipient digits, key
+  boxes) at doc level, plus per-lot fingerprints
+  (description, dates, proceeds, basis) at lot level → class `L3`;
+  Wage & Income transcript entries vs same-payer/year source docs →
+  class `corroboration` (**never** `duplicate`).
+
+Fingerprints are `sha256(salt + ":" + canonical_input)`; the salt is
+generated once per store (`secrets.token_hex(32)`) and persisted in the
+module-owned `dup_salt` table (`salt_id='v1'`) — W1's
+`medallion_schema.sql` is untouched. All group/conflict ids are stable
+hashes (contract §6); re-running an assess is idempotent.
+
+**Absolute rule:** conflicting field values are raised to the Operator
+and never mechanically resolved — no precedence, latest-wins,
+confidence-wins, averaging, first-match-wins, or default preselection,
+anywhere. Triggers: field disagreement inside L2/L3/corroboration
+groups (`duplicate`/`corroboration` conflicts), re-extraction vs a
+validated value (`flag_reextract` → `reextract` conflict,
+options `validated`/`re-extracted`; W2 sets `re_review`),
+and parser ambiguity (`parser_ambiguity` → `parser` conflict, for
+transcript.py/extractors.py call sites). Disposition is always
+explicit: `rule_on_group(store, group_id, *, ruling, primary, reason)`
+writes `duplicate_ruling`/`supersedes_ruling` to the decision log and
+disposes the group; `choose_conflict(store, conflict_id, *, choice,
+reason)` validates the choice against the recorded options (no
+default — a missing choice is a `TypeError`) and writes
+`conflict_choice` `{options_shown, choice, reason, ts}`. Gold refuses
+while anything is undisposed.
+
+Blind contract: `open_groups(store)` / `open_conflicts(store)` return
+`{class: count}` — counts only, never values or member keys (covered by
+the recursive PII sweep in `tests/test_medallion_w3.py`). E2's old
+`duplicate_of` relevance rule no longer auto-drops text-duplicates: it
+now yields `needs_human` (detection signal kept; disposition belongs to
+the medallion machinery).
+
+## Gold gate (Arc B)
+
+`taxprep carryforward` routes through `gold.gated_carryforward`. The
+gate (R16 I8, extending R3) refuses — loudly, with structured reason
+codes, exit code 3 — while any of these touch the year's documents:
+
+- `unresolved_duplicate` — an open L2/L3 probable-duplicate group
+- `unresolved_supersedes` — an open supersedes group (corrected forms)
+- `unresolved_conflict` — an open conflict, or an open corroboration
+  group with a disagreeing member (all-agree corroboration does NOT block)
+- `blocked_document` — a silver_doc with status BLOCKED
+- `excluded_lot` / `incomplete_lot` — the G2 lot-integrity blockers from
+  `carryforward.carryforward_blockers`, wired through; an operator
+  exclusion recorded in the decision log that the sum path cannot yet
+  honor is `excluded_lot` (fail-closed)
+
+Gold is a pure function of (validated silver, decisions, parameters):
+every output records `input_digest` (sha256 over canonical validated
+silver rows + relevant decision-log rows + params, deduped by
+bronze_hash so L1-merged aliases count once) and `output_digest`;
+recomputing with identical inputs yields identical digests, and a
+`gold_run` row (kind=carryforward) is persisted per run.
+
+`gold.blind_audit` exposes the workstation's five metadata-only
+invariants — `bronze_accounted`, `files_accounted`,
+`lot_sums_reconciled` (1-cent tolerance; no statement totals means
+not_evaluated, never a vacuous pass), `gold_inputs_validated`,
+`zero_unresolved_before_gold` — each returning
+`{status: pass|fail|not_evaluated, counts...}` with ids only, never
+values. All gold outputs are covered by the recursive PII sweep in
+`tests/test_medallion_w4.py`.
 
 Worksheet assumptions and limitations (see `carryforward.py`
 docstring for the full statement):

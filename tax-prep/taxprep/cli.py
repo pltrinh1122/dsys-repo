@@ -152,18 +152,46 @@ def cmd_review(args: argparse.Namespace) -> int:
 
 
 def cmd_carryforward(args: argparse.Namespace) -> int:
-    from .carryforward import compute_chain, from_store
+    from .carryforward import compute_chain
+    from . import gold
 
     store = _store(args.data_dir)
     years = [args.year] if args.year is not None else [2023, 2024, 2025, 2026]
     yearly: dict[int, dict] = {}
     lot_notes: list[str] = []
+    params = {"filing_status": args.filing_status,
+              "prior_st": str(args.prior_st), "prior_lt": str(args.prior_lt)}
     for y in years:
-        r = from_store(store, y)  # raises on unvalidated 1099-Bs
+        try:
+            # W4 (Arc B): every gold computation runs through the gate.
+            # GoldRefused carries structured reason codes -- loud, never
+            # silent. Exit 3 marks a gate refusal (distinct from 1/2).
+            r = gold.gated_carryforward(store, y, params=params)
+        except gold.GoldRefused as exc:
+            print(f"gold refused for {y}: {len(exc.reason_codes)} blocker(s)",
+                  file=sys.stderr)
+            for rc in exc.reason_codes:
+                who = (rc.get("doc_id") or rc.get("group_id")
+                       or rc.get("conflict_id") or "")
+                print(f"  [{rc['code']}] {who} {rc.get('detail', '')}".rstrip(),
+                      file=sys.stderr)
+            print("resolve each blocker (or record an Operator decision "
+                  "disposing it), then retry", file=sys.stderr)
+            return 3
+        except ValueError as exc:
+            # The carryforward's own R3 guard, post-gate: still loud.
+            print(f"carryforward failed for {y}: {exc}", file=sys.stderr)
+            return 1
         yearly[y] = {"st_current": r["st_current"], "lt_current": r["lt_current"]}
         lot_notes.append(
             f"{y}: {r['lots_included']} lot(s) in, {r['lots_excluded']} excluded"
         )
+        g = r.get("gold", {})
+        if g.get("input_digest"):
+            lot_notes.append(
+                f"{y}: gold input_digest {g['input_digest'][:16]}… "
+                f"output_digest {g['output_digest'][:16]}…"
+            )
         for w in r["warnings"]:
             lot_notes.append(f"  ! {y}: {w}")
     result = compute_chain(
@@ -588,6 +616,18 @@ def cmd_exclude(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    # Medallion record (Arc B): the exclusion also lands in the append-only
+    # decision log so gold's input digest and audit trail see the same
+    # disposal. Best-effort -- the file record above is authoritative.
+    log_decision = getattr(store, "log_decision", None)
+    if callable(log_decision):
+        from datetime import datetime, timezone
+        try:
+            log_decision(actor="operator", kind="exclude", doc_id=doc_id,
+                         payload={"doc_id": doc_id, "reason": args.reason,
+                                  "ts": datetime.now(timezone.utc).isoformat()})
+        except Exception:
+            pass
     print(f"excluded {rec['doc_id']} (recorded {rec['recorded_at']})")
     return 0
 

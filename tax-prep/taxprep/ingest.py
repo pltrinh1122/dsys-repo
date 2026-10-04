@@ -1,15 +1,36 @@
 """Ingest: walk an input directory, extract text, classify, extract fields.
 
-R4 identity (stable, content-derived): doc_id = sha256(SOURCE BYTES)[:16]
--- no filename component anywhere (this also fixes the R8 identifier
-leak at the source). Split children compose as
-<hash>-p<page_range>-<section-hash> (the section hash disambiguates
-sections sharing a page range).
+Medallion flow (Arc B, contract section 8):
+
+1. read bytes -> sha256 (source identity = sha256 of the SOURCE BYTES,
+   I1; no filename component anywhere -- this also fixes the R8
+   identifier leak at the source).
+2. Derivation-cache check: a silver derivation already at
+   (EXTRACTOR_VERSION, config_hash) for this bronze is an I2 no-op --
+   only bronze/alias ``last_seen`` is bumped; no new rows, decisions
+   untouched.
+3. Else build the R5 PageBundle, then register the bronze
+   (``register_bronze`` first so the first insert carries
+   encryption/source_root -- re-register never clobbers -- then
+   ``store_bronze_bytes`` + ``add_alias``).
+4. Derive in ONE transaction (I7): classify -> R1 split -> extract ->
+   ``upsert_silver_doc`` + ``replace_artifacts`` (silver.derive_artifacts)
+   + per-page text fingerprinting, with I6 re-derivation semantics on a
+   version/config bump (validated values win; vanished validated fields
+   drop + orphan-flag their decisions; ``re_review`` flagged).
+5. ``duplicates.assess_new_bronze`` hook, then
+   ``duplicates.assess_silver_doc`` per doc (W3; lazy import, hook
+   failures are recorded on the report and never fail the ingest).
+
+R4 identity (stable, content-derived): doc_id = sha256(SOURCE BYTES)[:16].
+Split children compose as <hash>-p<page_range>-<section-hash> (the
+section hash disambiguates sections sharing a page range).
 Re-ingest is idempotent: validated status/values/edits are never
-overwritten; if re-extraction disagrees with validated values the
-validated values are kept and the doc is flagged re_review; new text
-for the same source attaches to the same doc_id with provenance.
-``taxprep sync`` marks documents whose source file is missing ORPHANED.
+overwritten; a version bump that disagrees with validated values keeps
+them and flags re_review; new text for the same source attaches to the
+same doc_id with provenance.
+``taxprep sync`` marks bronze objects with zero on-disk alias paths as
+ORPHANED (their silver docs flip to ORPHANED, values preserved).
 
 R5 text-sufficiency gate: per-page deterministic signals (chars per
 page, near-full-page image dominance, garble ratio, AcroForm values,
@@ -53,7 +74,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import extractors, transcript
+from . import extractors, silver, transcript
 from .models import Document
 from .store import DocumentStore
 
@@ -658,98 +679,359 @@ def _apply_provenance(doc: Document, bundle: PageBundle,
     doc.encryption = bundle.encryption
 
 
-def _canon_value(v):
-    """Canonical form for comparing extracted values across re-ingests.
+def _utcnow_iso() -> str:
+    """UTC timestamp for decision-log payloads."""
+    from datetime import datetime, timezone
 
-    Numeric values compare by value, not by representation: an
-    Operator correction stored as the Decimal-safe string "10000.00"
-    agrees with an extracted float 10000.0. Non-numeric values compare
-    as strings; containers recurse.
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# -- Medallion silver write (I6/I7/R4; W2) -----------------------------------
+
+def _docs_for_bronze(store: DocumentStore, sha: str) -> list[Document]:
+    """Silver documents derived from one bronze object."""
+    return [d for d in store.list()
+            if getattr(d, "source_sha256", None) == sha]
+
+
+def _doc_derivation(store: DocumentStore,
+                    doc: Document) -> tuple[str | None, str | None]:
+    """A doc's (derivation_version, config_hash) for its CURRENT fields.
+
+    Reads the artifact rows for the doc's current field anchors only:
+    rows for vanished anchors are stale derivations (a known
+    replace_artifacts gap -- full replace per derivation is not
+    implemented -- flagged to W1) and must not vote. (None, None) when
+    the derivation cannot be attributed (no artifacts, or a field
+    without a row).
     """
-    from decimal import Decimal, InvalidOperation
-
-    if isinstance(v, bool):
-        return ("bool", v)
-    if isinstance(v, (int, float, Decimal)):
-        try:
-            return ("num", str(Decimal(str(v)).normalize()))
-        except InvalidOperation:
-            pass
-    if isinstance(v, str):
-        s = v.strip().replace("$", "").replace(",", "")
-        if s:
-            try:
-                return ("num", str(Decimal(s).normalize()))
-            except InvalidOperation:
-                pass
-        return ("str", v)
-    if isinstance(v, (list, tuple)):
-        return ("list", tuple(_canon_value(x) for x in v))
-    if isinstance(v, dict):
-        return ("dict", tuple(sorted((str(k), _canon_value(x))
-                                     for k, x in v.items())))
-    return ("str", str(v))
+    anchors = silver.field_artifact_anchors(doc.fields)
+    if not anchors:
+        return None, None
+    rows = {(a["artifact_type"], a["anchor"]): a
+            for a in store.get_artifacts(doc.doc_id) or []}
+    versions: set = set()
+    configs: set = set()
+    for key in anchors:
+        row = rows.get(key)
+        if row is None:
+            return None, None
+        versions.add(row.get("derivation_version"))
+        configs.add(row.get("config_hash"))
+    if len(versions) == 1 and len(configs) == 1:
+        version = next(iter(versions))
+        return (version, next(iter(configs))) if version is not None \
+            else (None, None)
+    return None, None
 
 
-def _fields_agree(old: dict, new: dict) -> bool:
-    """True when two field dicts carry the same canonical values."""
-    if set(old) != set(new):
+def _stored_derivation(store: DocumentStore, doc: Document,
+                       fallback: silver.DerivationContext
+                       ) -> silver.DerivationContext:
+    """A doc's derivation, falling back to the given context."""
+    version, config_hash = _doc_derivation(store, doc)
+    if version is None:
+        return fallback
+    return silver.DerivationContext(derivation_version=version,
+                                    config_hash=config_hash or "")
+
+
+def _persist_silver_doc(store: DocumentStore, doc: Document,
+                        ctx: silver.DerivationContext,
+                        bronze_hash: str | None) -> None:
+    """Write one silver_doc row (thin wrapper over the shared helper)."""
+    silver.persist_silver_doc(store, doc, ctx, bronze_hash)
+
+
+def _sidecar_changed(store: DocumentStore, path: Path,
+                    docs: list[Document]) -> bool:
+    """True when the current sidecar differs from derivation time.
+
+    A same-basename .txt sidecar is a derivation INPUT (it becomes the
+    document text when present). The derivation consumed exactly the
+    sidecar text iff the docs' stored text still equals it; otherwise
+    the cache must miss and re-derive. A *removed* sidecar is not
+    detected (the kept transcription is still valid text of the
+    unchanged bytes) -- documented I2 tradeoff.
+    """
+    sidecar = _sidecar_for(path)
+    if sidecar is None:
         return False
-    for code in old:
-        o, n = old[code], new[code]
-        ov = o.get("value") if isinstance(o, dict) else o
-        nv = n.get("value") if isinstance(n, dict) else n
-        if _canon_value(ov) != _canon_value(nv):
+    try:
+        text = sidecar.read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    stored_parts = []
+    for d in sorted(docs, key=lambda d: d.doc_id):
+        try:
+            stored_parts.append(store.load_ocr(d.doc_id))
+        except (FileNotFoundError, OSError):
+            return True  # no stored text: re-derive to be safe
+    return "\n".join(stored_parts) != text
+
+
+def _derivation_cache_hit(store: DocumentStore, sha: str,
+                          path: Path | None = None) -> bool:
+    """I2/I5: is this bronze already derived at the current version?
+
+    Checks every silver doc for the bronze: hit only when each doc's
+    artifacts are stamped (EXTRACTOR_VERSION, current config_hash) AND
+    the sidecar situation is unchanged (a sidecar is a derivation
+    input). Docs with no artifacts (BLOCKED) can never hit -- they
+    re-run the gate, which is a DB no-op when the outcome is unchanged.
+    """
+    ctx = silver.DerivationContext.current()
+    docs = _docs_for_bronze(store, sha)
+    if not docs:
+        return False
+    for d in docs:
+        version, config_hash = _doc_derivation(store, d)
+        if (version != ctx.derivation_version
+                or config_hash != ctx.config_hash):
             return False
+    if path is not None and _sidecar_changed(store, path, docs):
+        return False
     return True
+
+
+def _validated_field_keys(store: DocumentStore, doc: Document) -> set[str]:
+    """Field keys the Operator validated, from the decision log (I6).
+
+    Union of ``validated_fields`` across kind=validate decisions plus
+    kind=edit fields. Pre-decision-log fallback: when a validated doc
+    has no decisions at all, every field counts as validated
+    (conservative -- R4: validated values are never overwritten).
+    """
+    keys: set[str] = set()
+    saw = False
+    for d in store.decisions_for(doc_id=doc.doc_id, kind="validate") or []:
+        saw = True
+        payload = d.get("payload") or {}
+        for k in payload.get("validated_fields") or []:
+            keys.add(k)
+    for d in store.decisions_for(doc_id=doc.doc_id, kind="edit") or []:
+        saw = True
+        f = (d.get("payload") or {}).get("field")
+        if f and not f.startswith(silver.BOOKKEEPING_PREFIX):
+            keys.add(f)
+    if not saw and doc.status == "validated":
+        keys.update(k for k in (doc.fields or {})
+                    if not k.startswith(silver.BOOKKEEPING_PREFIX))
+    return keys
+
+
+def _flag_orphaned_decisions(store: DocumentStore, doc_id: str,
+                             old_artifacts: list[dict],
+                             new_artifacts: list[dict]) -> None:
+    """Flag decisions whose artifacts vanished in a re-derivation (I6).
+
+    Appends one follow-up decision per affected validate/edit/exclude
+    decision with ``payload["orphaned"] = True`` (actor=system).
+    Decision rows are never updated or deleted.
+    """
+    dropped = silver.dropped_artifacts(old_artifacts, new_artifacts)
+    if not dropped:
+        return
+    dropped_ids = {a["artifact_id"] for a in dropped}
+    dropped_fields = {a["anchor"] for a in dropped
+                      if a["artifact_type"] == silver.FIELD}
+    ts = _utcnow_iso()
+    for d in store.decisions_for(doc_id=doc_id) or []:
+        kind = d.get("kind")
+        if kind not in ("validate", "edit", "exclude"):
+            continue
+        payload = d.get("payload") or {}
+        if payload.get("orphaned"):
+            continue  # never re-flag a flag
+        row_aid = d.get("artifact_id") or payload.get("artifact_id")
+        if kind == "validate":
+            orphaned_fields = sorted(
+                set(payload.get("validated_fields") or [])
+                & dropped_fields)
+            if not orphaned_fields:
+                continue
+            new_payload = {"doc_id": doc_id,
+                           "validated_fields": orphaned_fields,
+                           "orphaned": True, "ts": ts}
+        elif kind == "edit":
+            if not (payload.get("field") in dropped_fields
+                    or row_aid in dropped_ids):
+                continue
+            new_payload = {**payload, "orphaned": True, "ts": ts}
+        else:  # exclude
+            if row_aid not in dropped_ids:
+                continue
+            new_payload = {**payload, "orphaned": True, "ts": ts}
+        store.log_decision(actor="system", kind=kind,
+                           artifact_id=d.get("artifact_id"),
+                           doc_id=doc_id, group_id=d.get("group_id"),
+                           payload=new_payload)
+
+
+def _derive_and_store(store: DocumentStore, doc: Document, text: str,
+                      bundle: PageBundle, source_sha: str,
+                      ctx: silver.DerivationContext) -> Document:
+    """Fresh silver write: OCR text, provenance, silver_doc + artifacts."""
+    doc.ocr_text_ref = store.save_ocr(doc.doc_id, text)
+    _apply_provenance(doc, bundle, source_sha)
+    _persist_silver_doc(store, doc, ctx, source_sha)
+    _persist_bronze_text(store, bundle, source_sha, ctx)
+    store.replace_artifacts(
+        doc.doc_id,
+        silver.derive_artifacts(
+            doc, bundle, bronze_hash=source_sha,
+            derivation_version=ctx.derivation_version,
+            config_hash=ctx.config_hash))
+    return doc
+
+
+def _persist_bronze_text(store: DocumentStore, bundle: PageBundle,
+                         source_sha: str,
+                         ctx: silver.DerivationContext) -> None:
+    """Write per-page derived text rows (I5 cache key).
+
+    Keyed by (bronze hash, page, derivation version, config): re-writing
+    the same derivation is a no-op; a version bump adds rows. Feeds the
+    L2 text fingerprint (duplicates.compute_and_store_text_fingerprint).
+    """
+    for i, page_text in enumerate(bundle.pages, start=1):
+        store.write_bronze_text(
+            source_sha, i,
+            text_source=bundle.text_source,
+            engine=bundle.ocr_engine,
+            engine_version=bundle.engine_version,
+            ocr_mode=bundle.ocr_mode,
+            derivation_version=ctx.derivation_version,
+            config_hash=ctx.config_hash,
+            text=page_text,
+        )
+
+
+def _store_blocked_reingest(store: DocumentStore, existing: Document,
+                            doc: Document, bundle: PageBundle,
+                            source_sha: str,
+                            ctx: silver.DerivationContext) -> Document:
+    """A failed re-ingest never destroys what we have (R4).
+
+    Keeps existing text/fields/status; refreshes provenance in memory.
+    Unvalidated docs move to BLOCKED (the file honestly is blocked now);
+    validated status is never overwritten. A no-op when nothing changed.
+    """
+    _apply_provenance(existing, bundle, source_sha)
+    if existing.status != "validated" and bundle.route == "blocked":
+        if (existing.status != "BLOCKED"
+                or existing.status_reason != bundle.reason_code):
+            existing.status = "BLOCKED"
+            existing.status_reason = bundle.reason_code
+            _persist_silver_doc(
+                store, existing,
+                _stored_derivation(store, existing, ctx), source_sha)
+    return existing
+
+
+def _store_version_bump(store: DocumentStore, existing: Document,
+                        doc: Document, text: str, bundle: PageBundle,
+                        source_sha: str,
+                        ctx: silver.DerivationContext) -> Document:
+    """I6: rebuild silver on a derivation version/config bump.
+
+    Operator decisions are preserved: validated values win over
+    re-derived values (changed -> keep + re_review); validated fields
+    that vanished from the new extraction are dropped and their
+    decisions flagged orphaned. Unvalidated fields take the new values.
+    Artifacts are fully replaced at the new derivation.
+    """
+    validated_keys = _validated_field_keys(store, existing)
+    old_artifacts = store.get_artifacts(existing.doc_id)
+    result = silver.reconcile_rederivation(
+        old_fields=existing.fields, new_fields=doc.fields,
+        validated_keys=validated_keys)
+    # Start from the existing record: status / relevance / validated_at /
+    # provenance history are Operator or Operator-visible state, never
+    # reset by a re-derivation.
+    existing.fields = result.fields
+    if result.re_review and not existing.re_review:
+        existing.re_review = True
+        existing.status_reason = "extraction-disagrees"
+    existing.ocr_text_ref = store.save_ocr(existing.doc_id, text)
+    _apply_provenance(existing, bundle, source_sha)
+    _persist_silver_doc(store, existing, ctx, source_sha)
+    _persist_bronze_text(store, bundle, source_sha, ctx)
+    new_artifacts = silver.derive_artifacts(
+        existing, bundle, bronze_hash=source_sha,
+        derivation_version=ctx.derivation_version,
+        config_hash=ctx.config_hash)
+    store.replace_artifacts(existing.doc_id, new_artifacts)
+    _flag_orphaned_decisions(store, existing.doc_id, old_artifacts,
+                             new_artifacts)
+    return existing
 
 
 def _store_idempotent(store: DocumentStore, doc: Document, text: str,
                       bundle: PageBundle, source_sha: str) -> Document:
-    """R4 non-destructive re-ingest.
+    """Medallion-aware idempotent doc write (I6/I7/R4).
 
-    - unknown doc_id -> store fresh (possibly a BLOCKED/ERROR record).
-    - re-extraction refused or failed (blocked/error route) on an
-      existing doc -> keep existing text/fields/status; record the new
-      provenance only. A failed re-ingest never destroys what we have.
-      (Unvalidated docs do move to BLOCKED -- the file honestly is
-      blocked now; validated status is never overwritten.)
-    - validated doc + agreeing re-extraction -> refresh text/provenance
-      only; validated status/values/edits untouched.
-    - validated doc + disagreeing re-extraction -> keep validated
-      values, flag re_review (status stays validated).
-    - unvalidated doc + successful re-extraction -> fresh extraction
-      wins (same doc_id).
+    - unknown doc_id -> fresh derivation (silver_doc + artifacts).
+    - re-derivation refused/failed (blocked/error route) -> keep
+      existing text/fields/status; failed re-ingests never destroy.
+    - same (version, config), agreeing re-derivation -> true no-op
+      (I2): no writes at all.
+    - same (version, config), disagreeing re-derivation -> validated:
+      keep validated values, flag re_review (status stays validated);
+      unvalidated: the fresh extraction wins.
+    - version/config bump -> I6 reconcile (see _store_version_bump).
+
+    Runs inside the caller's transaction (contract section 8: derive in
+    ONE txn, I7).
     """
+    ctx = silver.DerivationContext.current()
     existing = store.get(doc.doc_id)
     if existing is None:
-        doc.ocr_text_ref = store.save_ocr(doc.doc_id, text)
-        _apply_provenance(doc, bundle, source_sha)
-        store.upsert(doc)
-        return doc
+        return _derive_and_store(store, doc, text, bundle, source_sha, ctx)
+
     if bundle.route in ("blocked", "error"):
-        existing.source_path = doc.source_path
-        _apply_provenance(existing, bundle, source_sha)
-        if existing.status != "validated" and bundle.route == "blocked":
-            existing.status = "BLOCKED"
-            existing.status_reason = bundle.reason_code
-        store.upsert(existing)
-        return existing
+        return _store_blocked_reingest(store, existing, doc, bundle,
+                                       source_sha, ctx)
+
+    old_ctx = _stored_derivation(store, existing, ctx)
+    if (old_ctx.derivation_version != ctx.derivation_version
+            or old_ctx.config_hash != ctx.config_hash):
+        return _store_version_bump(store, existing, doc, text, bundle,
+                                   source_sha, ctx)
+
+    if silver.fields_agree(existing.fields, doc.fields):
+        return existing  # I2: byte-identical re-derivation, no writes
+
+    # Same-version disagreement: unreachable with deterministic
+    # extraction (same bytes -> same fields); kept as a fail-safe
+    # mirroring the pre-medallion R4 semantics.
     if existing.status == "validated":
-        if not _fields_agree(existing.fields, doc.fields):
+        changed = False
+        if not existing.re_review:
             existing.re_review = True
+            changed = True
+        if existing.status_reason != "extraction-disagrees":
             existing.status_reason = "extraction-disagrees"
-        existing.source_path = doc.source_path
-        existing.ocr_text_ref = store.save_ocr(existing.doc_id, text)
-        _apply_provenance(existing, bundle, source_sha)
-        store.upsert(existing)
+            changed = True
+        if changed:
+            _persist_silver_doc(store, existing, old_ctx, source_sha)
         return existing
-    # Not validated: the fresh extraction replaces fields/status/text,
-    # keeping the stable doc_id (and clearing any stale re_review flag).
+    # Not validated: the fresh extraction wins (same doc_id; relevance
+    # and other Operator-visible state are preserved).
+    relevance = existing.relevance
+    validated_at = existing.validated_at
     doc.re_review = False
     doc.ocr_text_ref = store.save_ocr(doc.doc_id, text)
     _apply_provenance(doc, bundle, source_sha)
-    store.upsert(doc)
+    doc.relevance = relevance
+    doc.validated_at = validated_at
+    _persist_silver_doc(store, doc, ctx, source_sha)
+    store.replace_artifacts(
+        doc.doc_id,
+        silver.derive_artifacts(
+            doc, bundle, bronze_hash=source_sha,
+            derivation_version=ctx.derivation_version,
+            config_hash=ctx.config_hash))
     return doc
 
 
@@ -906,51 +1188,31 @@ def _build_documents(path: Path, doc_id: str, bundle: PageBundle,
     return [_store_idempotent(store, doc, section_text, bundle, source_sha)]
 
 
-def _ingest_pdf(path: Path, source_bytes: bytes,
-                store: DocumentStore) -> list[Document]:
-    """Ingest one PDF file through the R5 gate."""
-    doc_id = source_doc_id(source_bytes)
-    source_sha = hashlib.sha256(source_bytes).hexdigest()
-    bundle = _pdf_page_bundle(path, store)
-    if bundle.route in ("blocked", "error"):
-        return [_blocked_document(path, doc_id, bundle, source_sha, store)]
-    return _build_documents(path, doc_id, bundle, source_sha, store)
+# -- Medallion ingest flow (contract section 8; W2) ----------------------------
 
+def _encryption_hint(path: Path, suffix: str) -> str | None:
+    """Cheap pre-ingest encryption probe for PDFs (X1 provenance).
 
-def _ingest_txt(path: Path, source_bytes: bytes,
-                store: DocumentStore) -> list[Document]:
-    """Ingest one .txt file (a sidecar already claimed by a PDF/image is
-    never passed here -- see ingest_dir)."""
-    doc_id = source_doc_id(source_bytes)
-    source_sha = hashlib.sha256(source_bytes).hexdigest()
-    # A same-basename .txt next to nothing is a standalone text file.
-    text = source_bytes.decode("utf-8", errors="replace")
-    bundle = PageBundle([text], "native", TS_NATIVE)
-    return _build_documents(path, doc_id, bundle, source_sha, store)
-
-
-def _ingest_image(path: Path, source_bytes: bytes,
-                  store: DocumentStore) -> list[Document]:
-    """Ingest one image: convert to PDF under the data dir, then the R5
-    path on the converted PDF. doc_id still derives from the ORIGINAL
-    image bytes (R4)."""
-    suffix = path.suffix.lower()
-    if _pil_image() is None:
-        raise _SkipFile(RC_IMAGE_SUPPORT_MISSING)
-    if suffix in HEIC_EXTS and not _heif_supported():
-        raise _SkipFile(RC_HEIC_UNSUPPORTED)
-    doc_id = source_doc_id(source_bytes)
-    source_sha = hashlib.sha256(source_bytes).hexdigest()
+    Returns "owner-only" when the file is encrypted but the empty
+    password unlocks it, else None. (A required USER password is
+    discovered by the R5 gate, which marks the doc BLOCKED-encrypted.)
+    Page content is never parsed here -- just the encryption flag.
+    """
+    if suffix not in PDF_EXTS:
+        return None
     try:
-        pdf_path = _image_to_pdf(path, source_sha, store)
-    except _SkipFile:
-        raise
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(path))
+        if not bool(reader.is_encrypted):
+            return None
+        try:
+            unlocked = bool(reader.decrypt(""))
+        except Exception:
+            return None
+        return "owner-only" if unlocked and _pages_readable(reader) else None
     except Exception:
-        raise _SkipFile(RC_IMAGE_CONVERT_FAILED)
-    bundle = _pdf_page_bundle(pdf_path, store)
-    if bundle.route in ("blocked", "error"):
-        return [_blocked_document(path, doc_id, bundle, source_sha, store)]
-    return _build_documents(path, doc_id, bundle, source_sha, store)
+        return None
 
 
 def _sidecar_for(path: Path) -> Path | None:
@@ -963,6 +1225,161 @@ def _sidecar_for(path: Path) -> Path | None:
     return None
 
 
+def _page_bundle_for(path: Path, source_bytes: bytes, suffix: str,
+                     store: DocumentStore) -> PageBundle:
+    """Route one file to its PageBundle (R5 gate). May raise _SkipFile.
+
+    Pure derivation: no store writes happen here, so a skip fails closed
+    with zero bronze/silver rows (W4 bronze_accounted stays whole).
+    """
+    # A same-basename .txt sidecar wins as the OCR text for PDFs and
+    # images (pre-existing OCR). The doc_id still derives from the
+    # source file's bytes, so the sidecar text attaches to the same
+    # doc_id with provenance text_source="sidecar" (R4).
+    if suffix in PDF_EXTS | IMAGE_EXTS:
+        sidecar = _sidecar_for(path)
+        if sidecar is not None:
+            text = sidecar.read_bytes().decode("utf-8", errors="replace")
+            return PageBundle([text], "native", TS_SIDECAR)
+    if suffix in PDF_EXTS:
+        return _pdf_page_bundle(path, store)
+    if suffix in TXT_EXTS:
+        return PageBundle([source_bytes.decode("utf-8", errors="replace")],
+                          "native", TS_NATIVE)
+    if suffix in IMAGE_EXTS:
+        if _pil_image() is None:
+            raise _SkipFile(RC_IMAGE_SUPPORT_MISSING)
+        if suffix in HEIC_EXTS and not _heif_supported():
+            raise _SkipFile(RC_HEIC_UNSUPPORTED)
+        sha = hashlib.sha256(source_bytes).hexdigest()
+        try:
+            pdf_path = _image_to_pdf(path, sha, store)
+        except _SkipFile:
+            raise
+        except Exception:
+            raise _SkipFile(RC_IMAGE_CONVERT_FAILED)
+        return _pdf_page_bundle(pdf_path, store)
+    raise _SkipFile(RC_UNSUPPORTED_TYPE)  # unreachable: caller pre-checks
+
+
+def _register_bronze(store: DocumentStore, sha: str, source_bytes: bytes,
+                     path: str, *, encryption: str | None) -> None:
+    """Bronze steps (contract section 8).
+
+    ``register_bronze`` runs FIRST so the first insert carries
+    encryption (and source_root); re-registering never clobbers those.
+    ``store_bronze_bytes`` re-registers idempotently inside.
+    """
+    # R11 source root: deferred (nullable per contract); W1's facade
+    # path also passes None. Populating it is a coordinator call.
+    store.register_bronze(sha, len(source_bytes), source_root=None,
+                          encryption=encryption)
+    store.store_bronze_bytes(sha, source_bytes)
+    store.add_alias(sha, path)
+
+
+def _hook_assess_new_bronze(store: DocumentStore, sha: str):
+    """W3 duplicates hook (contract section 8, step 5). Lazy import.
+
+    Never fails the ingest: duplicate assessment is advisory, and the
+    hook must be a safe no-op when W3's tables are empty. Returns the
+    outcome for the ingest report (group ids, or a skipped/error tag --
+    hashes/ids only, never PII).
+    """
+    try:
+        from . import duplicates as _duplicates
+    except ImportError:
+        return "skipped:duplicates-unavailable"
+    assess = getattr(_duplicates, "assess_new_bronze", None)
+    if assess is None:
+        return "skipped:hook-missing"
+    try:
+        return assess(store, sha)
+    except Exception as exc:  # surface, don't fail the ingest
+        return f"error:{type(exc).__name__}"
+
+
+def _hook_assess_silver_doc(store: DocumentStore, doc_id: str):
+    """W3 duplicates hook (contract section 8, step 6). See above."""
+    try:
+        from . import duplicates as _duplicates
+    except ImportError:
+        return "skipped:duplicates-unavailable"
+    assess = getattr(_duplicates, "assess_silver_doc", None)
+    if assess is None:
+        return "skipped:hook-missing"
+    try:
+        return assess(store, doc_id)
+    except Exception as exc:  # surface, don't fail the ingest
+        return f"error:{type(exc).__name__}"
+
+
+def _mark_stale_children(store: DocumentStore, old_ids: set[str],
+                         new_ids: set[str],
+                         ctx: silver.DerivationContext) -> None:
+    """Flag previously-derived docs that a re-derivation no longer emits.
+
+    A version bump can change R1 split topology (new child doc_ids).
+    Stale children keep their old derivation and decisions, but are
+    flagged re_review so the Operator disposes them -- silently keeping
+    a validated stale child would double-count once the new children
+    validate (W3's L3 is the second line of defense).
+    """
+    for stale_id in sorted(old_ids - new_ids):
+        st = store.get(stale_id)
+        if st is None or st.re_review:
+            continue
+        st.re_review = True
+        st.status_reason = "derivation-superseded"
+        arts = store.get_artifacts(stale_id)
+        bronze_hash = arts[0]["bronze_hash"] if arts else st.source_sha256
+        _persist_silver_doc(store, st,
+                            _stored_derivation(store, st, ctx),
+                            bronze_hash)
+
+
+def _ingest_file_medallion(path: Path, source_bytes: bytes, suffix: str,
+                           store: DocumentStore, *,
+                           hook_notes: list[dict] | None = None
+                           ) -> list[Document]:
+    """One file through the medallion flow (contract section 8).
+
+    sha -> derivation-cache check (I2 no-op on hit) -> R5 PageBundle ->
+    bronze steps -> single-txn derive (I7: bronze_text-classify-split-
+    extract-silver_doc-artifacts) -> W3 duplicate hooks (advisory).
+    """
+    sha = hashlib.sha256(source_bytes).hexdigest()
+    doc_id = source_doc_id(source_bytes)
+    if _derivation_cache_hit(store, sha, path):
+        # I2: this bronze is already derived at the current
+        # (EXTRACTOR_VERSION, config_hash) -- bump last_seen only. No
+        # new rows, no status change, decisions untouched.
+        store.register_bronze(sha, len(source_bytes))
+        store.add_alias(sha, str(path))
+        return _docs_for_bronze(store, sha)
+    bundle = _page_bundle_for(path, source_bytes, suffix, store)
+    _register_bronze(store, sha, source_bytes, str(path),
+                     encryption=bundle.encryption)
+    notes: list[dict] = []
+    with store.txn():
+        old_ids = {d.doc_id for d in _docs_for_bronze(store, sha)}
+        if bundle.route in ("blocked", "error"):
+            docs = [_blocked_document(path, doc_id, bundle, sha, store)]
+        else:
+            docs = _build_documents(path, doc_id, bundle, sha, store)
+        _mark_stale_children(
+            store, old_ids, {d.doc_id for d in docs},
+            silver.DerivationContext.current())
+    notes.append({"hook": "assess_new_bronze",
+                  "outcome": _hook_assess_new_bronze(store, sha)})
+    for d in docs:
+        notes.append({"hook": "assess_silver_doc", "doc_id": d.doc_id,
+                      "outcome": _hook_assess_silver_doc(store, d.doc_id)})
+    if hook_notes is not None:
+        hook_notes.extend(notes)
+    return docs
+
+
 def ingest_file(path: Path, store: DocumentStore) -> list[Document]:
     """Ingest one file; returns the Document(s) created.
 
@@ -972,8 +1389,9 @@ def ingest_file(path: Path, store: DocumentStore) -> list[Document]:
     cannot be separated honestly yields one MULTI_FORM-blocked Document.
 
     R4: doc_id derives from the source bytes; re-ingest is idempotent
-    and never overwrites validated values (disagreement flags
-    re_review). R5: PDFs go through the text-sufficiency gate.
+    and never overwrites validated values (a derivation-version bump
+    that disagrees flags re_review). R5: PDFs go through the
+    text-sufficiency gate.
     Raises _SkipFile for skipped files (R6 accounting); other
     exceptions propagate to ingest_dir's errored accounting.
     """
@@ -983,28 +1401,9 @@ def ingest_file(path: Path, store: DocumentStore) -> list[Document]:
         source_bytes = path.read_bytes()
     except OSError:
         raise _SkipFile(RC_READ_FAILED)
-
-    # A same-basename .txt sidecar wins as the OCR text for PDFs and
-    # converted images (pre-existing OCR). The doc_id still derives
-    # from the source file's bytes, so the sidecar text attaches to the
-    # same doc_id with provenance text_source="sidecar" (R4).
-    if suffix in PDF_EXTS | IMAGE_EXTS:
-        sidecar = _sidecar_for(path)
-        if sidecar is not None:
-            doc_id = source_doc_id(source_bytes)
-            source_sha = hashlib.sha256(source_bytes).hexdigest()
-            text = sidecar.read_bytes().decode("utf-8", errors="replace")
-            bundle = PageBundle([text], "native", TS_SIDECAR)
-            return _build_documents(path, doc_id, bundle, source_sha,
-                                    store)
-
-    if suffix in PDF_EXTS:
-        return _ingest_pdf(path, source_bytes, store)
-    if suffix in TXT_EXTS:
-        return _ingest_txt(path, source_bytes, store)
-    if suffix in IMAGE_EXTS:
-        return _ingest_image(path, source_bytes, store)
-    raise _SkipFile(RC_UNSUPPORTED_TYPE)
+    if suffix not in PDF_EXTS | TXT_EXTS | IMAGE_EXTS:
+        raise _SkipFile(RC_UNSUPPORTED_TYPE)
+    return _ingest_file_medallion(path, source_bytes, suffix, store)
 
 
 # -- R6: directory walk + accounting ----------------------------------------
@@ -1020,6 +1419,10 @@ class IngestReport:
     skipped: list[dict] = field(default_factory=list)  # [{file, reason_code}]
     errored: list[dict] = field(default_factory=list)  # [{file, reason_code}]
     seen_paths: list[str] = field(default_factory=list)  # for sync()
+    # W3 duplicate-assessment hook outcomes per file:
+    # [{file, hook, outcome}] -- outcomes are group ids, "ok", or
+    # "skipped:<reason>"/"error:<exc>". Never PII (ids/hashes only).
+    hook_notes: list[dict] = field(default_factory=list)
 
     def __len__(self) -> int:  # backward compat: len(report) == n docs
         return len(self.docs)
@@ -1086,30 +1489,49 @@ def ingest_dir(input_dir: str | Path, store: DocumentStore) -> IngestReport:
         report.files_seen += 1
         report.seen_paths.append(str(path))
         try:
-            docs = ingest_file(path, store)
+            try:
+                source_bytes = path.read_bytes()
+            except OSError:
+                raise _SkipFile(RC_READ_FAILED)
+            notes: list[dict] = []
+            docs = _ingest_file_medallion(path, source_bytes,
+                                          path.suffix.lower(), store,
+                                          hook_notes=notes)
+            for n in notes:
+                report.hook_notes.append({"file": _rel(root, path), **n})
         except _SkipFile as skip:
             report.skipped.append({"file": _rel(root, path),
                                    "reason_code": skip.reason_code})
             continue
         except Exception:
             # Reason code, never exception text (R6). The failure is
-            # still recorded as a document so nothing is silent.
+            # still recorded as a document so nothing is silent. The
+            # error document is derived in one txn (I7); its bronze row
+            # is registered first so the silver_doc FK always holds.
             reason = RC_EXTRACT_FAILED
             report.errored.append({"file": _rel(root, path),
                                    "reason_code": reason})
             try:
                 source_bytes = path.read_bytes()
-                doc_id = source_doc_id(source_bytes)
-                source_sha = hashlib.sha256(source_bytes).hexdigest()
             except OSError:
+                source_bytes = None
+            if source_bytes is not None:
+                source_sha = hashlib.sha256(source_bytes).hexdigest()
+                doc_id = source_doc_id(source_bytes)
+                _register_bronze(store, source_sha, source_bytes,
+                                 str(path), encryption=None)
+            else:
                 doc_id = source_doc_id(
                     f"unreadable:{path}".encode("utf-8"))
                 source_sha = hashlib.sha256(
                     f"unreadable:{path}".encode("utf-8")).hexdigest()
+                store.register_bronze(source_sha, 0)
+                store.add_alias(source_sha, str(path))
             bundle = PageBundle([], "error", TS_ERROR,
                                  reason_code=reason)
-            docs = [_blocked_document(path, doc_id, bundle, source_sha,
-                                      store)]
+            with store.txn():
+                docs = [_blocked_document(path, doc_id, bundle, source_sha,
+                                          store)]
         report.ingested += 1
         report.docs.extend(docs)
     return report
@@ -1117,41 +1539,122 @@ def ingest_dir(input_dir: str | Path, store: DocumentStore) -> IngestReport:
 
 # -- R4: sync -----------------------------------------------------------------
 
+def _doc_source_present(doc: Document, root: Path,
+                        seen_paths: set[str]) -> bool:
+    """True when the doc's recorded source path exists on disk."""
+    sp = doc.source_path
+    if not sp:
+        return True  # no source recorded: nothing to orphan on
+    p = Path(sp)
+    if not p.is_absolute():
+        p = root / p
+    try:
+        if str(p.resolve()) in seen_paths:
+            return True
+    except OSError:
+        pass
+    return p.exists()
+
+
+def _bronze_alias_paths(store: DocumentStore, sha: str,
+                        docs: list[Document]) -> list[str]:
+    """Alias paths recorded for a bronze object.
+
+    Prefers the bronze_alias table (authoritative); falls back to the
+    docs' recorded source paths.
+    """
+    get_bronze = getattr(store, "get_bronze", None)
+    if get_bronze is not None:
+        try:
+            bronze = get_bronze(sha)
+        except Exception:
+            bronze = None
+        if bronze is not None and bronze.get("aliases") is not None:
+            return list(bronze["aliases"])
+    return [d.source_path for d in docs if d.source_path]
+
+
+def _bronze_has_on_disk_alias(store: DocumentStore, sha: str,
+                              docs: list[Document], root: Path,
+                              seen_paths: set[str]) -> bool:
+    """True when any recorded alias path for the bronze exists on disk."""
+    for alias in _bronze_alias_paths(store, sha, docs):
+        p = Path(alias)
+        if not p.is_absolute():
+            p = root / p
+        try:
+            if str(p.resolve()) in seen_paths:
+                return True
+        except OSError:
+            pass
+        if p.exists():
+            return True
+    return False
+
+
+def _mark_orphaned(store: DocumentStore, doc: Document,
+                   bronze_hash: str | None) -> None:
+    """Flip a silver doc to ORPHANED, preserving values and derivation.
+
+    Validated values are untouched (only status/status_reason change).
+    Tombstone/legacy docs (no bronze hash) go through the facade upsert,
+    whose bronze handling re-attaches them correctly.
+    """
+    doc.status = "ORPHANED"
+    doc.status_reason = "source-missing"
+    if bronze_hash is None:
+        store.upsert(doc)
+        return
+    ctx = _stored_derivation(store, doc,
+                             silver.DerivationContext.current())
+    _persist_silver_doc(store, doc, ctx, bronze_hash)
+
+
 def sync(input_dir: str | Path, store: DocumentStore) -> dict:
     """Reconcile the store with a source directory.
 
     Walks input_dir (idempotent ingest: new files ingested, existing
-    re-ingested without clobbering validated values), then marks every
-    document whose source file is missing as ORPHANED (status +
-    status_reason "source-missing"). Returns the ingest accounting plus
-    the orphaned doc_ids.
+    re-ingested without clobbering validated values), then applies the
+    bronze-level orphan rule: a bronze object with ZERO on-disk alias
+    paths has its silver docs flipped to ORPHANED (status +
+    status_reason "source-missing"; values preserved). Documents that
+    predate bronze tracking fall back to the per-doc source check.
+
+    Returns the ingest accounting plus the orphaned doc_ids.
     """
     root = Path(input_dir)
     report = ingest_dir(root, store)
     seen_ids = {d.doc_id for d in report.docs}
     seen_paths = {str(Path(p).resolve()) for p in report.seen_paths}
 
-    def _source_present(doc: Document) -> bool:
-        sp = doc.source_path
-        if not sp:
-            return True  # no source recorded: nothing to orphan on
-        p = Path(sp)
-        if not p.is_absolute():
-            p = root / p
-        if str(p.resolve()) in seen_paths:
-            return True
-        return p.exists()
+    by_bronze: dict[str, list[Document]] = {}
+    legacy: list[Document] = []
+    for doc in store.list():
+        sha = doc.source_sha256
+        if sha:
+            by_bronze.setdefault(sha, []).append(doc)
+        else:
+            legacy.append(doc)
 
     orphaned: list[str] = []
-    for doc in store.list():
+    for sha in sorted(by_bronze):
+        docs = by_bronze[sha]
+        if any(d.doc_id in seen_ids for d in docs):
+            continue  # freshly (re-)ingested this run
+        if any(d.status == "ORPHANED" for d in docs):
+            continue
+        if _bronze_has_on_disk_alias(store, sha, docs, root, seen_paths):
+            continue
+        for d in docs:
+            _mark_orphaned(store, d, sha)
+            orphaned.append(d.doc_id)
+    for doc in legacy:
         if doc.doc_id in seen_ids:
             continue
         if doc.status == "ORPHANED":
             continue
-        if not _source_present(doc):
-            doc.status = "ORPHANED"
-            doc.status_reason = "source-missing"
-            store.upsert(doc)
+        if not _doc_source_present(doc, root, seen_paths):
+            _mark_orphaned(store, doc, None)
             orphaned.append(doc.doc_id)
 
     out = report.summary()

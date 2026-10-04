@@ -433,7 +433,28 @@ def _doc_lots(doc: Any) -> list[dict]:
     return [l for l in v if isinstance(l, dict)] if isinstance(v, list) else []
 
 
-def carryforward_blockers(store: Any, chained_years: list[int] | None = None) -> list[dict]:
+def _medallion_doc_exclusions(store: Any) -> set[str]:
+    """Doc ids with a doc-level decision-log exclusion (Arc B medallion).
+
+    Unifies the two exclusion mechanisms: a kind=exclude decision naming
+    a doc behaves exactly like a file-based Operator exclusion -- the doc
+    is out of gold's guard and sums. Artifact-level exclusions are NOT
+    included (excluding a single lot from sums is not yet supported;
+    the gold gate keeps those fail-closed as excluded_lot).
+    """
+    decisions_for = getattr(store, "decisions_for", None)
+    if decisions_for is None:
+        return set()
+    try:
+        rows = decisions_for(kind="exclude") or []
+    except Exception:
+        return set()
+    return {r["doc_id"] for r in rows
+            if r.get("doc_id") and not r.get("artifact_id")}
+
+
+def carryforward_blockers(store: Any, chained_years: list[int] | None = None,
+                        exclude_doc_ids: set[str] | None = None) -> list[dict]:
     """R3 guard: PII-free blocker list [{"doc_id", "reason_code"}].
 
     Refuses (via the caller raising) while ANY document in the store is
@@ -453,16 +474,23 @@ def carryforward_blockers(store: Any, chained_years: list[int] | None = None) ->
     ``lot_term_unknown`` entry); the list is sorted by
     (doc_id, reason_code) for determinism. Only doc_ids and fixed
     reason codes appear -- never values, names, or exclusion reasons.
+
+    ``exclude_doc_ids`` (optional): doc ids the Operator has ruled out of
+    gold via disposed duplicate/supersedes rulings -- their blockers are
+    moot and skipped. Not an Operator exclusion; it is the medallion
+    ruling machinery (Arc B).
     """
+    out_of_gold = set(exclude_doc_ids or ())
     docs = store.list()
     data_dir = getattr(store, "data_dir", None)
     excluded: set[str] = set()
     if data_dir is not None:
         excluded = {e["doc_id"] for e in exclusions.list_exclusions(data_dir)}
+    excluded |= _medallion_doc_exclusions(store)
 
     blockers: list[dict] = []
     for d in docs:
-        if d.doc_id in excluded:
+        if d.doc_id in excluded or d.doc_id in out_of_gold:
             continue
         form_type = getattr(d, "form_type", None)
         status = getattr(d, "status", None)
@@ -487,7 +515,7 @@ def carryforward_blockers(store: Any, chained_years: list[int] | None = None) ->
                                 if getattr(d, "tax_year", None) is not None})
     for y in chained_years:
         for d in store.list(year=y, form="1099-B"):
-            if d.doc_id in excluded:
+            if d.doc_id in excluded or d.doc_id in out_of_gold:
                 continue
             lots = _doc_lots(d)
             if not lots:
@@ -508,7 +536,8 @@ def carryforward_blockers(store: Any, chained_years: list[int] | None = None) ->
     return blockers
 
 
-def from_store(store: Any, year: int) -> dict:
+def from_store(store: Any, year: int,
+             exclude_doc_ids: set[str] | None = None) -> dict:
     """Sum validated 1099-B lots for ``year`` into signed ST/LT currents.
 
     Refuses loudly (R3 guard) if ANY document in the store is UNKNOWN,
@@ -531,8 +560,15 @@ def from_store(store: Any, year: int) -> dict:
     ``accrued_market_discount_1f_total`` for Phase 4 (Schedule B
     interest income) visibility -- never in gain/loss, never in
     withholding.
+
+    ``exclude_doc_ids`` (optional): doc ids ruled out of gold by disposed
+    duplicate/supersedes rulings (Arc B medallion) -- skipped by the
+    guard, the validation check, and the sums, exactly like Operator
+    exclusions.
     """
-    blockers = carryforward_blockers(store, chained_years=[year])
+    out_of_gold = set(exclude_doc_ids or ())
+    blockers = carryforward_blockers(store, chained_years=[year],
+                                     exclude_doc_ids=out_of_gold)
     if blockers:
         items = ", ".join(f"{b['doc_id']}({b['reason_code']})"
                           for b in blockers)
@@ -546,8 +582,10 @@ def from_store(store: Any, year: int) -> dict:
     excluded: set[str] = set()
     if data_dir is not None:
         excluded = {e["doc_id"] for e in exclusions.list_exclusions(data_dir)}
+    excluded |= _medallion_doc_exclusions(store)
     docs = store.list(year=year, form="1099-B")
-    unvalidated = [d.doc_id for d in docs if d.status != "validated"]
+    unvalidated = [d.doc_id for d in docs
+                   if d.status != "validated" and d.doc_id not in out_of_gold]
     if unvalidated:
         raise ValueError(
             f"cannot compute carryforward for {year}: "
@@ -561,7 +599,7 @@ def from_store(store: Any, year: int) -> dict:
     amd_total = Decimal("0")
     included = 0
     for d in docs:
-        if d.doc_id in excluded:
+        if d.doc_id in excluded or d.doc_id in out_of_gold:
             continue  # Operator-disposed: skipped by guard and by sums
         for n, lot in enumerate(_doc_lots(d), start=1):
             label = f"{d.doc_id} lot {n}"
