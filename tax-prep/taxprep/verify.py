@@ -311,15 +311,20 @@ def _transcript_payers(store, year: int) -> tuple[list[dict], list[dict]]:
     skipped = []
     for d in store.list(year=year, form="WAGE_INCOME_TRANSCRIPT"):
         parsed, reason = _gaps.parse_transcript_doc(d, store)
-        if reason is not None:
+        if reason is not None and reason != "partial":
             skipped.append({"doc_id": d.doc_id, "reason_code": reason})
             continue
+        # C1: "partial" transcripts contribute their mapped payers;
+        # the unparsed count rides along as coverage, not a skip.
+        partial = (reason == "partial")
         for p in parsed.get("payers", []):
             payers.append({
                 "ein": _norm_ein(p.get("payer_ein")),
                 "name": _norm_name(p.get("payer")),
                 "form_type": (p.get("form_type") or "UNKNOWN").upper(),
                 "boxes": p.get("boxes") or {},
+                "partial": partial,
+                "n_unparsed": parsed.get("n_unparsed", 0),
             })
     return payers, skipped
 
@@ -1067,7 +1072,9 @@ def verify_roa_corroboration(store, year: int) -> dict:
     for roa in sorted(roa_docs, key=lambda d: d.doc_id):
         n_roa += 1
         roa_parsed, roa_reason = _gaps.parse_transcript_doc(roa, store)
-        if roa_reason is not None:
+        # C1: "partial" ROAs still corroborate on mapped sections;
+        # other reasons skip.
+        if roa_reason is not None and roa_reason != "partial":
             skipped.append({"doc_id": roa.doc_id, "role": "roa",
                             "reason_code": roa_reason})
             continue
@@ -1086,7 +1093,8 @@ def verify_roa_corroboration(store, year: int) -> dict:
                 continue
             for st in sorted(standalone_docs, key=lambda d: d.doc_id):
                 st_parsed, st_reason = _gaps.parse_transcript_doc(st, store)
-                if st_reason is not None:
+                # C1: "partial" standalones still compare on mapped lines.
+                if st_reason is not None and st_reason != "partial":
                     skipped.append({"doc_id": st.doc_id,
                                     "role": f"standalone_{section}",
                                     "reason_code": st_reason})

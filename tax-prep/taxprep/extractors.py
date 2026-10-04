@@ -728,20 +728,25 @@ def _lot_money_patterns(
     (ocr_tolerant=False) is byte-identical to the pre-O1a patterns.
     """
     bt = lambda t: _box_token(t, ocr_tolerant)  # noqa: E731
+    # O1a-repair: real tesseract often puts the box token and its amount
+    # on separate lines (narrow columns). In OCR mode the fallback gap
+    # allows newlines ([^\d$]*); native keeps [^\d\n$]* byte-identical.
+    # Gaps stay digit-free (D3); segments bound the match to one lot.
+    gap = r"[^\d$]*" if ocr_tolerant else r"[^\d\n$]*"
     return {
         "proceeds_1d": [
             (r"Proceeds[^\n\d$]*" + _MONEY_RE, True),
-            (bt("1d") + r"[^\d\n$]*" + _MONEY_RE, False),
+            (bt("1d") + gap + _MONEY_RE, False),
         ],
         "basis_1e": [
             (r"Cost\s*(?:or\s+other)?\s*basis[^\n\d$]*" + _MONEY_RE, True),
-            (bt("1e") + r"[^\d\n$]*" + _MONEY_RE, False),
+            (bt("1e") + gap + _MONEY_RE, False),
         ],
         # F3: box 1g, wash sale loss disallowed -- added BACK to the lot's
         # gain/loss by carryforward (gain/loss = 1d - 1e + 1g).
         "wash_1g": [
             (r"Wash\s+sale\s+loss\s+disallowed[^\n\d$]*" + _MONEY_RE, True),
-            (bt("1g") + r"[^\d\n$]*" + _MONEY_RE, False),
+            (bt("1g") + gap + _MONEY_RE, False),
         ],
         # Box 1f: ACCRUED MARKET DISCOUNT -- Schedule B interest income
         # (Phase 4). Never part of gain/loss and never a withholding
@@ -749,7 +754,7 @@ def _lot_money_patterns(
         # withheld -- that is box 4.)
         "accrued_market_discount_1f": [
             (r"Accrued\s+market\s+discount[^\n\d$]*" + _MONEY_RE, True),
-            (bt("1f") + r"[^\d\n$]*" + _MONEY_RE, False),
+            (bt("1f") + gap + _MONEY_RE, False),
         ],
         # Box 4: federal income tax withheld -- a withholding credit,
         # never part of gain/loss. No bare \b4\b: it would match any
@@ -949,8 +954,11 @@ def _build_lot_split_res(
         tok = _ocr_tolerant_token(digit) if ocr_tolerant else re.escape(digit)
         return r"\b" + tok + rest + r"\b"
 
+    # O1a-repair: OCR gap allows newlines (box token and amount on
+    # separate lines in real tesseract output); native is byte-identical.
+    gap = r"[^\d$]*" if ocr_tolerant else r"[^\d\n$]*"
     proceeds = re.compile(
-        r"Proceeds[^\n\d$]*" + _MONEY_RE + r"|" + bt("1d") + r"[^\d\n$]*"
+        r"Proceeds[^\n\d$]*" + _MONEY_RE + r"|" + bt("1d") + gap
         + _MONEY_RE,
         re.IGNORECASE,
     )
@@ -963,7 +971,7 @@ def _build_lot_split_res(
     )
     basis = re.compile(
         r"Cost\s*(?:or\s+other)?\s*basis[^\n\d$]*" + _MONEY_RE
-        + r"|" + bt("1e") + r"[^\d\n$]*" + _MONEY_RE,
+        + r"|" + bt("1e") + gap + _MONEY_RE,
         re.IGNORECASE,
     )
     return proceeds, opener, basis

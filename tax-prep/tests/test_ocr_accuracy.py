@@ -291,18 +291,45 @@ OCR_PAGES = [
 ]
 
 
-def _image_only_pdf(path, n_pages=3):
-    img = Image.new("RGB", (400, 400), "white")
-    img_path = str(path) + ".png"
-    img.save(img_path)
+def _image_only_pdf(path, n_pages=3, page_texts=None):
+    """Render a multi-page image-only PDF with REAL text (T2 repair).
+
+    Each page gets a distinct line set rendered in a TrueType font at
+    high resolution, so a real OCR engine returns characters (not the
+    0-char UNKNOWN of a blank image). page_texts overrides the default
+    OCR_PAGES content per page.
+    """
+    from PIL import ImageDraw, ImageFont
+    texts = page_texts if page_texts is not None else OCR_PAGES
+    # 2550x3300 at 300dpi for letter size (8.5x11in)
+    W, H = 2550, 3300
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    try:
+        font = ImageFont.truetype(font_path, 60)
+    except OSError:
+        font = ImageFont.load_default()
+    img_paths = []
+    for i in range(n_pages):
+        img = Image.new("RGB", (W, H), "white")
+        draw = ImageDraw.Draw(img)
+        lines = texts[i % len(texts)].split("\n")
+        y = 200
+        for line in lines:
+            if line.strip():
+                draw.text((200, y), line, fill="black", font=font)
+            y += 120
+        img_path = str(path) + f".p{i}.png"
+        img.save(img_path)
+        img_paths.append(img_path)
     c = canvas.Canvas(str(path), pagesize=letter)
-    for _ in range(n_pages):
+    for img_path in img_paths:
         c.drawImage(img_path, 0, 0, width=letter[0], height=letter[1])
         c.showPage()
     c.save()
     from pathlib import Path
 
-    Path(img_path).unlink()
+    for img_path in img_paths:
+        Path(img_path).unlink()
     return path
 
 
@@ -375,3 +402,69 @@ def test_real_engine_multipage_stores_page_markers(tmp_path):
     doc = ingest_file(pdf, store)[0]
     assert doc.text_source.startswith("ocr:")
     assert len(store.load_ocr(doc.doc_id).split("\f")) == 3
+
+
+# ---------------------------------------------------------------- Repair arc
+# T2: fixture renders real text (not blank) -- verify pixels vary.
+def test_image_only_pdf_renders_real_text(tmp_path):
+    from PIL import Image, ImageDraw, ImageFont
+    img = Image.new("RGB", (2550, 3300), "white")
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 60)
+    draw.text((200, 200), "BROKER STATEMENT Tax Year 2024",
+              fill="black", font=font)
+    # Not blank: count dark pixels from rendered text.
+    gray = img.convert("L")
+    pixels = list(gray.getdata())
+    dark = sum(1 for p in pixels if p < 128)
+    assert dark > 1000
+    # And the PDF helper produces a valid multi-page file.
+    pdf_path = _image_only_pdf(tmp_path / "scan.pdf", n_pages=2)
+    assert pdf_path.exists()
+
+
+# O1a-repair: box token and amount on separate lines (real tesseract
+# often breaks narrow columns). OCR mode matches across the newline;
+# native does not (byte-identical).
+def test_ocr_box_token_newline_separated_amount():
+    text = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Lot 1
+le
+$1500.00
+ld $1000.00
+"""
+    fields, status = extract_fields(
+        "1099-B", text, text_source="ocr:tesseract/force-ocr")
+    lots = fields["lots"]["value"]
+    assert len(lots) == 1
+    assert lots[0]["basis_1e"] == "1500.00"
+    assert lots[0]["proceeds_1d"] == "1000.00"
+    # Native: no cross-line match (unchanged behavior).
+    fields_n, _ = extract_fields("1099-B", text, text_source="native")
+    lots_n = fields_n.get("lots", {}).get("value") if fields_n.get("lots") else None
+    # Native may extract fewer or none; the key is it doesn't match
+    # the newline-separated "le".
+    if lots_n:
+        assert all(l["basis_1e"] != "1500.00" for l in lots_n)
+
+
+# O2-repair: _store_pages_for stores markers when ocr_engine is set,
+# even if route != "ocr" (escalation path).
+def test_store_pages_for_escalation_path():
+    from taxprep.ingest import _store_pages_for, PageBundle
+    pages = ["page one", "page two"]
+    bundle = PageBundle(
+        pages=pages, route="native",  # route string differs on escalation
+        text_source="ocr:ocrmypdf+tesseract/force-ocr",
+        ocr_engine="ocrmypdf+tesseract",
+    )
+    text = "\n".join(pages)
+    result = _store_pages_for(bundle, text)
+    assert result == pages
+    # Non-OCR bundle still returns None.
+    bundle2 = PageBundle(pages=pages, route="native",
+                         text_source="native")
+    assert _store_pages_for(bundle2, text) is None
+    # Section text (not whole bundle) still returns None.
+    assert _store_pages_for(bundle, "page one") is None

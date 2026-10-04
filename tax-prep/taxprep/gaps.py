@@ -132,10 +132,16 @@ def parse_transcript_doc(doc, store) -> tuple[dict | None, str | None]:
         return None, "parser_unavailable"
     parsed = parser(text, tax_year=doc.tax_year)
     effective = effective_unparsed_lines(parsed)
-    if effective:
-        return None, "still_unusable"
+    # C1: "partial" is a distinct state from "unusable". A transcript
+    # with unparsed lines still yields its MAPPED lines/payers for
+    # corroboration; the unparsed count is reported as coverage
+    # (DR-CMD-116 measure-then-set), not a failure. Callers compare
+    # on parsed content and surface "partial" explicitly.
     parsed = dict(parsed)
     parsed["unparsed_lines"] = effective
+    parsed["n_unparsed"] = len(effective)
+    if effective:
+        return parsed, "partial"
     return parsed, None
 
 
@@ -152,10 +158,20 @@ def _wage_payers(store, year: int) -> tuple[list[dict], list[dict]]:
     skipped: list[dict] = []
     for d in store.list(year=year, form="WAGE_INCOME_TRANSCRIPT"):
         parsed, reason = parse_transcript_doc(d, store)
-        if reason is not None:
+        # C1: "partial" transcripts contribute mapped payers; only
+        # other reasons skip.
+        if reason is not None and reason != "partial":
             skipped.append({"doc_id": d.doc_id, "reason_code": reason})
             continue
-        payers.extend(parsed.get("payers", []))
+        # C1: mark partial payers; the unparsed count is coverage.
+        if reason == "partial":
+            for p in parsed.get("payers", []):
+                p = dict(p)
+                p["partial"] = True
+                p["n_unparsed"] = parsed.get("n_unparsed", 0)
+                payers.append(p)
+        else:
+            payers.extend(parsed.get("payers", []))
     return payers, skipped
 
 

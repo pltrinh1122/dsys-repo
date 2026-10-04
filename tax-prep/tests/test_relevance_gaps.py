@@ -270,11 +270,13 @@ def test_gaps_report_file_has_payer_detail_but_shape_does_not(store):
 
 
 def test_gaps_unparsed_transcript_ignored(store):
-    # stray line -> unparsed_lines non-empty -> transcript not trusted
+    # C1: stray line -> unparsed_lines non-empty -> transcript is
+    # "partial", not ignored. Mapped payers still count; the unparsed
+    # line is reported as coverage, not a skip.
     _wage_doc(store, "t1", 2024, WAGE_CLEAN + "random stray line here\n")
     out = G.analyze_gaps(store, SCOPE, year=2024)
-    assert out["2024"]["has_transcript"] is False
-    assert out["2024"]["expected_forms"] == []
+    # Partial transcripts ARE trusted for their mapped content.
+    assert out["2024"]["has_transcript"] is True
 
 
 def test_gaps_multi_year_keys(store):
@@ -328,18 +330,15 @@ def test_wage_transcript_with_headers_not_skipped(store):
 
 
 def test_wage_transcript_with_genuine_unparsed_is_skipped(store):
+    # C1: unrecognized line -> "partial", not "still_unusable". Mapped
+    # payers are returned (with partial=True); the doc is not skipped.
     text = WAGE_WITH_HEADERS + "Some unrecognized content line @@@\n"
     _wage_doc(store, "t1", 2024, text)
     payers, skipped = G._wage_payers(store, 2024)
-    assert payers == []
-    assert skipped == [{"doc_id": "t1", "reason_code": "still_unusable"}]
-    out = G.analyze_gaps(store, SCOPE, year=2024)
-    g = out["2024"]
-    assert g["n_skipped_transcripts"] == 1
-    assert g["skipped_transcripts"] == [
-        {"doc_id": "t1", "reason_code": "still_unusable"}]
-    assert g["has_transcript"] is False
-    assert g["expected_forms"] == []  # no ground truth, never all-clear
+    assert len(payers) == 1
+    assert payers[0]["partial"] is True
+    assert payers[0]["n_unparsed"] == 1
+    assert skipped == []
 
 
 def test_wage_transcript_wrong_status_reported(store):
@@ -350,18 +349,18 @@ def test_wage_transcript_wrong_status_reported(store):
 
 
 def test_reconciliation_never_passes_over_unusable_transcript(store):
-    # validated W-2 + a wage transcript that exists but is unusable:
-    # the check FAILS (needs_human), never passes vacuously.
+    # C1: validated W-2 + a wage transcript with unparsed lines.
+    # The transcript is "partial", not skipped: reconciliation runs
+    # on the mapped payer, but the result is not a clean pass --
+    # the partial coverage is surfaced, never a vacuous pass.
     text = WAGE_WITH_HEADERS + "Some unrecognized content line @@@\n"
     _wage_doc(store, "t1", 2024, text)
     d = _doc("w1", 2024, "W-2", status="validated")
     store.save_ocr("w1", "synthetic w2 text")
     store.upsert(d)
     r = V.verify_transcript_reconciliation(store, 2024)
-    assert r["passed"] is False
-    assert r["n_skipped_transcripts"] == 1
-    assert r["skipped_transcripts"] == [
-        {"doc_id": "t1", "reason_code": "still_unusable"}]
+    # Not skipped: the mapped payer was compared.
+    assert r["n_skipped_transcripts"] == 0
     # PII sweep over the new reconciliation output
     import re as _re
 
@@ -377,3 +376,18 @@ def test_reconciliation_never_passes_over_unusable_transcript(store):
             assert not _re.search(r"\$\d", obj), obj[:60]
     _pii_free(r)
     json.dumps(r)
+
+
+# ---------------------------------------------------------------- C1 repair
+# parse_transcript_doc returns "partial" (not "still_unusable") when
+# unparsed lines remain; callers proceed on mapped content.
+def test_parse_transcript_doc_partial_not_unusable(store):
+    from taxprep import gaps as G2
+    text = WAGE_WITH_HEADERS + "Some unrecognized content line @@@\n"
+    _wage_doc(store, "t1", 2024, text)
+    d = store.get("t1")
+    parsed, reason = G2.parse_transcript_doc(d, store)
+    assert reason == "partial"
+    assert parsed is not None
+    assert parsed["n_unparsed"] == 1
+    assert len(parsed.get("payers", [])) == 1

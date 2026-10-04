@@ -1155,8 +1155,13 @@ def _store_pages_for(bundle: PageBundle, text: str) -> list[str] | None:
     legacy byte-identical stored text. The markers apply only when the
     stored text IS the whole bundle join (``"\\n".join(bundle.pages)``)
     -- the extraction text is always the ``"\\n"`` join, unchanged.
+
+    O2-repair: the OCR indicator is the route OR a set ocr_engine
+    (escalation paths such as force-ocr via ocrmypdf may not carry
+    route == "ocr" even though per-page OCR produced the bundle text).
     """
-    if bundle.route == "ocr" and text == "\n".join(bundle.pages):
+    is_ocr = bundle.route == "ocr" or bundle.ocr_engine is not None
+    if is_ocr and bundle.pages and text == "\n".join(bundle.pages):
         return list(bundle.pages)
     return None
 

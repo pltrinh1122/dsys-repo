@@ -285,6 +285,8 @@ taxprep/
                  OCR-accuracy: on `text_source=ocr:*` the 1099-B box-token
                  fallbacks tolerate 1/l/I and 0/O confusions (labeled
                  patterns stay primary; native text is byte-identical);
+                 the fallback gap allows newlines (real tesseract often
+                 puts box tokens and amounts on separate lines);
                  the 1099-B lots field drops to `low` with reason
                  `lot_count_mismatch` (+ counts-only expected/extracted)
                  when fewer lots extract than the "Lot N" markers or
@@ -330,7 +332,9 @@ taxprep/
                  corroboration conflicts
   verify.py      mechanical verification suite (blind-safe): completeness,
                  validation gate, 1099-B lot integrity, transcript
-                 reconciliation (EIN/name/1:1 matching, 1-cent tolerance),
+                 reconciliation (EIN/name/1:1 matching, 1-cent tolerance;
+                 "partial" transcripts compare on mapped lines with
+                 unparsed counts as coverage, never skipped outright),
                  carryforward-readiness; all outputs counts/ids/booleans
   cli.py         argparse CLI: ingest | list | show | review | carryforward | mcp | verify
                  (TAXPREP_BLIND=1 redacts `show` field values)
