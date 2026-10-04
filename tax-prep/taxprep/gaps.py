@@ -10,10 +10,14 @@ from two signals, both metadata-only:
    "Schedule C" expects 1099-NEC/MISC.
 
 Return value is PII-free: per year {expected_forms, missing_forms,
-n_transcript_payers, n_document_payers, transcript_forms} plus a top-
-level report_path. Per-payer detail (names -> missing forms) goes ONLY
-to the local report file under data/reports/ -- operator's eyes, never
-committed, never returned over a tool boundary.
+n_transcript_payers, n_document_payers, transcript_forms, schedules_seen,
+n_docs, has_transcript, n_skipped_transcripts, skipped_transcripts}
+plus a top-level report_path. skipped_transcripts lists transcript
+docs that exist for the year but could not be used, with a
+reason_code -- never silently dropped. Per-payer detail (names ->
+missing forms) goes ONLY to the local report file under
+data/reports/ -- operator's eyes, never committed, never returned
+over a tool boundary.
 """
 
 from __future__ import annotations
@@ -37,29 +41,119 @@ _SCHEDULE_RE = re.compile(r"schedule\s+([a-z])\b", re.IGNORECASE)
 _PAYER_FORMS = {"W-2", "1099-B", "1099-INT", "1099-DIV", "1099-NEC",
                 "1099-R", "1099-MISC"}
 
+# G1: IRS transcript header / notice lines. Realistic transcripts always
+# carry these (title, tax-year banner, notice boilerplate, taxpayer
+# identity header). They are structural -- represented by form_type /
+# tax_year -- not content, so they must not count as unparsed lines and
+# must not trigger skipping a transcript. Heuristic and documented as
+# such: a line matching here only ever SUPPRESSES a skip, it never adds
+# content. (transcript.py keeps its own parallel structural set; this
+# module does not touch that file.)
+_HEADER_LINE_RES = [
+    # title lines: "WAGE AND INCOME TRANSCRIPT", "TAX RETURN TRANSCRIPT",
+    # "ACCOUNT TRANSCRIPT", "RECORD OF ACCOUNT"
+    re.compile(
+        r"^\s*((wage\s+and\s+income|tax\s+return|account)\s+transcript"
+        r"|record\s+of\s+account)\b", re.IGNORECASE),
+    # "For Tax Year 2024", "Tax Year: 2024", "Tax Period 2024"
+    re.compile(r"^\s*(for\s+)?tax\s*(year|period)\s*[:\-]?\s*\d{4}\b",
+               re.IGNORECASE),
+    # taxpayer identity header: "Taxpayer: ...", "SSN: ..."
+    re.compile(r"^\s*(taxpayer(\s+(name|ssn))?|ssn|tin)\s*[:\-]",
+               re.IGNORECASE),
+    # notice boilerplate
+    re.compile(r"^\s*note\s*[:\-]", re.IGNORECASE),
+    re.compile(r"^\s*(this|the)\s+(transcript|product|document)\b",
+               re.IGNORECASE),
+    re.compile(r"^\s*for\s+your\s+(information|records)\b", re.IGNORECASE),
+    re.compile(r"^\s*(please|important)\b.*\b(transcript|information)\b",
+               re.IGNORECASE),
+]
 
-def _wage_payers(store, year: int) -> list[dict]:
+
+def is_transcript_header_line(line: str) -> bool:
+    """True for a known IRS transcript header/notice line (see above).
+
+    Classification only -- never echoes the line anywhere. verify.py
+    imports this for the reconciliation path.
+    """
+    return any(pat.match(line) for pat in _HEADER_LINE_RES)
+
+
+# transcript form -> parser; ACCOUNT_TRANSCRIPT and RECORD_OF_ACCOUNT
+# parsers are the R17 workstream's (absent from transcript.py for now).
+_TRANSCRIPT_PARSERS = {
+    "WAGE_INCOME_TRANSCRIPT": "parse_wage_income_transcript",
+    "RETURN_TRANSCRIPT": "parse_return_transcript",
+    "ACCOUNT_TRANSCRIPT": "parse_account_transcript",
+    "RECORD_OF_ACCOUNT": "parse_record_of_account",
+}
+
+# statuses a transcript may still be parsed under: a "needs_review" doc
+# whose only unparsed lines are headers is usable, not skipped.
+_USABLE_STATUSES = ("transcribed", "validated", "needs_review")
+
+
+def parser_for(form_type: str):
+    """The transcript.py parser for a transcript form, or None when the
+    R17 workstream has not added it yet."""
+    parser_name = _TRANSCRIPT_PARSERS.get(form_type)
+    return getattr(_transcript, parser_name, None) if parser_name else None
+
+
+def effective_unparsed_lines(parsed: dict) -> list:
+    """Parser-reported unparsed lines minus header/notice lines (G1)."""
+    return [line for line in (parsed.get("unparsed_lines") or [])
+            if not is_transcript_header_line(line)]
+
+
+def parse_transcript_doc(doc, store) -> tuple[dict | None, str | None]:
+    """Parse one transcript doc's OCR text with its form's parser.
+
+    Returns (parsed, None) when usable, else (None, reason_code) with
+    reason_code in {"wrong_status", "ocr_unavailable",
+    "parser_unavailable", "still_unusable"}. Header/notice lines (see
+    is_transcript_header_line) are excluded from the unusable judgment:
+    a transcript whose only unparsed lines are headers is fully usable.
+    The returned parsed dict has "unparsed_lines" replaced by the
+    effective (post-header-filter) list.
+    """
+    if doc.status not in _USABLE_STATUSES:
+        return None, "wrong_status"
+    try:
+        text = store.load_ocr(doc.doc_id)
+    except (FileNotFoundError, OSError):
+        return None, "ocr_unavailable"
+    parser = parser_for(doc.form_type)
+    if parser is None:
+        return None, "parser_unavailable"
+    parsed = parser(text, tax_year=doc.tax_year)
+    effective = effective_unparsed_lines(parsed)
+    if effective:
+        return None, "still_unusable"
+    parsed = dict(parsed)
+    parsed["unparsed_lines"] = effective
+    return parsed, None
+
+
+def _wage_payers(store, year: int) -> tuple[list[dict], list[dict]]:
     """Re-parse WAGE_INCOME_TRANSCRIPT OCR for a year into raw payer dicts.
 
-    Same guards as the reconciliation check: only fully-parsed
-    transcripts (no unparsed lines at ingest) in transcribed/validated
-    status. Payer dicts carry the RAW names/EINs -- they are used for
-    the expected-form computation and the local human report, never for
-    an agent-facing return value.
+    Returns (payers, skipped). Skipped entries are {"doc_id",
+    "reason_code"} dicts for transcript docs that exist for the year
+    but could not be used -- never silently dropped. Payer dicts carry
+    the RAW names/EINs -- used for the expected-form computation and
+    the local human report, never for an agent-facing return value.
     """
-    payers = []
+    payers: list[dict] = []
+    skipped: list[dict] = []
     for d in store.list(year=year, form="WAGE_INCOME_TRANSCRIPT"):
-        if d.status not in ("transcribed", "validated"):
-            continue
-        try:
-            text = store.load_ocr(d.doc_id)
-        except (FileNotFoundError, OSError):
-            continue
-        parsed = _transcript.parse_wage_income_transcript(text, tax_year=year)
-        if parsed.get("unparsed_lines"):
+        parsed, reason = parse_transcript_doc(d, store)
+        if reason is not None:
+            skipped.append({"doc_id": d.doc_id, "reason_code": reason})
             continue
         payers.extend(parsed.get("payers", []))
-    return payers
+    return payers, skipped
 
 
 def _schedule_forms(store, year: int) -> tuple[set[str], set[str]]:
@@ -99,7 +193,7 @@ def analyze_gaps(store, scope_years: list[int],
     report_sections: list[str] = []
 
     for y in years:
-        payers = _wage_payers(store, y)
+        payers, skipped = _wage_payers(store, y)
         txn_forms = sorted({(p.get("form_type") or "UNKNOWN").upper()
                             for p in payers
                             if (p.get("form_type") or "UNKNOWN").upper()
@@ -122,12 +216,23 @@ def analyze_gaps(store, scope_years: list[int],
             "schedules_seen": sorted(sched_seen),
             "n_docs": len(docs),
             "has_transcript": bool(payers),
+            # G1: transcripts that exist for the year but could not be
+            # used -- reported explicitly, never a silent gap.
+            "n_skipped_transcripts": len(skipped),
+            "skipped_transcripts": sorted(
+                skipped, key=lambda s: s["doc_id"]),
         }
 
         # -- per-payer detail: local report only (names live here) ----
         report_sections.append(f"=== {y} ===")
         if not payers:
             report_sections.append("no wage & income transcript parsed for this year")
+        if skipped:
+            report_sections.append(
+                "  skipped transcripts (unusable -- needs human): " +
+                ", ".join(f"{s['doc_id']}({s['reason_code']})"
+                          for s in sorted(skipped,
+                                          key=lambda s: s["doc_id"])))
         for p in payers:
             present = (p.get("form_type") or "UNKNOWN").upper() in actual
             report_sections.append(

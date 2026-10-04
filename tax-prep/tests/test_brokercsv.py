@@ -80,7 +80,8 @@ def test_unknown_term_kept_verbatim_low_confidence(iso):
     docs = ingest_csv(_csv(iso["tmp"] / "t.csv", csv), "generic", 2024,
                       DocumentStore(iso["data"]))
     assert docs[0].fields["lots"]["value"][0]["term"] == "maybe"
-    # unknown term -> from_store will exclude the lot: flagged low
+    # unknown term -> the carryforward guard will refuse on the lot
+    # (G2 blocker): flagged low
     assert docs[0].fields["lots"]["confidence"] == "low"
 
 

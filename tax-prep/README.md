@@ -119,6 +119,23 @@ the stage's reason code. `--from`/`--to` slice the sequence
 (stage names, counts, doc_ids, reason codes only); the full
 PII-bearing carryforward report stays operator-local.
 
+### Encrypted PDFs
+
+Encryption is detected with pypdf and the **empty password is tried
+first**. Owner-password-only PDFs (empty user password — common on
+government and financial PDFs) proceed normally: the document ingests
+and records `encryption="owner-only"` as provenance (operational
+metadata, blind-orchestrator safe, same class as `text_source` /
+`ocr_engine`; it crosses the MCP boundary). The OCR route applies the
+same try-empty-password-first logic — it hands the engine an
+unencrypted copy in a private temp dir and never touches `src`.
+
+A PDF that still needs a **user** password becomes BLOCKED with
+reason code `"encrypted"` for the Operator to decrypt. Passwords are
+never handled here — no password flag, prompt, or storage exists in
+the codebase. (AES-encrypted PDFs need the `cryptography` package,
+a hard dependency.)
+
 ## Review workflow (Phase 2)
 
 `taxprep review` starts a localhost-only HTTP server (binds 127.0.0.1;
@@ -219,9 +236,11 @@ tests/
 
 `taxprep carryforward` chains the Schedule D Capital Loss Carryover
 Worksheet across 2023→2024→2025→2026 from **validated** 1099-B lots
-only — any unvalidated 1099-B for a chained year is a hard error, and
-lots with unknown term or missing proceeds/basis are excluded with a
-warning (never guessed).
+only — any unvalidated 1099-B for a chained year is a hard error.
+Lots with unknown term or missing proceeds/basis are **blockers**
+(`lot_term_unknown` / `lot_missing_amounts`): the carryforward
+refuses until the Operator disposes (supplies the term/amounts or
+records an exclusion with a reason) — never a silent omission.
 
 Typical loop: `ingest` → `review` (validate everything) →
 `carryforward`. The 2023-2025 rows drive the 1040-X amendments; the
@@ -246,9 +265,15 @@ docstring for the full statement):
   is set to line 2 and a warning is recorded on every year.
 - Per-lot gain/loss on 1099-B lots is `1d − 1e + 1g`: box 1g (wash
   sale loss disallowed) is extracted per lot and added back to the
-  lot's gain/loss. Box 1f (federal income tax withheld) is a
+  lot's gain/loss. Box 1f is **accrued market discount** (NOT federal
+  income tax withheld) — Schedule B interest income, never part of
+  gain/loss and never a withholding credit; it is summed separately
+  for Phase 4 visibility. Box 4 (federal income tax withheld) is the
   withholding credit, never part of gain/loss; it is summed separately
   for the 1040 withholding line (Phase 4).
+- Verification semantics: the summary reconciliation reports
+  `evaluated: false` (and fails) when a statement shows totals but no
+  comparable keys — a vacuous check is not a pass.
 - Out of scope (flagged via warnings when indicated): unrecaptured
   section 1250 gain (25%), 28% collectibles rate,
   qualified-dividend interactions. State rules not modeled.

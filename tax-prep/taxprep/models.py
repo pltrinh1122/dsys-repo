@@ -78,6 +78,11 @@ class Document:
     ocr_mode: str | None = None          # skip-text | redo-ocr | force-ocr
     attempts: list = field(default_factory=list)
     mean_confidence: float | None = None
+    # X1: encryption provenance -- "owner-only" when the PDF carried only
+    # an owner password (empty user password unlocked it), None otherwise.
+    # Operational metadata, not taxpayer data -- crosses the MCP boundary
+    # alongside text_source/ocr_engine (blind-orchestrator safe).
+    encryption: str | None = None
 
     def __post_init__(self) -> None:
         if self.form_type not in FORM_TYPES:
@@ -114,4 +119,5 @@ class Document:
             ocr_mode=d.get("ocr_mode"),
             attempts=d.get("attempts") or [],
             mean_confidence=d.get("mean_confidence"),
+            encryption=d.get("encryption"),
         )

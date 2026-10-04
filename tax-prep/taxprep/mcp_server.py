@@ -71,7 +71,7 @@ def _scrub_code(code: str) -> str:
 # to expose to the blind orchestrator (no values, names, or paths).
 PROVENANCE_KEYS = ("text_source", "reason_code", "ocr_engine",
                    "engine_version", "ocr_mode", "attempts",
-                   "mean_confidence")
+                   "mean_confidence", "encryption")
 
 
 def _scrub_doc(doc_dict: dict) -> dict:

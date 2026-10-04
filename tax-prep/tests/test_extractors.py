@@ -160,6 +160,135 @@ def test_1099b_repeated_labeled_blocks():
     assert all(l["term"] == "long" for l in lots)
 
 
+# F1b: section headings propagate term/covered to every lot in the
+# section. All fixtures synthetic.
+B1099_HEADING_SHORT_COVERED = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Broker: EXAMPLE BROKERAGE
+Short-term covered
+Lot 1 1d Proceeds $1000.00 1e Cost or other basis $1500.00
+Lot 2 1d Proceeds $2000.00 1e Cost or other basis $2400.00
+Lot 3 1d Proceeds $500.00 1e Cost or other basis $300.00
+"""
+
+
+def test_1099b_section_heading_propagates_term_covered():
+    # workstation probe: 3 lots under "Short-term covered" -- all lots
+    # get term=short, covered=covered
+    fields, status = extract_fields("1099-B", B1099_HEADING_SHORT_COVERED)
+    assert status == "transcribed"
+    lots = _lots(fields)
+    assert len(lots) == 3
+    assert all(l["term"] == "short" for l in lots)
+    assert all(l["covered"] == "covered" for l in lots)
+
+
+B1099_TWO_SECTIONS = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Broker: EXAMPLE BROKERAGE
+Short-term covered
+Lot 1 1d Proceeds $1000.00 1e Cost or other basis $1500.00
+Lot 2 1d Proceeds $2000.00 1e Cost or other basis $2400.00
+Long-term noncovered
+Lot 3 1d Proceeds $500.00 1e Cost or other basis $300.00
+"""
+
+
+def test_1099b_two_sections_assign_per_section():
+    # the long-term heading sits between lot 2 and lot 3: it must not
+    # leak back onto lot 2, and lot 3 takes it
+    fields, status = extract_fields("1099-B", B1099_TWO_SECTIONS)
+    assert status == "transcribed"
+    lots = _lots(fields)
+    assert len(lots) == 3
+    assert [l["term"] for l in lots] == ["short", "short", "long"]
+    assert [l["covered"] for l in lots] == ["covered", "covered",
+                                            "noncovered"]
+
+
+def test_1099b_no_heading_term_stays_none():
+    # genuinely unknown stays None -- G2 raises it to the Operator
+    text = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Broker: EXAMPLE BROKERAGE
+Lot 1 1d Proceeds $1000.00 1e Cost or other basis $1500.00
+Lot 2 1d Proceeds $2000.00 1e Cost or other basis $2400.00
+"""
+    fields, _ = extract_fields("1099-B", text)
+    lots = _lots(fields)
+    assert len(lots) == 2
+    assert all(l["term"] is None for l in lots)
+    assert all(l["covered"] is None for l in lots)
+
+
+def test_1099b_box2_term_fallback_without_headings():
+    # form box 2 ("Short-term/Long-term gain or loss") is the fallback
+    # term source when no section headings exist
+    text = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Broker: EXAMPLE BROKERAGE
+Box 2: Short-term gain or loss
+Lot 1 1d Proceeds $1000.00 1e Cost or other basis $1500.00
+"""
+    fields, _ = extract_fields("1099-B", text)
+    lots = _lots(fields)
+    assert lots[0]["term"] == "short"
+    assert lots[0]["covered"] is None  # box 2 carries no covered info
+
+
+def test_1099b_lot_own_term_beats_heading():
+    # a lot's own segment wins over the section heading
+    text = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Broker: EXAMPLE BROKERAGE
+Short-term covered
+Lot 1 1d Proceeds $1000.00 1e Cost or other basis $1500.00 long term
+"""
+    fields, _ = extract_fields("1099-B", text)
+    lots = _lots(fields)
+    assert lots[0]["term"] == "long"      # segment wins
+    assert lots[0]["covered"] == "covered"  # inherited
+
+
+# B1F: box 1f is accrued market discount (Schedule B interest income),
+# NOT federal income tax withheld -- that is box 4.
+B1099_1F_AND_4 = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Broker: EXAMPLE BROKERAGE
+Lot 1 1d Proceeds $1000.00 1e Cost or other basis $1500.00 short term
+Accrued market discount $25.00
+Federal income tax withheld $28.00
+"""
+
+
+def test_1099b_box1f_is_accrued_market_discount_not_withholding():
+    fields, _ = extract_fields("1099-B", B1099_1F_AND_4)
+    lot = _lots(fields)[0]
+    assert lot["accrued_market_discount_1f"] == "25.00"
+    assert lot["fed_withheld_4"] == "28.00"
+    assert "fed_withheld_1f" not in lot  # the old mis-mapping is gone
+    # Decimal-safe strings, never floats
+    assert isinstance(lot["accrued_market_discount_1f"], str)
+    assert isinstance(lot["fed_withheld_4"], str)
+
+
+def test_1099b_box4_labeled_withholding():
+    text = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Broker: EXAMPLE BROKERAGE
+Lot 1 1d Proceeds $1000.00 1e Cost or other basis $1500.00 short term
+Box 4: $28.00
+"""
+    fields, _ = extract_fields("1099-B", text)
+    lot = _lots(fields)[0]
+    assert lot["fed_withheld_4"] == "28.00"
+    assert lot["accrued_market_discount_1f"] is None
+
+
+def test_1099b_1f_box_code_maps_to_discount():
+    text = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Broker: EXAMPLE BROKERAGE
+Lot 1 1d Proceeds $1000.00 1e Cost or other basis $1500.00 short term 1f $12.50
+"""
+    fields, _ = extract_fields("1099-B", text)
+    lot = _lots(fields)[0]
+    assert lot["accrued_market_discount_1f"] == "12.50"
+    assert lot["fed_withheld_4"] is None
+
+
 # D3: workstation probes, verbatim -- the greedy-gap truncation bug made
 # "52,345.67" extract as "5.67" and "100.00" as "0.0".
 @pytest.mark.parametrize("text,expected", [

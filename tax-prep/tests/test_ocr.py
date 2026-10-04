@@ -149,6 +149,24 @@ def encrypted_pdf(path):
     tmp.unlink()
 
 
+def owner_only_pdf(path):
+    """Owner-password-only PDF: the empty user password unlocks it."""
+    tmp = Path(str(path) + ".tmp.pdf")
+    c = canvas.Canvas(str(tmp), pagesize=letter)
+    c.drawString(72, 720, "Form W-2 Wage and Tax Statement Tax Year 2024")
+    c.showPage()
+    c.save()
+    reader = PdfReader(str(tmp))
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    writer.encrypt(user_password="", owner_password="synthetic-owner",
+                   algorithm="AES-128")
+    with open(path, "wb") as f:
+        writer.write(f)
+    tmp.unlink()
+
+
 def photo_pdf(path):
     """Photo-like page: full-page noise raster, no text."""
     rng = random.Random(7)
@@ -173,6 +191,7 @@ def fixtures(tmp_path):
         "no_tounicode": no_tounicode_pdf,
         "form": fillable_form_pdf,
         "encrypted": encrypted_pdf,
+        "owner_only": owner_only_pdf,
         "photo": photo_pdf,
     }
     for name, build in builders.items():
@@ -188,7 +207,8 @@ def fixtures(tmp_path):
 
 def test_fixtures_build(fixtures):
     assert set(fixtures) == {"image_only", "mixed", "stray_stamp", "bad_layer",
-                             "no_tounicode", "form", "encrypted", "photo"}
+                             "no_tounicode", "form", "encrypted", "owner_only",
+                             "photo"}
     for p in fixtures.values():
         assert p.exists() and p.stat().st_size > 0
 
@@ -293,6 +313,26 @@ def test_ocr_pdf_encrypted_blocked(tmp_path, fixtures):
     assert res["text"] == ""
     # never handles passwords: returns immediately, no exception text
     assert res["engine"] is None
+
+
+def test_user_password_required_pure_logic(fixtures):
+    # X1: the empty password is tried first -- only a genuine user
+    # password counts as requiring one.
+    assert ocr._user_password_required(fixtures["image_only"]) is False
+    assert ocr._user_password_required(fixtures["owner_only"]) is False
+    assert ocr._user_password_required(fixtures["encrypted"]) is True
+
+
+def test_ocr_pdf_owner_only_not_refused(tmp_path, fixtures, monkeypatch):
+    # X1: owner-only PDF is NOT refused with "encrypted"; the next gate
+    # (engine absence here) is what fails, and src is never modified.
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    before = fixtures["owner_only"].stat().st_size
+    res = ocr.ocr_pdf(fixtures["owner_only"], "skip-text",
+                      tmp_path / "work")
+    assert res["ok"] is False
+    assert res["reason_code"] == "engine_missing"  # not "encrypted"
+    assert fixtures["owner_only"].stat().st_size == before
 
 
 def test_ocr_pdf_engine_missing_without_engine(tmp_path, fixtures, monkeypatch):

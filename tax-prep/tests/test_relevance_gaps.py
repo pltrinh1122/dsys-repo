@@ -279,3 +279,98 @@ def test_gaps_multi_year_keys(store):
     out = G.analyze_gaps(store, SCOPE)
     assert set(out) == {"2023", "2024", "2025", "2026", "report_path"}
     assert out["2023"]["has_transcript"] is False
+
+
+# -- G1: header lines are structural; skipped transcripts reported ------
+
+WAGE_WITH_HEADERS = """WAGE AND INCOME TRANSCRIPT
+For Tax Year 2024
+Note: This transcript is provided for your information only.
+This transcript shows income reported to the IRS for the tax year.
+Taxpayer: SYNTHETIC PERSON 000-00-0001
+Payer: ACME CORPORATION 12-3456789
+Form W-2
+Box 1 Wages: $85,000.00
+"""
+
+
+def test_header_lines_recognized_as_structural():
+    for line in ("WAGE AND INCOME TRANSCRIPT",
+                 "TAX RETURN TRANSCRIPT",
+                 "For Tax Year 2024",
+                 "Tax Year: 2024",
+                 "Note: informational use only.",
+                 "This transcript shows income reported to the IRS.",
+                 "For your information: keep this transcript.",
+                 "Taxpayer: SYNTHETIC PERSON 000-00-0001"):
+        assert G.is_transcript_header_line(line), line
+    for line in ("Payer: ACME CORPORATION 12-3456789",
+                 "Form W-2",
+                 "Box 1 Wages: $85,000.00",
+                 "Adjusted Gross Income: $85,420.00"):
+        assert not G.is_transcript_header_line(line), line
+
+
+def test_wage_transcript_with_headers_not_skipped(store):
+    # headers only: usable even in needs_review status (the G1 fix)
+    _wage_doc(store, "t1", 2024, WAGE_WITH_HEADERS, status="needs_review")
+    payers, skipped = G._wage_payers(store, 2024)
+    assert len(payers) == 1 and skipped == []
+    out = G.analyze_gaps(store, SCOPE, year=2024)
+    g = out["2024"]
+    assert g["has_transcript"] is True
+    assert g["n_skipped_transcripts"] == 0
+    assert g["skipped_transcripts"] == []
+    json.dumps(out)
+
+
+def test_wage_transcript_with_genuine_unparsed_is_skipped(store):
+    text = WAGE_WITH_HEADERS + "Some unrecognized content line @@@\n"
+    _wage_doc(store, "t1", 2024, text)
+    payers, skipped = G._wage_payers(store, 2024)
+    assert payers == []
+    assert skipped == [{"doc_id": "t1", "reason_code": "still_unusable"}]
+    out = G.analyze_gaps(store, SCOPE, year=2024)
+    g = out["2024"]
+    assert g["n_skipped_transcripts"] == 1
+    assert g["skipped_transcripts"] == [
+        {"doc_id": "t1", "reason_code": "still_unusable"}]
+    assert g["has_transcript"] is False
+    assert g["expected_forms"] == []  # no ground truth, never all-clear
+
+
+def test_wage_transcript_wrong_status_reported(store):
+    _wage_doc(store, "t1", 2024, WAGE_CLEAN, status="BLOCKED")
+    payers, skipped = G._wage_payers(store, 2024)
+    assert payers == []
+    assert skipped == [{"doc_id": "t1", "reason_code": "wrong_status"}]
+
+
+def test_reconciliation_never_passes_over_unusable_transcript(store):
+    # validated W-2 + a wage transcript that exists but is unusable:
+    # the check FAILS (needs_human), never passes vacuously.
+    text = WAGE_WITH_HEADERS + "Some unrecognized content line @@@\n"
+    _wage_doc(store, "t1", 2024, text)
+    d = _doc("w1", 2024, "W-2", status="validated")
+    store.save_ocr("w1", "synthetic w2 text")
+    store.upsert(d)
+    r = V.verify_transcript_reconciliation(store, 2024)
+    assert r["passed"] is False
+    assert r["n_skipped_transcripts"] == 1
+    assert r["skipped_transcripts"] == [
+        {"doc_id": "t1", "reason_code": "still_unusable"}]
+    # PII sweep over the new reconciliation output
+    import re as _re
+
+    def _pii_free(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                assert k not in ("value", "raw_text"), k
+                _pii_free(v)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                _pii_free(v)
+        elif isinstance(obj, str):
+            assert not _re.search(r"\$\d", obj), obj[:60]
+    _pii_free(r)
+    json.dumps(r)

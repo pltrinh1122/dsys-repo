@@ -18,8 +18,8 @@ so re-ingesting the same CSV is idempotent and carries no filename.
 
 Money values are kept as the broker's raw strings (Decimal-safe --
 never floated); from_store coerces them. Term values are normalized
-to short|long; anything else is kept verbatim (from_store excludes
-unknown terms with a loud warning -- never guessed).
+to short|long; anything else is kept verbatim (the carryforward guard
+refuses on unknown terms with a loud blocker -- never guessed).
 
 Synthetic fixtures only in tests. Fully local, deterministic.
 """
@@ -37,7 +37,8 @@ from .store import DocumentStore
 # Canonical lot fields (what from_store reads, plus dates).
 CANONICAL_FIELDS = ("proceeds", "basis", "term",
                     "date_acquired", "date_sold", "description",
-                    "wash_1g", "fed_withheld_1f")
+                    "wash_1g", "fed_withheld_4",
+                    "accrued_market_discount_1f")
 
 # Canonical field -> key inside the per-lot dict on the Document's
 # fields["lots"]["value"] table.
@@ -49,7 +50,10 @@ FIELD_CODES = {
     "date_sold": "date_sold",
     "description": "description",
     "wash_1g": "wash_1g",
-    "fed_withheld_1f": "fed_withheld_1f",
+    # B1F: box 1f is accrued market discount, NOT withholding;
+    # federal income tax withheld is box 4.
+    "fed_withheld_4": "fed_withheld_4",
+    "accrued_market_discount_1f": "accrued_market_discount_1f",
 }
 
 # Broker column name (normalized) -> canonical field. "generic" covers
@@ -76,8 +80,11 @@ BROKER_MAPS: dict[str, dict[str, str]] = {
         "disposal date": "date_sold",
         "wash sale loss disallowed": "wash_1g",
         "wash sale disallowed": "wash_1g",
-        "federal income tax withheld": "fed_withheld_1f",
-        "backup withholding": "fed_withheld_1f",
+        # B1F: federal income tax withheld is box 4; box 1f is
+        # accrued market discount.
+        "federal income tax withheld": "fed_withheld_4",
+        "backup withholding": "fed_withheld_4",
+        "accrued market discount": "accrued_market_discount_1f",
     },
     # Best-effort provisional maps (Operator-confirmed in review).
     "fidelity": {
@@ -110,7 +117,8 @@ def _norm_header(h: str) -> str:
 
 def _norm_term(raw: str) -> tuple[str, str]:
     """(canonical_term, confidence). Unknown terms are kept verbatim
-    with low confidence -- from_store excludes them loudly."""
+    with low confidence -- the carryforward guard refuses on them
+    loudly (G2 blocker), never guessed."""
     key = _norm_header(raw)
     if key in _TERM_MAP:
         return _TERM_MAP[key], "high"
@@ -161,7 +169,8 @@ def ingest_csv(csv_path: str | Path, broker: str, year: int,
             "proceeds_1d": None,
             "basis_1e": None,
             "wash_1g": None,
-            "fed_withheld_1f": None,
+            "accrued_market_discount_1f": None,
+            "fed_withheld_4": None,
             "term": None,
             "covered": None,
         }
@@ -192,8 +201,8 @@ def ingest_csv(csv_path: str | Path, broker: str, year: int,
         elif not lot["proceeds_1d"] and not lot["basis_1e"]:
             lots_conf = "low"
         elif lot["term"] is not None and term_conf != "high":
-            # Unknown term kept verbatim: from_store will exclude this
-            # lot with a loud warning -- flag it low for the reviewer.
+            # Unknown term kept verbatim: the carryforward guard will
+            # refuse on it (G2 blocker) -- flag it low for the reviewer.
             lots_conf = "low"
         else:
             lots_conf = "medium"

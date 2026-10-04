@@ -20,7 +20,8 @@ D = Decimal
 
 
 def _lot(proceeds=None, basis=None, term=None, wash_1g=None,
-         fed_withheld_1f=None, description=None,
+         fed_withheld_4=None, accrued_market_discount_1f=None,
+         description=None,
          date_acquired="01/15/2024", date_sold="06/20/2024"):
     return {
         "description": description,
@@ -29,20 +30,23 @@ def _lot(proceeds=None, basis=None, term=None, wash_1g=None,
         "proceeds_1d": proceeds,
         "basis_1e": basis,
         "wash_1g": wash_1g,
-        "fed_withheld_1f": fed_withheld_1f,
+        "accrued_market_discount_1f": accrued_market_discount_1f,
+        "fed_withheld_4": fed_withheld_4,
         "term": term,
         "covered": None,
     }
 
 
 def b1099(doc_id, year, proceeds, basis, term, status="validated",
-          wash_1g=None, fed_withheld_1f=None, lots=None):
+          wash_1g=None, fed_withheld_4=None,
+          accrued_market_discount_1f=None, lots=None):
     """Single- (or multi-) lot 1099-B fixture on the lot-table shape.
 
     ``lots`` overrides the single lot built from proceeds/basis/term.
     """
     if lots is None:
-        lots = [_lot(proceeds, basis, term, wash_1g, fed_withheld_1f)]
+        lots = [_lot(proceeds, basis, term, wash_1g, fed_withheld_4,
+                     accrued_market_discount_1f)]
     return Document(
         doc_id=doc_id,
         tax_year=year,
@@ -160,17 +164,68 @@ def test_from_store_refuses_unvalidated(tmp_path):
         from_store(store, 2024)
 
 
-def test_from_store_sums_and_excludes_unknown_term(tmp_path):
+# G2: lots with unknown term are blockers -- carryforward refuses
+# until the Operator disposes. Never a silent omission.
+def test_g2_unknown_term_lot_is_blocker(tmp_path):
     store = DocumentStore(tmp_path / "data")
     store.upsert(b1099("b1", 2024, "1,000.00", "1,500.00", "short"))   # -500 ST
     store.upsert(b1099("b2", 2024, "2,000.00", "1,200.00", "long"))    # +800 LT
     store.upsert(b1099("b3", 2024, "500.00", "400.00", None))          # unknown term
+    blockers = carryforward_blockers(store)
+    assert blockers == [{"doc_id": "b3",
+                         "reason_code": "lot_term_unknown"}]
+    with pytest.raises(ValueError, match=r"b3\(lot_term_unknown\)") as ei:
+        from_store(store, 2024)
+    _refusal_message_pii_free(str(ei.value))
+    # the two clean docs compute once the termless one is excluded
+    # with a reason
+    exclusions.record_exclusion(store.data_dir, "b3",
+                                "operator: duplicate statement, use re-scan")
+    assert carryforward_blockers(store) == []
     r = from_store(store, 2024)
     assert r["st_current"] == D("-500")
     assert r["lt_current"] == D("800")
-    assert r["lots_included"] == 2
-    assert r["lots_excluded"] == 1
-    assert any("unknown" in w for w in r["warnings"])
+    assert r["lots_included"] == 2 and r["lots_excluded"] == 0
+    _from_store_pii_free(r)
+
+
+def test_g2_missing_amounts_lot_is_blocker(tmp_path):
+    store = DocumentStore(tmp_path / "data")
+    store.upsert(b1099("b4", 2024, "500.00", None, "short"))  # missing basis
+    blockers = carryforward_blockers(store)
+    assert blockers == [{"doc_id": "b4",
+                         "reason_code": "lot_missing_amounts"}]
+    with pytest.raises(ValueError, match=r"b4\(lot_missing_amounts\)"):
+        from_store(store, 2024)
+
+
+def test_g2_one_entry_per_doc_per_code(tmp_path):
+    # several tripping lots still yield one entry per (doc, code)
+    lots = [
+        _lot("500.00", "400.00", None),       # unknown term
+        _lot("600.00", "700.00", None),       # unknown term
+        _lot(None, "300.00", "short"),        # missing proceeds
+    ]
+    store = DocumentStore(tmp_path / "data")
+    store.upsert(b1099("m1", 2024, None, None, None, lots=lots))
+    assert carryforward_blockers(store) == [
+        {"doc_id": "m1", "reason_code": "lot_missing_amounts"},
+        {"doc_id": "m1", "reason_code": "lot_term_unknown"},
+    ]
+
+
+def test_g2_exclusion_with_reason_clears_lot_blocker(tmp_path):
+    store = DocumentStore(tmp_path / "data")
+    store.upsert(b1099("b3", 2024, "500.00", "400.00", None))
+    with pytest.raises(ValueError, match="lot_term_unknown"):
+        from_store(store, 2024)
+    exclusions.record_exclusion(store.data_dir, "b3",
+                                "operator: informational copy, no lots needed")
+    assert carryforward_blockers(store) == []
+    r = from_store(store, 2024)
+    # the excluded doc is skipped by the sums, not silently folded in
+    assert r["st_current"] == D("0") and r["lt_current"] == D("0")
+    assert r["lots_included"] == 0
 
 
 def test_from_store_wash_sale_1g_added_back(tmp_path):
@@ -204,15 +259,62 @@ def test_from_store_multi_lot_sums_every_lot(tmp_path):
     assert r["lots_included"] == 3 and r["lots_excluded"] == 0
 
 
-def test_from_store_withholding_is_not_gain_loss(tmp_path):
-    # Box 1f (federal income tax withheld) is a withholding credit:
-    # summed separately, never folded into gain/loss.
+def test_from_store_box4_withholding_and_1f_discount_totals(tmp_path):
+    # B1F: box 4 (federal income tax withheld) is the withholding
+    # credit; box 1f (accrued market discount) is Schedule B interest
+    # income. Both are summed separately -- never folded into
+    # gain/loss, and 1f never into withholding.
     store = DocumentStore(tmp_path / "data")
     store.upsert(b1099("f1", 2024, "1000.00", "1500.00", "short",
-                       fed_withheld_1f="28.00"))
+                       fed_withheld_4="28.00",
+                       accrued_market_discount_1f="25.00"))
     r = from_store(store, 2024)
     assert r["st_current"] == D("-500")
-    assert r["fed_withheld_1f_total"] == D("28.00")
+    assert r["fed_withheld_4_total"] == D("28.00")
+    assert r["accrued_market_discount_1f_total"] == D("25.00")
+    assert "fed_withheld_1f_total" not in r
+    _from_store_pii_free(r)
+
+
+def test_from_store_withholding_sums_box4_only(tmp_path):
+    # two lots: box-4 withholding accumulates; a lot with no
+    # withholding contributes zero
+    lots = [
+        _lot("1000.00", "1500.00", "short", fed_withheld_4="10.00"),
+        _lot("2000.00", "1800.00", "long", fed_withheld_4="5.00"),
+    ]
+    store = DocumentStore(tmp_path / "data")
+    store.upsert(b1099("f2", 2024, None, None, None, lots=lots))
+    r = from_store(store, 2024)
+    assert r["fed_withheld_4_total"] == D("15.00")
+    assert r["accrued_market_discount_1f_total"] == D("0")
+
+
+# F1b end to end: the "Short-term covered" section heading propagates
+# to every lot, so from_store sums them instead of refusing on
+# unknown term. (-500) + (-400) + (+200) = -700.00 ST exactly.
+_F1B_HEADING_TEXT = """Form 1099-B Proceeds From Broker Transactions Tax Year 2024
+Broker: EXAMPLE BROKERAGE
+Short-term covered
+Lot 1 1d Proceeds $1000.00 1e Cost or other basis $1500.00
+Lot 2 1d Proceeds $2000.00 1e Cost or other basis $2400.00
+Lot 3 1d Proceeds $500.00 1e Cost or other basis $300.00
+"""
+
+
+def test_f1b_heading_propagates_to_from_store(tmp_path):
+    from taxprep.extractors import extract_fields
+    fields, _ = extract_fields("1099-B", _F1B_HEADING_TEXT)
+    lots = fields["lots"]["value"]
+    assert all(l["term"] == "short" for l in lots)
+    assert all(l["covered"] == "covered" for l in lots)
+    store = DocumentStore(tmp_path / "data")
+    store.upsert(b1099("h1", 2024, None, None, None, lots=lots))
+    r = from_store(store, 2024)
+    assert r["st_current"] == D("-700.00")
+    assert r["lt_current"] == D("0")
+    assert r["lots_included"] == 3 and r["lots_excluded"] == 0
+    _from_store_pii_free(r)
 
 
 def test_e2e_ingest_validate_carryforward_no_retyping(tmp_path):
@@ -370,6 +472,21 @@ def _refusal_message_pii_free(msg):
     assert '"value"' not in msg and '"raw_text"' not in msg
 
 
+def _from_store_pii_free(obj):
+    """Recursive blind-orchestrator assertion over carryforward
+    outputs (blocker lists, from_store results): doc_ids and reason
+    codes only -- no value/raw_text keys, no money patterns."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            assert k not in ("value", "raw_text"), f"PII key leaked: {k!r}"
+            _from_store_pii_free(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _from_store_pii_free(v)
+    elif isinstance(obj, str):
+        assert not re.search(r"\$\d", obj), f"money leaked: {obj[:60]!r}"
+
+
 def test_guard_refuses_unknown_form(tmp_path):
     store = _real_store(tmp_path, [_real_doc("u1", 2024, "UNKNOWN")])
     assert carryforward_blockers(store) == [
@@ -439,15 +556,15 @@ def test_guard_zero_lots_is_chained_year_scoped(tmp_path):
         carryforward_blockers(store, chained_years=[2023, 2024])
 
 
-def test_guard_malformed_lot_keeps_exclude_with_warning(tmp_path):
-    # lot present but term unknown: NOT zero-lots -- the existing
-    # exclude-with-warning path still handles it
+def test_g2_malformed_lot_is_blocker_not_silent(tmp_path):
+    # lot present but term unknown: NOT zero-lots -- it is a G2
+    # lot_term_unknown blocker until the Operator disposes
     store = _real_store(tmp_path, [b1099("b3", 2024, "500.00", "400.00",
                                         None)])
-    assert carryforward_blockers(store) == []
-    r = from_store(store, 2024)
-    assert r["lots_included"] == 0 and r["lots_excluded"] == 1
-    assert any("unknown" in w for w in r["warnings"])
+    assert carryforward_blockers(store) == [
+        {"doc_id": "b3", "reason_code": "lot_term_unknown"}]
+    with pytest.raises(ValueError, match=r"b3\(lot_term_unknown\)"):
+        from_store(store, 2024)
 
 
 def test_guard_scans_whole_store_not_just_year(tmp_path):

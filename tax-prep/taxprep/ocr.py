@@ -71,9 +71,12 @@ Failure policy:
   * reason_code is one of: "engine_missing", "encrypted", "source_missing",
     "invalid_mode", "ocr_failed", "render_unavailable", "ocr_timeout".
     It is a stable code, never exception text (R6).
-  * Encrypted PDFs are detected with pypdf and refused with
-    reason_code "encrypted" (BLOCKED-encrypted). The Operator decrypts;
-    passwords are never handled here.
+  * Encrypted PDFs are detected with pypdf; the empty password is tried
+    first. Owner-password-only PDFs (empty user password) proceed: the
+    engine is handed an unencrypted copy in the private TMPDIR. PDFs that
+    still need a USER password are refused with reason_code "encrypted"
+    (BLOCKED-encrypted). The Operator decrypts those; passwords are never
+    handled here.
   * A private TMPDIR is created inside ``work_dir`` (mode 0700) for every
     run; engine subprocesses inherit it. Temp files (rendered pages, TSVs)
     are removed afterwards. Files and directories this module creates use
@@ -97,7 +100,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 # Modes accepted by ocr_pdf / ocr_with_escalation.
 MODES = ("skip-text", "redo-ocr", "force-ocr")
@@ -197,6 +200,47 @@ def _is_encrypted(src: Path):
         return bool(PdfReader(str(src)).is_encrypted)
     except Exception:
         return None
+
+
+def _user_password_required(src: Path) -> bool:
+    """True when src is a PDF that still needs a USER password after the
+    empty password is tried; False when the PDF is open or owner-password-
+    only (empty password unlocks it). False on unreadable files too --
+    those were never refused here and still aren't (the engine-missing /
+    render gates handle them downstream)."""
+    try:
+        reader = PdfReader(str(src))
+    except Exception:
+        return False
+    try:
+        if not reader.is_encrypted:
+            return False
+    except Exception:
+        return False
+    try:
+        return not bool(reader.decrypt(""))
+    except Exception:
+        return True
+
+
+def _decrypted_copy(src: Path, dest: Path) -> bool:
+    """Write an unencrypted copy of an owner-password-only PDF to ``dest``.
+
+    ``src`` is never modified. Returns False when a user password is
+    required or anything fails (the caller refuses with RC_ENCRYPTED).
+    """
+    try:
+        reader = PdfReader(str(src))
+        if reader.is_encrypted and not reader.decrypt(""):
+            return False
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+        with open(dest, "wb") as fh:
+            writer.write(fh)
+        return True
+    except Exception:
+        return False
 
 
 def _ensure_private_dir(path: Path) -> None:
@@ -430,8 +474,12 @@ def ocr_pdf(src: Path, mode: str, work_dir: Path) -> dict:
     if not src.is_file():
         return _fail(mode, RC_SOURCE_MISSING)
 
-    encrypted = _is_encrypted(src)
+    encrypted = _user_password_required(src)
     if encrypted:
+        # BLOCKED-encrypted: the Operator decrypts; passwords are never
+        # handled here. Owner-password-only files pass this gate: the
+        # empty password already unlocked them, and the engine below is
+        # handed a decrypted copy.
         return _fail(mode, RC_ENCRYPTED, [
             _make_attempt(mode, None, None, False, 0, None, RC_ENCRYPTED)])
 
@@ -445,9 +493,21 @@ def ocr_pdf(src: Path, mode: str, work_dir: Path) -> dict:
     _ensure_private_dir(work_dir)
     tmp = Path(tempfile.mkdtemp(prefix="ocr-", dir=str(work_dir)))
     try:
+        effective = src
+        if _is_encrypted(src):
+            # Owner-password-only: hand the engine an unencrypted copy in
+            # the private tmp dir (engines take no passwords here). The
+            # copy is removed with tmp in the finally below.
+            dec = tmp / f"decrypted_{_sha_prefix(src)}.pdf"
+            if not _decrypted_copy(src, dec):
+                return _fail(mode, RC_ENCRYPTED, [
+                    _make_attempt(mode, None, None, False, 0, None,
+                                  RC_ENCRYPTED)])
+            effective = dec
         if engine == "ocrmypdf":
-            return _run_ocrmypdf(src, mode, work_dir, tmp, engine_version)
-        return _run_tesseract(src, mode, work_dir, tmp, engine_version)
+            return _run_ocrmypdf(effective, mode, work_dir, tmp,
+                                 engine_version)
+        return _run_tesseract(effective, mode, work_dir, tmp, engine_version)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

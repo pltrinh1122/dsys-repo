@@ -219,6 +219,44 @@ def test_encrypted_pdf_is_blocked(iso):
     assert doc.reason_code == RC_ENCRYPTED
     assert doc.status_reason == RC_ENCRYPTED
     assert doc.fields == {}
+    assert doc.encryption is None  # X1: only user-password PDFs land here
+
+
+def _owner_only_pdf(path: Path, text: str, algorithm: str) -> Path:
+    """Synthetic owner-password-only PDF: empty user password unlocks it."""
+    _pdf(path, text)
+    reader = PdfReader(str(path))
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    writer.encrypt(user_password="", owner_password="synthetic-owner",
+                   algorithm=algorithm)
+    with open(path, "wb") as fh:
+        writer.write(fh)
+    return path
+
+
+@pytest.mark.parametrize("algorithm", ["RC4-128", "AES-128", "AES-256"])
+def test_owner_password_only_pdf_ingests_with_provenance(iso, algorithm):
+    # X1: owner-only PDFs proceed like ordinary PDFs; the encryption
+    # provenance is recorded on the Document (operational metadata).
+    pdf = _owner_only_pdf(iso["src"] / f"owner-{algorithm}.pdf", W2_TEXT,
+                          algorithm)
+    doc = ingest_file(pdf, iso["store"])[0]
+    assert doc.status != "BLOCKED"
+    assert doc.encryption == "owner-only"
+    assert "Box 1 Wages" in iso["store"].load_ocr(doc.doc_id)
+    # store round-trip preserves the new field (from_dict)
+    assert iso["store"].get(doc.doc_id).encryption == "owner-only"
+
+
+def test_owner_only_pdf_crosses_mcp_boundary_as_metadata(iso):
+    # X1: encryption rides with the other R5 provenance keys (non-PII).
+    from taxprep import mcp_server
+    pdf = _owner_only_pdf(iso["src"] / "owner-mcp.pdf", W2_TEXT, "AES-128")
+    doc = ingest_file(pdf, iso["store"])[0]
+    view = mcp_server._scrub_doc(doc.to_dict())
+    assert view["encryption"] == "owner-only"
 
 
 def test_form_field_pdf_extracts_values(iso):
@@ -235,7 +273,11 @@ def test_form_field_pdf_extracts_values(iso):
 
 
 def test_garbled_text_triggers_ocr_route(iso, monkeypatch):
-    # a text layer of (cid:) runs with no engine -> BLOCKED needs-ocr
+    # a text layer of (cid:) runs with no engine -> BLOCKED needs-ocr.
+    # Engine discovery (taxprep.ocr.available, consulted by
+    # ingest._pdf_page_bundle) is mocked absent so this holds where a
+    # real engine (tesseract) is installed too.
+    monkeypatch.setattr("taxprep.ocr.available", lambda: False)
     garbled = ("Form W-2 (cid:72)(cid:73)(cid:74) " * 40).strip()
     pdf = _pdf(iso["src"] / "garbled.pdf", garbled)
     doc = ingest_file(pdf, iso["store"])[0]
@@ -388,3 +430,114 @@ def test_transcript_fields_carry_verbatim_raw_text():
     assert fields["agi"]["raw_text"] == "Adjusted Gross Income: $85,420.00"
     assert fields["total_tax"]["raw_text"] == "Total Tax: $12,340.00"
     assert status == "transcribed"
+
+
+# -- R17: account-transcript + record-of-account branches -------------------
+
+ACCOUNT_TEXT = ("TAX ACCOUNT TRANSCRIPT\nTax Year: 2024\n"
+                "Account Balance: $1,234.56\n"
+                "Accrued Interest: $12.34 as of 09/22/2025\n"
+                "150 Tax return filed 20241205 04-15-2025 $1,234.56\n"
+                "846 Refund issued 20243207 10-05-2025 $384.56\n")
+
+ROA_TEXT = ("RECORD OF ACCOUNT\nTax Year: 2024\n"
+            "TAX RETURN TRANSCRIPT\n"
+            "Adjusted Gross Income: $85,420.00\n"
+            "150 Tax return filed 04-15-2025 $12,340.00\n"
+            "TAX ACCOUNT TRANSCRIPT\n"
+            "Account Balance: $0.00\n"
+            "846 Refund issued 20243207 10-05-2025 $0.00\n")
+
+
+def test_account_transcript_fields_branch():
+    fields, status = ingest._fields_from_transcript(
+        "ACCOUNT_TRANSCRIPT", ACCOUNT_TEXT, 2024)
+    # balance/accrual lines: high confidence, verbatim raw_text (R15)
+    assert fields["account_balance"] == {
+        "value": "1234.56", "confidence": "high",
+        "raw_text": "Account Balance: $1,234.56"}
+    assert fields["accrued_interest"]["value"] == "12.34"
+    assert fields["accrued_interest"]["confidence"] == "high"
+    # tc_<code> transaction fields, same shape as the return branch
+    assert fields["tc_150"] == {
+        "value": "1234.56", "confidence": "medium",
+        "raw_text": "Tax return filed"}
+    assert fields["tc_846"]["value"] == "384.56"
+    assert "_unparsed_lines" not in fields
+    assert status == "transcribed"
+
+
+def test_account_transcript_fields_needs_review():
+    fields, status = ingest._fields_from_transcript(
+        "ACCOUNT_TRANSCRIPT", ACCOUNT_TEXT + "mystery footer\n", 2024)
+    assert fields["_unparsed_lines"]["value"] == ["mystery footer"]
+    assert fields["_unparsed_lines"]["confidence"] == "low"
+    assert status == "needs_review"
+
+
+def test_roa_fields_merge_both_sections_with_provenance():
+    fields, status = ingest._fields_from_transcript(
+        "RECORD_OF_ACCOUNT", ROA_TEXT, 2024)
+    # return-section fields carry "return section: <raw>" provenance
+    assert fields["agi"]["value"] == 85420.0
+    assert fields["agi"]["raw_text"] == \
+        "return section: Adjusted Gross Income: $85,420.00"
+    assert fields["agi"]["confidence"] == "high"
+    # account-section fields carry "account section: <raw>" provenance
+    assert fields["account_balance"]["value"] == "0.00"
+    assert fields["account_balance"]["raw_text"] == \
+        "account section: Account Balance: $0.00"
+    # tc_<code> fields from both sections, provenance-tagged
+    assert fields["tc_150"]["raw_text"] == \
+        "return section: Tax return filed"
+    assert fields["tc_846"]["raw_text"] == \
+        "account section: Refund issued"
+    assert status == "transcribed"
+
+
+def test_roa_fields_top_level_unparsed_needs_review():
+    text = ROA_TEXT.replace("Tax Year: 2024\n",
+                            "Tax Year: 2024\nSome cover-page notice\n")
+    fields, status = ingest._fields_from_transcript(
+        "RECORD_OF_ACCOUNT", text, 2024)
+    assert fields["_unparsed_lines"]["value"] == ["Some cover-page notice"]
+    assert status == "needs_review"
+    # sections still merged
+    assert fields["agi"]["value"] == 85420.0
+    assert fields["account_balance"]["value"] == "0.00"
+
+
+def test_roa_fields_section_unparsed_tagged():
+    text = ROA_TEXT.replace("TAX ACCOUNT TRANSCRIPT\n",
+                            "TAX ACCOUNT TRANSCRIPT\nmystery acct line\n")
+    fields, status = ingest._fields_from_transcript(
+        "RECORD_OF_ACCOUNT", text, 2024)
+    assert fields["_unparsed_lines"]["value"] == \
+        ["account section: mystery acct line"]
+    assert status == "needs_review"
+
+
+# -- R17 integration: TRANSCRIPT_FORMS routes the new forms end to end --------
+
+def test_account_transcript_ingests_end_to_end(iso):
+    # R17: reachable through _extract_for_type (TRANSCRIPT_FORMS), not just
+    # direct _fields_from_transcript calls — classification + routing.
+    src = _write(iso["src"] / "account-transcript-2024.txt", ACCOUNT_TEXT)
+    doc = ingest_file(src, iso["store"])[0]
+    assert doc.form_type == "ACCOUNT_TRANSCRIPT"
+    assert doc.status == "transcribed"
+    assert doc.fields["account_balance"]["value"] == "1234.56"
+    assert doc.fields["tc_150"]["value"] == "1234.56"
+    assert doc.fields["tc_846"]["value"] == "384.56"
+
+
+def test_record_of_account_ingests_end_to_end(iso):
+    src = _write(iso["src"] / "record-of-account-2024.txt", ROA_TEXT)
+    doc = ingest_file(src, iso["store"])[0]
+    assert doc.form_type == "RECORD_OF_ACCOUNT"
+    assert doc.status == "transcribed"
+    # both sections present, section provenance in raw_text
+    assert doc.fields["agi"]["value"] == 85420.0  # return parser emits floats (pre-existing)
+    assert "return section" in doc.fields["agi"]["raw_text"]
+    assert doc.fields["tc_846"]["value"] == "0.00"
+    assert "account section" in doc.fields["tc_846"]["raw_text"]

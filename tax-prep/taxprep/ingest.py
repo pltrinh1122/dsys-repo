@@ -15,7 +15,10 @@ R5 text-sufficiency gate: per-page deterministic signals (chars per
 page, near-full-page image dominance, garble ratio, AcroForm values,
 encryption) route each document to native | form-field | OCR
 (--skip-text / --redo-ocr / --force-ocr via ocr.ocr_with_escalation)
-| BLOCKED-encrypted | ERROR(reason_code). OCR never modifies originals;
+| BLOCKED-encrypted | ERROR(reason_code). Owner-password-only PDFs (empty
+user password) try the empty password first and proceed with
+encryption="owner-only" provenance; only a required USER password is
+BLOCKED-encrypted for the Operator to decrypt. OCR never modifies originals;
 its outputs go under <data_dir>/ocr_work.
 
 R6 intake: .pdf / .txt plus images (jpg/jpeg/png/heic/heif/tiff/tif/
@@ -54,7 +57,14 @@ from . import extractors, transcript
 from .models import Document
 from .store import DocumentStore
 
-TRANSCRIPT_FORMS = {"WAGE_INCOME_TRANSCRIPT", "RETURN_TRANSCRIPT"}
+# R17: ACCOUNT_TRANSCRIPT + RECORD_OF_ACCOUNT have parsers in
+# transcript.py and branches in _fields_from_transcript.
+TRANSCRIPT_FORMS = {
+    "WAGE_INCOME_TRANSCRIPT",
+    "RETURN_TRANSCRIPT",
+    "ACCOUNT_TRANSCRIPT",
+    "RECORD_OF_ACCOUNT",
+}
 
 # form types with box-level extractors (mirrors extractors' supported set)
 BOX_FORMS = {
@@ -239,6 +249,9 @@ class PageBundle:
     ocr_mode: str | None = None
     attempts: list = field(default_factory=list)
     mean_confidence: float | None = None
+    # X1: "owner-only" when the PDF carried only an owner password (empty
+    # user password unlocked it); None otherwise. Operational metadata.
+    encryption: str | None = None
 
 
 def _ocr_pdf(pdf_path: Path, mode: str, work_dir: Path) -> dict:
@@ -293,6 +306,22 @@ def _ocr_page(page_pdf: Path, work_dir: Path, garbled: bool) -> dict:
     return out
 
 
+def _pages_readable(reader) -> bool:
+    """True when the reader's pages yield text without raising.
+
+    Used after a decrypt attempt: pypdf raises FileNotDecryptedError on
+    page access while still locked, so a clean first-page read is the
+    signal that the empty password actually unlocked the file.
+    """
+    try:
+        pages = reader.pages
+        if len(pages):
+            _ = pages[0].extract_text() or ""
+        return True
+    except Exception:
+        return False
+
+
 def _pdf_page_bundle(pdf_path: Path, store: DocumentStore) -> PageBundle:
     """Run the R5 gate over one PDF: per-page signals, then native |
     form-field | OCR | BLOCKED-encrypted | ERROR."""
@@ -308,12 +337,22 @@ def _pdf_page_bundle(pdf_path: Path, store: DocumentStore) -> PageBundle:
         encrypted = bool(reader.is_encrypted)
     except Exception:
         encrypted = False
+    encryption: str | None = None
     if encrypted:
-        # BLOCKED-encrypted: the Operator decrypts; passwords are
-        # never handled here. (Checked before touching pages: pypdf
-        # raises FileNotDecryptedError on page access.)
-        return PageBundle([], "blocked", TS_BLOCKED,
-                           reason_code=RC_ENCRYPTED)
+        # Owner-password-only PDFs (empty user password; common on
+        # gov/financial PDFs): try the empty password first. BLOCKED-
+        # encrypted is reserved for files that genuinely need a USER
+        # password -- the Operator decrypts those; passwords are never
+        # handled here. (Checked before touching pages: pypdf raises
+        # FileNotDecryptedError on page access while still locked.)
+        try:
+            unlocked = bool(reader.decrypt(""))
+        except Exception:
+            unlocked = False
+        if not unlocked or not _pages_readable(reader):
+            return PageBundle([], "blocked", TS_BLOCKED,
+                               reason_code=RC_ENCRYPTED)
+        encryption = "owner-only"
 
     try:
         n_pages = len(reader.pages)
@@ -349,7 +388,8 @@ def _pdf_page_bundle(pdf_path: Path, store: DocumentStore) -> PageBundle:
                                for k, v in sorted(form_values.items()))
         return PageBundle([native + "\n" + form_lines] if native.strip()
                           else [form_lines],
-                          "form-field", TS_FORM_FIELD)
+                          "form-field", TS_FORM_FIELD,
+                          encryption=encryption)
 
     attempts: list = []
     engine = engine_version = None
@@ -412,6 +452,7 @@ def _pdf_page_bundle(pdf_path: Path, store: DocumentStore) -> PageBundle:
         attempts=attempts,
         mean_confidence=(sum(confidences) / len(confidences)
                          if confidences else None),
+        encryption=encryption,
     )
 
 
@@ -484,6 +525,12 @@ def _fields_from_transcript(form_type: str, text: str,
 
     R8: positional payer keys (payer1.box1); the payer name is stored as
     a payer1.name field VALUE, never embedded in a key.
+
+    R17: ACCOUNT_TRANSCRIPT maps balance/accrual lines as fields plus
+    tc_<code> transaction fields, same field shape as the return branch.
+    RECORD_OF_ACCOUNT merges both sections' fields with section provenance
+    tagged in raw_text ("return section: <raw>" / "account section:
+    <raw>"); the account section is merged after the return section.
     """
     if form_type == "WAGE_INCOME_TRANSCRIPT":
         parsed = transcript.parse_wage_income_transcript(text, tax_year=year)
@@ -503,6 +550,48 @@ def _fields_from_transcript(form_type: str, text: str,
                     "raw_text": f"{payer.get('form_type', '')} box {box}",
                 }
         unparsed = parsed.get("unparsed_lines", [])
+    elif form_type == "ACCOUNT_TRANSCRIPT":
+        parsed = transcript.parse_account_transcript(text, tax_year=year)
+        line_raw = parsed.get("line_raw_text", {})
+        fields = {
+            label: {"value": val, "confidence": "high",
+                    "raw_text": line_raw.get(label, "")}
+            for label, val in parsed.get("lines", {}).items()
+        }
+        for t in parsed.get("transactions", []):
+            code = f"tc_{t.get('code')}"
+            fields[code] = {
+                "value": t.get("amount"),
+                "confidence": "medium",
+                "raw_text": t.get("description", ""),
+            }
+        unparsed = parsed.get("unparsed_lines", [])
+    elif form_type == "RECORD_OF_ACCOUNT":
+        parsed = transcript.parse_record_of_account(text, tax_year=year)
+        fields = {}
+        # Top-level unparsed (document lines outside both sections) plus
+        # each section's own unparsed, section-tagged so nothing is
+        # silently dropped.
+        unparsed = list(parsed.get("unparsed_lines", []))
+        for section, tag in (("return_section", "return section"),
+                             ("account_section", "account section")):
+            sec = parsed.get(section, {})
+            line_raw = sec.get("line_raw_text", {})
+            for label, val in sec.get("lines", {}).items():
+                fields[label] = {
+                    "value": val,
+                    "confidence": "high",
+                    "raw_text": f"{tag}: {line_raw.get(label, '')}",
+                }
+            for t in sec.get("transactions", []):
+                code = f"tc_{t.get('code')}"
+                fields[code] = {
+                    "value": t.get("amount"),
+                    "confidence": "medium",
+                    "raw_text": f"{tag}: {t.get('description', '')}",
+                }
+            for u in sec.get("unparsed_lines", []):
+                unparsed.append(f"{tag}: {u}")
     else:
         parsed = transcript.parse_return_transcript(text, tax_year=year)
         # R15: raw_text carries the verbatim transcript line (D4), not a
@@ -566,6 +655,7 @@ def _apply_provenance(doc: Document, bundle: PageBundle,
     doc.ocr_mode = bundle.ocr_mode
     doc.attempts = list(bundle.attempts)
     doc.mean_confidence = bundle.mean_confidence
+    doc.encryption = bundle.encryption
 
 
 def _canon_value(v):
@@ -764,6 +854,23 @@ def _build_documents(path: Path, doc_id: str, bundle: PageBundle,
     sections = extractors.split_form_sections(pages)
     typed = [s for s in sections if not s.excluded and s.form_type]
     distinct = list(dict.fromkeys(s.form_type for s in typed))
+
+    # R17: a Record of Account is one IRS transcript whose return and
+    # account sections carry their own transcript headers. Those inner
+    # anchors are content, not separate documents: collapse to a single
+    # RECORD_OF_ACCOUNT document parsed over the whole text by
+    # parse_record_of_account. (A genuinely different transcript type,
+    # e.g. WAGE_INCOME_TRANSCRIPT, still fans out below.)
+    _ROA_INNER = {"RETURN_TRANSCRIPT", "ACCOUNT_TRANSCRIPT"}
+    if "RECORD_OF_ACCOUNT" in distinct and set(distinct) <= (
+        _ROA_INNER | {"RECORD_OF_ACCOUNT"}
+    ):
+        distinct = ["RECORD_OF_ACCOUNT"]
+        typed = [
+            extractors.FormSection(
+                "RECORD_OF_ACCOUNT", text, 1, max(len(pages), 1)
+            )
+        ]
 
     if len(distinct) >= 2:
         if all(

@@ -1,8 +1,13 @@
 """IRS transcript parsers — local-only, stdlib only.
 
-Two entry points:
+Four entry points:
   - parse_return_transcript: IRS Tax Return Transcript -> lines / transactions.
   - parse_wage_income_transcript: IRS Wage & Income Transcript -> payer blocks.
+  - parse_account_transcript: IRS Tax Account Transcript -> lines /
+    transactions (with cycle). Money is Decimal-safe strings, never floats.
+  - parse_record_of_account: IRS Record of Account -> {"return_section",
+    "account_section", "unparsed_lines"}, reusing the return and account
+    parsers on the two sections.
 
 Mapping contract (return transcript):
   - Each summary line is normalized (strip, collapse internal whitespace,
@@ -38,7 +43,14 @@ import re
 _STRUCTURAL_LINE_RES = [
     re.compile(r"^\s*tax return transcript\s*$", re.IGNORECASE),
     re.compile(r"^\s*wage and income transcript\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:tax\s+)?account\s+transcript\s*$", re.IGNORECASE),
+    re.compile(r"^\s*record of account\s*$", re.IGNORECASE),
     re.compile(r"^\s*tax\s*(year|period)\s*[:\-]?\s*\d{4}\s*$", re.IGNORECASE),
+    # D5: "Tax Period Ending: Dec. 31, 2024" is a header, never a
+    # label. Without this, the bare ("TAX", "total_tax") table entry
+    # prefix-matches "TAX PERIOD ENDING" and the day number 31 reads
+    # as total_tax.
+    re.compile(r"^\s*tax\s+period\s+ending\b", re.IGNORECASE),
 ]
 
 
@@ -146,8 +158,8 @@ def _label_candidate(norm: str) -> str:
     return head
 
 
-def _match_return_label(candidate: str) -> tuple[str | None, str | None, bool]:
-    """Match a label candidate against the table.
+def _match_label(candidate: str, table) -> tuple[str | None, str | None, bool]:
+    """Match a label candidate against an exact-label table.
 
     Returns (key, matched_label, ambiguous). Exact match wins; otherwise
     the longest prefixing label wins. If the longest length is shared by
@@ -156,7 +168,7 @@ def _match_return_label(candidate: str) -> tuple[str | None, str | None, bool]:
     if not candidate:
         return None, None, False
     hits: list[tuple[int, str, str]] = []
-    for label, key in _RETURN_LABEL_TABLE:
+    for label, key in table:
         if candidate == label:
             hits.append((len(label), key, label))
         elif candidate.startswith(label):
@@ -171,6 +183,11 @@ def _match_return_label(candidate: str) -> tuple[str | None, str | None, bool]:
     if len(keys) > 1:
         return None, None, True
     return winners[0][0], winners[0][1], False
+
+
+def _match_return_label(candidate: str) -> tuple[str | None, str | None, bool]:
+    """Match a label candidate against the return-transcript table."""
+    return _match_label(candidate, _RETURN_LABEL_TABLE)
 
 
 def _label_span_re(label: str) -> re.Pattern:
@@ -199,9 +216,11 @@ def _summary_value(raw: str, key: str, label: str):
     if key in _INT_KEYS:
         m_int = re.search(r"\d+", after)
         return int(m_int.group(0)) if m_int else None
-    value = _parse_money(after)
+    # D5: dates are blanked before the money search -- numbers inside
+    # dates ("Dec. 31, 2024", "12-31-2024") are never amounts.
+    value = _parse_money(_blank_dates(after))
     if value is None:
-        value = _parse_money(raw)
+        value = _parse_money(_blank_dates(raw))
     return value
 
 # Money extraction: $1,234.00, 1234.00, ($1,234.00) for negatives, "1234.00CR".
@@ -222,6 +241,38 @@ _DATE_RE = re.compile(r"\b(\d{2}-\d{2}-\d{4})\b")
 _TXN_AMOUNT_RE = re.compile(
     r"[-−]?\s*\$?\s*\(?\s*(\d{1,3}(?:,\d{3})*|\d+)(?:\.(\d{1,2}))?\s*\)?\s*(CR)?\s*$"
 )
+
+# Account-transcript cycle: 8 digits YYYYWWDD, e.g. 20241205.
+_CYCLE_RE = re.compile(r"\b((?:19|20)\d{6})\b")
+
+# Record-of-Account section boundaries: the account section starts at the
+# first "TAX ACCOUNT TRANSCRIPT" (or "ACCOUNT TRANSCRIPT") line; the return
+# section starts at "TAX RETURN TRANSCRIPT" when present.
+_ACCOUNT_SECTION_HEADER_RE = re.compile(
+    r"^\s*(?:tax\s+)?account\s+transcript\s*$", re.IGNORECASE)
+_RETURN_SECTION_HEADER_RE = re.compile(
+    r"^\s*tax\s+return\s+transcript\s*$", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Account transcript: exact normalized label table.
+#
+# The IRS Tax Account Transcript's balance/accrual vocabulary is small and
+# exact. Same contract as the return table: entries are (label, key) pairs,
+# matching is exact-first then longest-prefix, and a longest-match shared
+# by entries with different keys is AMBIGUOUS, never silently resolved.
+# Real label layouts covered:
+#   "Account Balance: $1,234.56"                    -> exact match
+#   "Accrued Interest: $12.34 as of 09/22/2025"    -> exact match
+#   "Accrued interest as of 09/22/2025: $12.34"    -> prefix match
+#     ("ACCRUED INTEREST" + separator, value after the label span)
+# ---------------------------------------------------------------------------
+
+_ACCOUNT_LABEL_TABLE = [
+    ("ACCOUNT BALANCE", "account_balance"),
+    ("ACCRUED INTEREST", "accrued_interest"),
+    ("ACCRUED PENALTY", "accrued_penalty"),
+]
 
 # ---------------------------------------------------------------------------
 # Wage & income transcript
@@ -267,6 +318,30 @@ def _parse_money(raw: str) -> float | None:
     )
     negative = "(" in raw or cr or re.match(r"^\s*[-−]", raw.strip())
     return -value if negative else value
+
+
+# Money as a Decimal-safe string: the exact digits from the source, never
+# floated. "$85,420.00" -> "85420.00"; "($50.00)" / "$50.00CR" / "-$50.00"
+# -> "-50.00". None when no money is present. Negativity is read from the
+# matched money region (parens/CR) or a leading dash on the searched text.
+_MONEY_STR_RE = re.compile(
+    r"\$?\s*\(?(\d{1,3}(?:,\d{3})*|\d+)(?:\.(\d{1,2}))?\)?\s*(CR)?")
+
+
+def _money_str(raw: str) -> str | None:
+    """Decimal-safe money string from a string, else None."""
+    m = _MONEY_STR_RE.search(raw)
+    if not m:
+        return None
+    dollars, cents, cr = m.groups()
+    body = dollars.replace(",", "") + ("." + cents if cents else "")
+    # Negativity: parens/CR on the match, or a "(" / leading dash
+    # immediately before it ("($10.00)", "Balance: -$50.00").
+    prefix = raw[:m.start()].rstrip()
+    neg = (("(" in m.group(0)) or prefix.endswith("(")
+           or prefix.endswith(("-", "\u2212")) or cr
+           or re.match(r"^\s*[-−]", raw.strip()))
+    return ("-" if neg else "") + body
 
 
 def _detect_tax_year(text: str) -> int | None:
@@ -380,6 +455,213 @@ def parse_return_transcript(text: str, tax_year: int | None = None) -> dict:
         "line_raw_text": line_raw_text,
         "transactions": transactions,
         "unparsed_lines": unparsed_lines,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Account transcript
+# ---------------------------------------------------------------------------
+
+def _account_summary_value(raw: str, label: str) -> str | None:
+    """Extract the money value for a matched account key as a Decimal-safe
+    string. The value region is the text after the matched label; falls
+    back to the whole line. Dates ("as of 09/22/2025") are blanked first
+    so their digits are never misread as money. None when no usable
+    money is present."""
+    after = raw
+    m = _label_span_re(label).search(raw)
+    if m:
+        after = raw[m.end():]
+    value = _money_str(_blank_dates(after))
+    if value is None:
+        value = _money_str(_blank_dates(raw))
+    return value
+
+
+_SLASH_DATE_RE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b")
+
+# Month-name dates: "Dec. 31, 2024", "December 31 2024".
+_MONTH_DATE_RE = re.compile(
+    r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
+    r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|"
+    r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?"
+    r"\s+\d{1,2},?\s+\d{4}\b",
+    re.IGNORECASE,
+)
+
+
+def _blank_dates(text: str) -> str:
+    """Blank dash/slash/month-name dates so their digits can't read as
+    money. (D5: numbers inside dates are never amounts.)"""
+    text = _DATE_RE.sub(" ", text)
+    text = _SLASH_DATE_RE.sub(" ", text)
+    return _MONTH_DATE_RE.sub(" ", text)
+
+
+def _parse_account_transaction(raw: str) -> dict | None:
+    """Parse one account-transcript transaction line.
+
+    "150 Tax return filed 20241205 04-15-2025 $1,234.00" ->
+    {"code": "150", "description": "Tax return filed", "cycle": "20241205",
+     "date": "04-15-2025", "amount": "1234.00"}.
+    Date, cycle, and amount are stripped from the description in that
+    order so a dateless/amountless line can never misread its date or
+    cycle as money. Returns None when the line is not code-led.
+    """
+    m = _TRANSACTION_CODE_RE.match(raw)
+    if not m:
+        return None
+    code = m.group(1)
+    work = raw[m.end():].strip()
+    date = None
+    dm = _DATE_RE.search(work)
+    if dm:
+        date = dm.group(1)
+        work = work[:dm.start()] + " " + work[dm.end():]
+    cycle = None
+    cm = _CYCLE_RE.search(work)
+    if cm:
+        cycle = cm.group(1)
+        work = work[:cm.start()] + " " + work[cm.end():]
+    amount = None
+    am = _TXN_AMOUNT_RE.search(work)
+    if am:
+        amount = _money_str(am.group(0))
+        work = work[:am.start()] + work[am.end():]
+    description = re.sub(r"\s{2,}", " ", work).strip(" -:,;")
+    return {
+        "code": code,
+        "description": description,
+        "cycle": cycle,
+        "date": date,
+        "amount": amount,
+    }
+
+
+def parse_account_transcript(text: str, tax_year: int | None = None) -> dict:
+    """Parse IRS Tax Account Transcript text into a dict.
+
+    Returns {"lines", "line_raw_text", "transactions", "unparsed_lines"}
+    per the R17 contract -- exactly these four keys. ``lines`` maps each
+    parsed key (account_balance, accrued_interest, accrued_penalty) to a
+    Decimal-safe money string, never a float; ``line_raw_text`` maps the
+    same key to the verbatim source line (R15 evidence hook);
+    ``transactions`` are {"code", "description", "cycle", "date",
+    "amount"} dicts covering the account TC vocabulary (150, 806,
+    290/291, 971/977, 766/768, 846, and any other code-led line).
+    Same D4 discipline as the return parser: exact normalized labels
+    from an explicit table, longest-match where labels nest, AMBIGUOUS
+    raised never silently resolved, every non-blank non-structural line
+    mapped or in unparsed_lines.
+    """
+    lines: dict = {}
+    line_raw_text: dict = {}
+    transactions: list = []
+    unparsed_lines: list = []
+    consumed_as_transaction: set = set()
+
+    raw_lines = text.splitlines()
+
+    # First pass: transactions (3-digit code led lines, cycle-aware).
+    for idx, raw in enumerate(raw_lines):
+        if not raw.strip():
+            continue
+        txn = _parse_account_transaction(raw)
+        if txn is None:
+            continue
+        transactions.append(txn)
+        consumed_as_transaction.add(idx)
+
+    # Second pass: balance/accrual summary lines.
+    for idx, raw in enumerate(raw_lines):
+        if not raw.strip() or idx in consumed_as_transaction:
+            continue
+        norm = _normalize_line(raw)
+        if _is_structural(raw) or _is_structural(
+                _LEADING_YEAR_RE.sub("", norm)):
+            continue
+        candidate = _label_candidate(norm)
+        key, label, ambiguous = _match_label(candidate, _ACCOUNT_LABEL_TABLE)
+        if ambiguous:
+            unparsed_lines.append("AMBIGUOUS: " + raw)
+            continue
+        if key is None:
+            unparsed_lines.append(raw)
+            continue
+        value = _account_summary_value(raw, label)
+        if value is None:
+            unparsed_lines.append(raw)
+            continue
+        if key in lines:
+            unparsed_lines.append(f"DUPLICATE {key}: " + raw)
+            continue
+        lines[key] = value
+        line_raw_text[key] = raw
+
+    return {
+        "lines": lines,
+        "line_raw_text": line_raw_text,
+        "transactions": transactions,
+        "unparsed_lines": unparsed_lines,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Record of Account
+# ---------------------------------------------------------------------------
+
+def _split_roa_sections(text: str) -> tuple[str, str, list]:
+    """Split Record-of-Account text into (return_text, account_text,
+    doc_level_lines).
+
+    The account section starts at the first account-section header line;
+    the return section runs from its own header (or the document start)
+    to that boundary. Non-blank, non-structural lines before the first
+    section header belong to neither section and are returned as
+    doc-level lines. When no account-section header is present the whole
+    text is the return section.
+    """
+    raw_lines = text.splitlines()
+    acct_idx = next(
+        (i for i, line in enumerate(raw_lines)
+         if _ACCOUNT_SECTION_HEADER_RE.match(line)),
+        None,
+    )
+    ret_idx = next(
+        (i for i, line in enumerate(raw_lines)
+         if _RETURN_SECTION_HEADER_RE.match(line)),
+        None,
+    )
+    if acct_idx is None:
+        return text, "", []
+    section_start = ret_idx if ret_idx is not None else 0
+    doc_level = [
+        line for line in raw_lines[:section_start]
+        if line.strip() and not _is_structural(line)
+    ]
+    return_text = "\n".join(raw_lines[section_start:acct_idx])
+    account_text = "\n".join(raw_lines[acct_idx:])
+    return return_text, account_text, doc_level
+
+
+def parse_record_of_account(text: str, tax_year: int | None = None) -> dict:
+    """Parse IRS Record of Account text into a dict.
+
+    Returns exactly {"return_section", "account_section",
+    "unparsed_lines"}. A Record of Account is a return section followed
+    by an account section: the text is split on the account-section
+    header and each section is parsed by reusing parse_return_transcript
+    / parse_account_transcript on the section text. Lines that fall
+    outside both sections (document-level lines before the first section
+    header) go to top-level unparsed_lines.
+    """
+    return_text, account_text, doc_level = _split_roa_sections(text)
+    return {
+        "return_section": parse_return_transcript(
+            return_text, tax_year=tax_year),
+        "account_section": parse_account_transcript(
+            account_text, tax_year=tax_year),
+        "unparsed_lines": doc_level,
     }
 
 

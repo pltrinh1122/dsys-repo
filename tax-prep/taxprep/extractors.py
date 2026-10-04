@@ -16,7 +16,8 @@ never float, never Decimal (DocumentStore is JSONL; carryforward coerces
 via Decimal and loudly rejects floats). The 1099-B extractor returns a
 lot table: ``fields["lots"]["value"]`` is a list of per-lot dicts with
 keys ``description``, ``date_acquired``, ``date_sold``, ``proceeds_1d``,
-``basis_1e``, ``wash_1g``, ``fed_withheld_1f``, ``term``, ``covered``
+``basis_1e``, ``wash_1g``, ``accrued_market_discount_1f``,
+``fed_withheld_4``, ``term``, ``covered``
 (money as Decimal-safe strings, the rest strings or None).
 
 Supporting helpers
@@ -176,7 +177,9 @@ def _box_field(text, label_patterns, box_num, value_transform=None):
 _FORM_TITLE_ANCHORS: list[tuple[str, str, bool]] = [
     ("WAGE_INCOME_TRANSCRIPT", r"WAGE\s+AND\s+INCOME\s+TRANSCRIPT", True),
     ("RECORD_OF_ACCOUNT", r"RECORD\s+OF\s+ACCOUNT", True),
-    ("ACCOUNT_TRANSCRIPT", r"ACCOUNT\s+TRANSCRIPT\b", True),
+    # R17: the IRS header is "TAX ACCOUNT TRANSCRIPT" — accept the optional
+    # TAX prefix (mirrors the RETURN_TRANSCRIPT anchor).
+    ("ACCOUNT_TRANSCRIPT", r"(?:TAX\s+)?ACCOUNT\s+TRANSCRIPT\b", True),
     ("RETURN_TRANSCRIPT", r"TAX\s+RETURN\s+TRANSCRIPT", True),
     ("1040-X", r"FORM\s+1040-?X\b", False),
     ("1040-X", r"AMENDED\s+(?:U\.?S\.?\s+)?INDIVIDUAL\s+INCOME\s+TAX\s+RETURN", True),
@@ -596,17 +599,27 @@ _LOT_MONEY_PATTERNS: dict[str, list[tuple[str, bool]]] = {
         (r"Wash\s+sale\s+loss\s+disallowed[^\n\d$]*" + _MONEY_RE, True),
         (r"\b1g\b[^\d\n$]*" + _MONEY_RE, False),
     ],
-    # Box 1f, federal income tax withheld: a withholding credit, never
-    # part of gain/loss (carryforward sums it separately for Phase 4).
-    "fed_withheld_1f": [
+    # Box 1f: ACCRUED MARKET DISCOUNT -- Schedule B interest income
+    # (Phase 4). Never part of gain/loss and never a withholding
+    # credit. (B1F: on Form 1099-B, box 1f is NOT federal income tax
+    # withheld -- that is box 4.)
+    "accrued_market_discount_1f": [
+        (r"Accrued\s+market\s+discount[^\n\d$]*" + _MONEY_RE, True),
+        (r"\b1f\b[^\d\n$]*" + _MONEY_RE, False),
+    ],
+    # Box 4: federal income tax withheld -- a withholding credit,
+    # never part of gain/loss. No bare \b4\b: it would match any
+    # standalone 4 on the statement.
+    "fed_withheld_4": [
         (r"Federal\s+income\s+tax\s+withheld[^\n\d$]*" + _MONEY_RE, True),
         (r"Backup\s+withholding[^\n\d$]*" + _MONEY_RE, True),
-        (r"\b1f\b[^\d\n$]*" + _MONEY_RE, False),
+        (r"\bBox\s*4\b[^\d\n$]*" + _MONEY_RE, True),
     ],
 }
 
 _LOT_KEYS = ("description", "date_acquired", "date_sold", "proceeds_1d",
-             "basis_1e", "wash_1g", "fed_withheld_1f", "term", "covered")
+             "basis_1e", "wash_1g", "accrued_market_discount_1f",
+             "fed_withheld_4", "term", "covered")
 
 
 def _clean_description(m: "re.Match") -> str | None:
@@ -656,6 +669,75 @@ def _lot_covered(segment: str) -> str | None:
     if re.search(r"basis\s+reported\s+to\s+IRS", segment, re.IGNORECASE):
         return "covered"
     return None
+
+
+# F1b: section headings ("Short-term covered", "Long-term noncovered",
+# "Short-term transactions for which basis is reported to IRS", ...).
+# A heading is a line naming the holding term WITH covered/noncovered
+# (or basis-reported-to-IRS) context -- a bare "Holding period: long
+# term" lot line is not a heading.
+_SECTION_HEADING_RE = re.compile(
+    r"^[^\n]*\b(short|long)\s*-?\s*term\b[^\n]*"
+    r"\b(noncovered|covered|basis\s+reported\s+to\s+IRS)\b[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Lines that look like lot content are never headings, even when they
+# name a term: a heading is a section label, not a lot row.
+_HEADING_EXCLUSIONS_RE = re.compile(
+    r"proceeds|\bBox\s*1[defg]?\b|\bLots?\s*#?\s*\d+\b", re.IGNORECASE)
+
+
+def _find_section_headings(text: str) -> list[tuple[int, str, str]]:
+    """[(offset, term, covered)] of 1099-B section headings, in order.
+
+    Delegates to _is_section_heading_line so the finder and the
+    segment stripper agree on what a heading is.
+    """
+    headings = []
+    for m in re.finditer(r"(?m)^[^\n]*$", text):
+        line = m.group(0)
+        if not _is_section_heading_line(line):
+            continue
+        term = _SECTION_HEADING_RE.search(line).group(1).lower()
+        if re.search(r"\bnoncovered\b", line, re.IGNORECASE):
+            covered = "noncovered"
+        else:
+            covered = "covered"  # "covered" or "basis reported to IRS"
+        headings.append((m.start(), term, covered))
+    return headings
+
+
+def _strip_heading_lines(segment: str) -> str:
+    """Remove section-heading lines from a lot segment.
+
+    A heading that lands inside a segment's span (e.g. between two
+    "Lot n" markers) belongs to the section, not to the lot: leaving
+    it in would let one section's heading set the previous lot's term.
+    """
+    kept = [line for line in segment.splitlines(keepends=True)
+            if not _is_section_heading_line(line)]
+    return "".join(kept)
+
+
+def _is_section_heading_line(line: str) -> bool:
+    """True when a single line is a 1099-B section heading."""
+    # The MULTILINE regex is anchored per line, so a search over the
+    # single line is exact.
+    m = _SECTION_HEADING_RE.search(line)
+    if not m:
+        return False
+    if _HEADING_EXCLUSIONS_RE.search(line):
+        return False
+    return not re.search(_MONEY_RE, line)
+
+
+# Form box 2 ("Short-term/Long-term gain or loss"): fallback term
+# source when the statement carries no section headings at all.
+_BOX2_TERM_RE = re.compile(
+    r"^[^\n]*\bbox\s*2\b[^\n]*\b(short|long)\s*-?\s*term\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def _extract_one_lot(segment: str) -> tuple[dict, bool]:
@@ -719,8 +801,8 @@ def _total_line_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _split_lot_segments(text: str) -> list[str]:
-    """Split statement text into per-lot segments.
+def _split_lot_segments(text: str) -> list[tuple[str, int]]:
+    """Split statement text into per-lot (segment, start_offset) pairs.
 
     1. Explicit "Lot n" markers win: each marker starts a segment (the
        preamble before the first marker holds statement-level info and
@@ -729,6 +811,9 @@ def _split_lot_segments(text: str) -> list[str]:
        never on total/subtotal lines (those feed the summary-totals
        extractor, not the lot table).
     3. Zero or one proceeds label: the whole text is one lot.
+
+    The start offset lets _extract_1099_b inherit term/covered from
+    the nearest preceding section heading (F1b).
     """
     markers = list(_LOT_MARKER_RE.finditer(text))
     if markers:
@@ -737,7 +822,7 @@ def _split_lot_segments(text: str) -> list[str]:
             end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
             seg = text[m.end():end]
             if seg.strip():
-                segs.append(seg)
+                segs.append((seg, m.end()))
         if segs:
             return segs
     total_spans = _total_line_spans(text)
@@ -748,7 +833,7 @@ def _split_lot_segments(text: str) -> list[str]:
     proc_matches = [m for m in _PROCEEDS_SPLIT_RE.finditer(text)
                     if not _on_total_line(m.start())]
     if len(proc_matches) <= 1:
-        return [text]
+        return [(text, 0)]
     # Repeated labeled blocks: each block starts at the nearest
     # description/date opener ahead of its proceeds label (see
     # _BLOCK_OPENER_RE); without an opener the block starts at the
@@ -772,7 +857,7 @@ def _split_lot_segments(text: str) -> list[str]:
     segs = []
     for i, b in enumerate(bounds):
         end = bounds[i + 1] if i + 1 < len(bounds) else len(text)
-        segs.append(text[b:end])
+        segs.append((text[b:end], b))
     return segs
 
 
@@ -823,8 +908,36 @@ def _extract_1099_b(text: str) -> dict:
     all_labeled = True
     any_proceeds = False
     lot_raw: list[str] = []
-    for seg in _split_lot_segments(text):
+    # F1b: section headings ("Short-term covered", ...) name the term
+    # and covered flag for every lot in the section. A lot's own
+    # segment wins when it names them; otherwise the nearest preceding
+    # heading applies -- never a guess, and genuinely unknown stays
+    # None (the carryforward guard raises it to the Operator). With no
+    # headings at all, form box 2 ("Short-term/Long-term gain or
+    # loss") is the fallback term source.
+    headings = _find_section_headings(text)
+    box2_term = None
+    if not headings:
+        m = _BOX2_TERM_RE.search(text)
+        if m:
+            box2_term = m.group(1).lower()
+    for seg, start in _split_lot_segments(text):
+        # A heading line inside a segment's span belongs to the
+        # section, not to the lot: strip it before per-lot detection
+        # so one section's heading cannot set the previous lot's term.
+        seg = _strip_heading_lines(seg)
         lot, proceeds_labeled = _extract_one_lot(seg)
+        if lot["term"] is None or lot["covered"] is None:
+            hterm = hcovered = None
+            for hoff, ht, hc in headings:
+                if hoff < start:
+                    hterm, hcovered = ht, hc
+                else:
+                    break
+            if lot["term"] is None:
+                lot["term"] = hterm or box2_term
+            if lot["covered"] is None:
+                lot["covered"] = hcovered
         if not any(v is not None for v in lot.values()):
             continue  # no lot-like content in this segment
         lots.append(lot)

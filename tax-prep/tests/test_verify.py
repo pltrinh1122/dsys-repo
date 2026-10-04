@@ -29,7 +29,8 @@ def _doc(doc_id, year, form, fields, status="transcribed"):
 
 
 def _lot(proceeds=None, basis=None, term=None,
-         d_acq="01/15/2024", d_sold="06/20/2024", wash_1g=None):
+         d_acq="01/15/2024", d_sold="06/20/2024", wash_1g=None,
+         fed_withheld_4=None, accrued_market_discount_1f=None):
     return {
         "description": None,
         "date_acquired": d_acq,
@@ -37,7 +38,8 @@ def _lot(proceeds=None, basis=None, term=None,
         "proceeds_1d": proceeds,
         "basis_1e": basis,
         "wash_1g": wash_1g,
-        "fed_withheld_1f": None,
+        "accrued_market_discount_1f": accrued_market_discount_1f,
+        "fed_withheld_4": fed_withheld_4,
         "term": term,
         "covered": None,
     }
@@ -229,8 +231,65 @@ def test_summary_reconciliation_skip_when_no_totals(tmp_path):
     ])
     r = V.verify_summary_reconciliation(store, 2024)
     assert r["passed"] is True
+    assert r["evaluated"] is False
+    assert r["not_evaluated_ids"] == []
     assert r["skipped_ids"] == ["b1"]
     assert r["failed_ids"] == [] and r["passed_ids"] == []
+    _pii_free(r)
+
+
+def test_summary_reconciliation_not_evaluated_when_no_comparable_keys(tmp_path):
+    # V1: the statement shows totals but zero keys are comparable --
+    # a vacuous check is not a PASS: the doc is not evaluated and the
+    # check fails (needs_human)
+    store = _store_with(tmp_path, [
+        _b1099("b1", 2024, None, None, None, lots=[
+            _lot("1000.00", "1500.00", "short"),
+        ], summary_totals={"short": {"proceeds_1d": None,
+                                     "basis_1e": None}}),
+    ])
+    r = V.verify_summary_reconciliation(store, 2024)
+    assert r["n_compared"] == 0
+    assert r["evaluated"] is False
+    assert r["not_evaluated_ids"] == ["b1"]
+    assert r["passed"] is False
+    assert r["failed_ids"] == [] and r["passed_ids"] == []
+    assert r["skipped_ids"] == []
+    _pii_free(r)
+
+
+def test_summary_reconciliation_mixed_evaluated_and_not_evaluated(tmp_path):
+    # one doc evaluates and passes, one is vacuous: overall not PASS
+    store = _store_with(tmp_path, [
+        _b1099("ok", 2024, None, None, None, lots=[
+            _lot("1000.00", "1500.00", "short"),
+        ], summary_totals={"short": {"proceeds_1d": "1000.00",
+                                     "basis_1e": "1500.00"}}),
+        _b1099("vac", 2024, None, None, None, lots=[
+            _lot("1000.00", "1500.00", "short"),
+        ], summary_totals={"short": {"proceeds_1d": None}}),
+    ])
+    r = V.verify_summary_reconciliation(store, 2024)
+    assert r["n_compared"] == 2
+    assert r["evaluated"] is True
+    assert r["passed_ids"] == ["ok"]
+    assert r["not_evaluated_ids"] == ["vac"]
+    assert r["passed"] is False  # vacuous drags the check down
+    _pii_free(r)
+
+
+def test_verify_all_fails_on_vacuous_reconciliation(tmp_path):
+    # the not-evaluated case wires into verify_all as a FAIL signal
+    store = _store_with(tmp_path, [
+        _b1099("vac", 2024, None, None, None, lots=[
+            _lot("1000.00", "1500.00", "short"),
+        ], summary_totals={"short": {"proceeds_1d": None}},
+         status="validated"),
+    ])
+    r = V.verify_all(store, 2024)
+    assert r["checks"]["summary_reconciliation"]["passed"] is False
+    assert r["checks"]["summary_reconciliation"]["not_evaluated_ids"] == ["vac"]
+    assert r["passed"] is False
     _pii_free(r)
 
 
@@ -429,7 +488,13 @@ def test_verify_all_year_scoping(tmp_path):
                                 "validation_gate", "lot_integrity",
                                 "summary_reconciliation",
                                 "transcript_reconciliation",
-                                "carryforward_ready"}
+                                "carryforward_ready",
+                                "extraction_yield",
+                                "roa_corroboration"}
+    assert r["checks"]["extraction_yield"]["checks"]["zero_yield"]["passed"] is True
+    assert r["checks"]["roa_corroboration"]["applicable"] is True  # R17 landed
+    _pii_free(r["checks"]["extraction_yield"])
+    _pii_free(r["checks"]["roa_corroboration"])
     assert r["checks"]["validation_gate"]["passed"] is True
     assert r["passed"] is False  # reconciliation: no transcript doc
     _pii_free(r)
@@ -440,3 +505,287 @@ def test_verify_all_year_scoping(tmp_path):
     assert r2["checks"]["validation_gate:2023"]["passed"] is False
     _pii_free(r2)
     json.dumps(r2)  # fully JSON-serializable
+
+# -- R18: extraction-yield verification (all fixtures synthetic) -------
+
+from taxprep import transcript as _T
+
+
+def _ocr(store, doc, text):
+    store.save_ocr(doc.doc_id, text)
+    store.upsert(doc)
+    return doc
+
+
+def test_zero_yield_fails_on_text_without_fields(tmp_path):
+    store = _store_with(tmp_path, [])
+    d = _doc("z1", 2024, "W-2", {}, "transcribed")
+    _ocr(store, d, "synthetic form filler line\n" * 50)  # > 200 chars
+    r = V.verify_zero_yield(store, 2024)
+    assert r["passed"] is False
+    assert r["failed_ids"] == ["z1"]
+    assert r["min_text_chars"] == 200
+    _pii_free(r)
+
+
+def test_zero_yield_passes(tmp_path):
+    store = _store_with(tmp_path, [])
+    ok = _doc("ok", 2024, "W-2", {"1": _field(1)}, "transcribed")
+    _ocr(store, ok, "synthetic form filler line\n" * 50)
+    short = _doc("short", 2024, "W-2", {}, "transcribed")
+    _ocr(store, short, "tiny")  # below the char threshold: not a failure
+    r = V.verify_zero_yield(store, 2024)
+    assert r["passed"] is True
+    assert r["failed_ids"] == [] and r["n_checked"] == 2
+    _pii_free(r)
+
+
+WAGE_WITH_HEADERS = """WAGE AND INCOME TRANSCRIPT
+For Tax Year 2024
+Note: This transcript is provided for your information only.
+This transcript shows income reported to the IRS for the tax year.
+Taxpayer: SYNTHETIC PERSON 000-00-0001
+Payer: ACME CORPORATION 12-3456789
+Form W-2
+Box 1 Wages: $85,000.00
+"""
+
+
+def test_parse_coverage_headers_do_not_count(tmp_path):
+    store = _store_with(tmp_path, [])
+    _ocr(store, _doc("t1", 2024, "WAGE_INCOME_TRANSCRIPT", {},
+                     "needs_review"), WAGE_WITH_HEADERS)
+    r = V.verify_parse_coverage(store, 2024)
+    assert r["passed"] is True
+    assert len(r["docs"]) == 1
+    assert r["docs"][0]["coverage"] == 1.0
+    assert r["low_ids"] == [] and r["unassessable"] == []
+    _pii_free(r)
+
+
+def test_parse_coverage_fails_on_genuine_unparsed(tmp_path):
+    store = _store_with(tmp_path, [])
+    text = WAGE_WITH_HEADERS + "Some unrecognized content line @@@\n"
+    _ocr(store, _doc("t1", 2024, "WAGE_INCOME_TRANSCRIPT", {},
+                     "transcribed"), text)
+    r = V.verify_parse_coverage(store, 2024)
+    assert r["passed"] is False
+    assert r["low_ids"] == ["t1"]
+    assert r["docs"][0]["coverage"] == 0.75  # 3 of 4 content lines parsed
+    assert r["threshold"] == 0.8
+    _pii_free(r)
+
+
+def test_expected_coverage_w2_boxes(tmp_path):
+    store = _store_with(tmp_path, [])
+    thin = _doc("thin", 2024, "W-2", {"1": _field(1)}, "transcribed")
+    store.upsert(thin)
+    r = V.verify_expected_coverage(store, 2024)
+    assert r["passed"] is False
+    assert len(r["low"]) == 1
+    assert r["low"][0]["doc_id"] == "thin"
+    assert r["low"][0]["coverage"] == pytest.approx(1 / 6)
+    assert r["low"][0]["n_expected"] == 6 and r["low"][0]["n_present"] == 1
+    _pii_free(r)
+
+    full = _doc("full", 2024, "W-2",
+                {b: _field(1) for b in ("1", "2", "3", "4", "5", "6")},
+                "transcribed")
+    store.upsert(full)
+    r2 = V.verify_expected_coverage(store, 2024)
+    assert r2["passed"] is False  # "thin" still low
+    assert r2["n_assessed"] == 2
+    assert [e["doc_id"] for e in r2["low"]] == ["thin"]
+    _pii_free(r2)
+
+
+def test_expected_coverage_return_transcript_core_lines(tmp_path):
+    full_text = """TAX RETURN TRANSCRIPT
+For Tax Year 2024
+Adjusted Gross Income: $85,420.00
+Taxable Income: $62,000.00
+Total Tax: $9,800.00
+Federal Income Tax Withheld: $11,200.00
+Refund: $1,400.00
+Amount Owed: $0.00
+"""
+    thin_text = """TAX RETURN TRANSCRIPT
+For Tax Year 2024
+Adjusted Gross Income: $85,420.00
+"""
+    store = _store_with(tmp_path, [])
+    _ocr(store, _doc("rt-full", 2024, "RETURN_TRANSCRIPT", {},
+                     "transcribed"), full_text)
+    _ocr(store, _doc("rt-thin", 2024, "RETURN_TRANSCRIPT", {},
+                     "transcribed"), thin_text)
+    r = V.verify_expected_coverage(store, 2024)
+    assert r["passed"] is False
+    assert [e["doc_id"] for e in r["low"]] == ["rt-thin"]
+    thin = r["low"][0]
+    assert thin["coverage"] == pytest.approx(1 / 6)
+    assert thin["n_expected"] == 6 and thin["n_present"] == 1
+    _pii_free(r)
+
+
+def test_expected_coverage_wage_transcript_needs_payer(tmp_path):
+    store = _store_with(tmp_path, [])
+    _ocr(store, _doc("t1", 2024, "WAGE_INCOME_TRANSCRIPT", {},
+                     "transcribed"),
+         "WAGE AND INCOME TRANSCRIPT\nFor Tax Year 2024\n")
+    r = V.verify_expected_coverage(store, 2024)
+    assert r["passed"] is False
+    assert r["low"][0]["coverage"] == 0.0
+    _pii_free(r)
+
+
+def test_type_hint_mismatch_flags(tmp_path):
+    store = _store_with(tmp_path, [])
+    d = Document(doc_id="m1", tax_year=2024, form_type="1099-INT",
+                  source_path="w2_acme_2024.pdf",
+                  ocr_text_ref="ocr/m1.txt",
+                  fields={"1": _field(1)}, status="transcribed")
+    store.upsert(d)
+    r = V.verify_type_hint_mismatch(store, 2024)
+    assert r["passed"] is False
+    assert r["mismatched"] == [{"doc_id": "m1", "hint": "W-2",
+                               "form_type": "1099-INT"}]
+    _pii_free(r)
+    # never auto-reclassifies: the stored doc is untouched
+    assert store.get("m1").form_type == "1099-INT"
+
+
+def test_type_hint_mismatch_passes(tmp_path):
+    store = _store_with(tmp_path, [])
+    agree = Document(doc_id="a1", tax_year=2024, form_type="W-2",
+                      source_path="w2_acme_2024.pdf",
+                      ocr_text_ref="ocr/a1.txt",
+                      fields={"1": _field(1)}, status="transcribed")
+    nohint = Document(doc_id="n1", tax_year=2024, form_type="W-2",
+                       source_path="scan_0042.pdf",
+                       ocr_text_ref="ocr/n1.txt",
+                       fields={"1": _field(1)}, status="transcribed")
+    ambig = Document(doc_id="x1", tax_year=2024, form_type="W-2",
+                      source_path="w2_1099int_combined.pdf",
+                      ocr_text_ref="ocr/x1.txt",
+                      fields={"1": _field(1)}, status="transcribed")
+    for d in (agree, nohint, ambig):
+        store.upsert(d)
+    r = V.verify_type_hint_mismatch(store, 2024)
+    assert r["passed"] is True
+    assert r["mismatched"] == []
+    assert r["n_no_hint"] == 2  # scan_0042 + the ambiguous filename
+    _pii_free(r)
+
+
+def _w2_pair(doc_id, ein, name, text, year=2024):
+    return _doc(doc_id, year, "W-2",
+                {"1": _field(1), "employer_ein": _field(ein),
+                 "employer_name": _field(name)}, "transcribed"), text
+
+
+def test_cross_doc_duplicate_candidate(tmp_path):
+    store = _store_with(tmp_path, [])
+    text = ("SYNTHETIC W-2 ACME CORPORATION 12-3456789 Box 1 wages\n" * 20)
+    d1, t1 = _w2_pair("w2a", "12-3456789", "ACME CORPORATION", text)
+    d2, t2 = _w2_pair("w2b", "12-3456789", "ACME CORPORATION", text)
+    _ocr(store, d1, t1)
+    _ocr(store, d2, t2)
+    r = V.verify_cross_doc(store, 2024)
+    assert r["passed"] is False
+    assert r["candidates"] == [{"doc_ids": ["w2a", "w2b"]}]
+    assert r["n_pairs_checked"] == 1
+    _pii_free(r)
+
+
+def test_cross_doc_no_candidate_when_content_differs(tmp_path):
+    store = _store_with(tmp_path, [])
+    d1, t1 = _w2_pair("w2a", "12-3456789", "ACME CORPORATION",
+                      "FIRST SCAN synthetic w2 content\n" * 20)
+    d2, t2 = _w2_pair("w2b", "12-3456789", "ACME CORPORATION",
+                      "SECOND SCAN different synthetic w2 content\n" * 20)
+    _ocr(store, d1, t1)
+    _ocr(store, d2, t2)
+    r = V.verify_cross_doc(store, 2024)
+    assert r["passed"] is True
+    assert r["candidates"] == []
+    assert r["n_pairs_checked"] == 1
+    _pii_free(r)
+
+
+def test_extraction_yield_wires_into_verify_all(tmp_path):
+    store = _store_with(tmp_path, [])
+    d = _doc("z1", 2024, "W-2", {}, "transcribed")
+    _ocr(store, d, "synthetic form filler line\n" * 50)
+    r = V.verify_all(store, 2024)
+    ey = r["checks"]["extraction_yield"]
+    assert ey["passed"] is False
+    assert ey["checks"]["zero_yield"]["failed_ids"] == ["z1"]
+    for sub in ey["checks"].values():
+        _pii_free(sub)
+    _pii_free(ey)
+
+
+# -- Record-of-Account corroboration (R17-adjacent) --------------------
+
+def test_roa_corroboration_arms_when_parsers_present(tmp_path):
+    # R17 landed: the parsers exist, so the check arms itself. No
+    # standalone transcripts here, so both sections skip cleanly.
+    from taxprep import transcript as T
+    assert hasattr(T, "parse_record_of_account")
+    assert hasattr(T, "parse_account_transcript")
+    store = _store_with(tmp_path, [])
+    _ocr(store, _doc("roa1", 2024, "RECORD_OF_ACCOUNT", {},
+                     "transcribed"), "synthetic roa text")
+    r = V.verify_roa_corroboration(store, 2024)
+    assert r["applicable"] is True
+    assert r["passed"] is True
+    assert r["n_roa"] == 1
+    assert r["n_conflicts"] == 0
+    assert all(s["reason_code"] == "no_standalone" for s in r["skipped"])
+    _pii_free(r)
+
+
+def test_roa_section_conflicts_comparator():
+    # comparator only, on documented-shape dicts -- no parsers involved
+    roa = {"lines": {"agi": 85420.0, "total_tax": 12340.0,
+                     "withholding": 11200.0},
+           "transactions": [{"code": "150", "date": "04/15/2025",
+                             "amount": 12340.0}]}
+    standalone = {"lines": {"agi": 85420.0, "total_tax": 12341.0},
+                  "transactions": [{"code": "150", "date": "04/15/2025",
+                                    "amount": 12340.0},
+                                   {"code": "766", "date": "04/15/2025",
+                                    "amount": 1400.0}]}
+    c = V._roa_section_conflicts("return", roa, standalone)
+    assert {"section": "return", "key": "total_tax",
+            "conflict": "value_mismatch"} in c
+    assert {"section": "return", "key": "withholding",
+            "conflict": "roa_only"} in c
+    assert {"section": "return", "key": "tc_766",
+            "conflict": "standalone_only"} in c
+    assert len(c) == 3  # agi agrees, tc_150 agrees: no entries
+    # no values anywhere in the conflict entries
+    for e in c:
+        assert set(e) == {"section", "key", "conflict"}
+    _pii_free(c)
+
+
+def test_roa_section_conflicts_all_agree(tmp_path):
+    section = {"lines": {"agi": 85420.0},
+               "transactions": [{"code": "150", "date": "04/15/2025",
+                                 "amount": 12340.0}]}
+    assert V._roa_section_conflicts("return", section, section) == []
+
+
+@pytest.mark.skipif(not hasattr(_T, "parse_record_of_account"),
+                    reason="R17 parsers not yet in tree")
+def test_roa_corroboration_arms_when_parsers_land(tmp_path):
+    # integration: the check activates once the R17 workstream adds the
+    # parsers; no standalone transcripts -> informational skip only.
+    store = _store_with(tmp_path, [])
+    _ocr(store, _doc("roa1", 2024, "RECORD_OF_ACCOUNT", {},
+                     "transcribed"), "synthetic roa text")
+    r = V.verify_roa_corroboration(store, 2024)
+    assert r["applicable"] is True
+    assert r["n_roa"] == 1
+    _pii_free(r)

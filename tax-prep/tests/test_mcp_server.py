@@ -62,7 +62,8 @@ def _lot(proceeds=None, basis=None, term=None, wash_1g=None):
         "proceeds_1d": proceeds,
         "basis_1e": basis,
         "wash_1g": wash_1g,
-        "fed_withheld_1f": None,
+        "accrued_market_discount_1f": None,
+        "fed_withheld_4": None,
         "term": term,
         "covered": None,
     }
@@ -335,6 +336,8 @@ def test_pii_sweep_all_tools(tmp_path, monkeypatch):
                       "engine_version": "5.3.4", "ok": True, "chars": 900,
                       "mean_confidence": 93.0, "reason_code": None}]
     prov.mean_confidence = 93.0
+    # X1 encryption provenance: operational metadata, must sweep clean
+    prov.encryption = "owner-only"
     store.upsert(prov)
     dd = str(store.data_dir)
     outputs = [

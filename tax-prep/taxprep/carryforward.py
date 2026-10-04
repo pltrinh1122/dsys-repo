@@ -63,10 +63,14 @@ Known simplifications (out of scope)
   flagged via ``flags`` into the ``warnings`` list when indicated.
 * Wash sale (F3): box 1g (wash sale loss disallowed) is extracted per
   lot and ADDED BACK to the lot's gain/loss: per-lot gain/loss =
-  1d proceeds - 1e basis + 1g. Box 1f (federal income tax withheld) is
-  a withholding credit, never part of gain/loss: from_store sums it
-  separately as ``fed_withheld_1f_total`` for the 1040 withholding
-  line (Phase 4).
+  1d proceeds - 1e basis + 1g. Box 1f is ACCRUED MARKET DISCOUNT
+  (B1F: on Form 1099-B it is NOT federal income tax withheld) --
+  Schedule B interest income (Phase 4), never part of gain/loss and
+  never a withholding credit: from_store sums it separately as
+  ``accrued_market_discount_1f_total`` for Phase 4 visibility. Box 4
+  (federal income tax withheld) IS the withholding credit: from_store
+  sums it separately as ``fed_withheld_4_total`` for the 1040
+  withholding line (Phase 4).
 * State carryforward rules (states differ; several do not conform to
   the federal worksheet).
 """
@@ -91,6 +95,10 @@ REASON_BLOCKED = "blocked"
 REASON_ORPHANED = "orphaned"
 REASON_MISSING_YEAR = "missing_year"
 REASON_ZERO_LOTS = "zero_lots"
+# G2: present-but-incomplete lots are blockers, never silently
+# excluded. One entry per doc per code.
+REASON_LOT_TERM_UNKNOWN = "lot_term_unknown"
+REASON_LOT_MISSING_AMOUNTS = "lot_missing_amounts"
 REASON_CODES = (
     REASON_UNKNOWN_FORM,
     REASON_MULTI_FORM,
@@ -98,6 +106,8 @@ REASON_CODES = (
     REASON_ORPHANED,
     REASON_MISSING_YEAR,
     REASON_ZERO_LOTS,
+    REASON_LOT_TERM_UNKNOWN,
+    REASON_LOT_MISSING_AMOUNTS,
 )
 
 # canonical filing statuses -> annual limit is only status-sensitive for MFS
@@ -423,34 +433,26 @@ def _doc_lots(doc: Any) -> list[dict]:
     return [l for l in v if isinstance(l, dict)] if isinstance(v, list) else []
 
 
-def _has_lot_record(doc: Any) -> bool:
-    """True when this 1099-B carries at least one lot record.
-
-    A lot that is present but malformed (unknown term, missing
-    proceeds/basis) is NOT zero-lots: from_store already excludes it
-    with a loud warning. Zero lots means the document has no lot table
-    entries at all -- the case that used to contribute a silent $0.
-    """
-    return len(_doc_lots(doc)) > 0
-
-
 def carryforward_blockers(store: Any, chained_years: list[int] | None = None) -> list[dict]:
     """R3 guard: PII-free blocker list [{"doc_id", "reason_code"}].
 
     Refuses (via the caller raising) while ANY document in the store is
-    UNKNOWN, MULTI_FORM, BLOCKED, or ORPHANED, or has tax_year None, or
-    while any 1099-B in a chained year carries no lot record at all
-    (see _has_lot_record -- present-but-malformed lots keep the
-    existing exclude-with-warning path) -- unless the Operator recorded
-    an exclusion with a reason for that doc_id (taxprep.exclusions).
-    The scan is store-wide for document-level blockers; the zero-lots
-    check covers ``chained_years`` (defaults to every year present in
-    the store).
+    UNKNOWN, MULTI_FORM, BLOCKED, or ORPHANED, or has tax_year None,
+    or while any 1099-B in a chained year carries no lot record at
+    all, or carries a lot with unknown term (G2: ``lot_term_unknown``)
+    or missing proceeds/basis (G2: ``lot_missing_amounts``) -- unless
+    the Operator recorded an exclusion with a reason for that doc_id
+    (taxprep.exclusions). Excluded or incomplete lots are blockers
+    until the Operator disposes (supplies the term/amounts or excludes
+    with a reason): never a silent omission. The scan is store-wide
+    for document-level blockers; the lot checks cover ``chained_years``
+    (defaults to every year present in the store).
 
     A document can carry several blocker entries (e.g. UNKNOWN form AND
-    missing year); the list is sorted by (doc_id, reason_code) for
-    determinism. Only doc_ids and fixed reason codes appear -- never
-    values, names, or exclusion reasons.
+    missing year; several lots with unknown term still yield ONE
+    ``lot_term_unknown`` entry); the list is sorted by
+    (doc_id, reason_code) for determinism. Only doc_ids and fixed
+    reason codes appear -- never values, names, or exclusion reasons.
     """
     docs = store.list()
     data_dir = getattr(store, "data_dir", None)
@@ -487,9 +489,20 @@ def carryforward_blockers(store: Any, chained_years: list[int] | None = None) ->
         for d in store.list(year=y, form="1099-B"):
             if d.doc_id in excluded:
                 continue
-            if not _has_lot_record(d):
+            lots = _doc_lots(d)
+            if not lots:
                 blockers.append({"doc_id": d.doc_id,
                                  "reason_code": REASON_ZERO_LOTS})
+                continue
+            # G2: one entry per doc per code, however many lots trip it.
+            if any(lot.get("term") not in ("short", "long") for lot in lots):
+                blockers.append({"doc_id": d.doc_id,
+                                 "reason_code": REASON_LOT_TERM_UNKNOWN})
+            if any(_parse_money_opt(lot.get("proceeds_1d")) is None
+                   or _parse_money_opt(lot.get("basis_1e")) is None
+                   for lot in lots):
+                blockers.append({"doc_id": d.doc_id,
+                                 "reason_code": REASON_LOT_MISSING_AMOUNTS})
 
     blockers.sort(key=lambda b: (b["doc_id"], b["reason_code"]))
     return blockers
@@ -500,19 +513,24 @@ def from_store(store: Any, year: int) -> dict:
 
     Refuses loudly (R3 guard) if ANY document in the store is UNKNOWN,
     MULTI_FORM, BLOCKED, or ORPHANED, or has tax_year None, or if any
-    1099-B for the year has zero lots -- unless the Operator recorded
-    an exclusion with a reason for that document. Also refuses if any
-    1099-B for the year is not yet validated (validation is never
-    excludable).
+    1099-B for the year has zero lots, an unknown-term lot
+    (``lot_term_unknown``), or a lot missing proceeds/basis
+    (``lot_missing_amounts``) -- unless the Operator recorded an
+    exclusion with a reason for that document. Excluded documents are
+    skipped by both the guard and the sums (the exclusion reason is
+    the Operator's disposal); documents with a recorded exclusion are
+    never summed. Also refuses if any 1099-B for the year is not yet
+    validated (validation is never excludable).
 
-    Every lot in every document's lot table is summed (no single-lot
-    fallback). Per-lot gain/loss = 1d proceeds - 1e basis + 1g wash sale
-    loss disallowed; box 1f (federal income tax withheld) is summed
-    separately as ``fed_withheld_1f_total`` -- it is a withholding
-    credit, never part of gain/loss.
-
-    Lots with unknown term or missing proceeds/basis are EXCLUDED and
-    reported in ``warnings`` -- never guessed.
+    Every lot in every non-excluded document's lot table is summed (no
+    single-lot fallback). Per-lot gain/loss = 1d proceeds - 1e basis +
+    1g wash sale loss disallowed. Box 4 (federal income tax withheld)
+    is summed separately as ``fed_withheld_4_total`` -- it is a
+    withholding credit, never part of gain/loss. Box 1f (accrued
+    market discount) is summed separately as
+    ``accrued_market_discount_1f_total`` for Phase 4 (Schedule B
+    interest income) visibility -- never in gain/loss, never in
+    withholding.
     """
     blockers = carryforward_blockers(store, chained_years=[year])
     if blockers:
@@ -524,6 +542,10 @@ def from_store(store: Any, year: int) -> dict:
             "or record an Operator exclusion with a reason for it "
             "(`taxprep exclude <doc_id> --reason <reason>`), then retry"
         )
+    data_dir = getattr(store, "data_dir", None)
+    excluded: set[str] = set()
+    if data_dir is not None:
+        excluded = {e["doc_id"] for e in exclusions.list_exclusions(data_dir)}
     docs = store.list(year=year, form="1099-B")
     unvalidated = [d.doc_id for d in docs if d.status != "validated"]
     if unvalidated:
@@ -536,43 +558,44 @@ def from_store(store: Any, year: int) -> dict:
     st = Decimal("0")
     lt = Decimal("0")
     fed_withheld_total = Decimal("0")
-    warnings: list[str] = []
+    amd_total = Decimal("0")
     included = 0
-    excluded = 0
     for d in docs:
+        if d.doc_id in excluded:
+            continue  # Operator-disposed: skipped by guard and by sums
         for n, lot in enumerate(_doc_lots(d), start=1):
             label = f"{d.doc_id} lot {n}"
             term = lot.get("term")
             proceeds = _parse_money_opt(lot.get("proceeds_1d"))
             basis = _parse_money_opt(lot.get("basis_1e"))
             wash = _parse_money_opt(lot.get("wash_1g"))
-            withheld = _parse_money_opt(lot.get("fed_withheld_1f"))
+            withheld = _parse_money_opt(lot.get("fed_withheld_4"))
+            amd = _parse_money_opt(lot.get("accrued_market_discount_1f"))
+            # The R3 guard already refused on unknown terms and missing
+            # amounts; these raises are defensive and unreachable --
+            # a lot must never be silently dropped or misbucketed.
             if term not in ("short", "long"):
-                warnings.append(
-                    f"{label}: term {term!r} unknown -- lot excluded "
-                    "from carryforward sums (never guessed)"
-                )
-                excluded += 1
-                continue
+                raise ValueError(
+                    f"{label}: term {term!r} unknown -- "
+                    "carryforward_blockers should have refused")
             if proceeds is None or basis is None:
-                warnings.append(
-                    f"{label}: missing proceeds/basis -- lot excluded "
-                    "from carryforward sums"
-                )
-                excluded += 1
-                continue
+                raise ValueError(
+                    f"{label}: missing proceeds/basis -- "
+                    "carryforward_blockers should have refused")
             gain_loss = proceeds - basis + (wash or Decimal("0"))
             if term == "short":
                 st += gain_loss
             else:
                 lt += gain_loss
             fed_withheld_total += withheld or Decimal("0")
+            amd_total += amd or Decimal("0")
             included += 1
     return {
         "st_current": st,
         "lt_current": lt,
-        "fed_withheld_1f_total": fed_withheld_total,
-        "warnings": warnings,
+        "fed_withheld_4_total": fed_withheld_total,
+        "accrued_market_discount_1f_total": amd_total,
+        "warnings": [],
         "lots_included": included,
-        "lots_excluded": excluded,
+        "lots_excluded": 0,
     }
