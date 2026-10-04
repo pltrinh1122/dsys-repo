@@ -261,7 +261,7 @@ def test_version_bump_rebuilds_silver_preserves_decisions(
     # EXTRACTOR_VERSION moves with R15 and friends.)
     _bumped = str(int(extractors.EXTRACTOR_VERSION) + 1)
 
-    def _v3(form_type, text, year):
+    def _v3(form_type, text, year, text_source=None):
         return ({"1": {"value": "99999.99", "confidence": "high",
                        "raw_text": ""}}, "transcribed")
 

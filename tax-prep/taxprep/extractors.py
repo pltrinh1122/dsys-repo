@@ -5,11 +5,15 @@ no names, EINs, or amounts in this module are real.
 
 Main entry point
 ----------------
-``extract_fields(form_type, text)`` returns ``(fields, status)`` where
+``extract_fields(form_type, text, text_source=None)`` returns ``(fields, status)`` where
 ``fields`` maps each box code of the form to
 ``{"value": str | None, "confidence": "high"|"medium"|"low",
 "raw_text": str}`` and ``status`` is ``"transcribed"`` when every KEY box of
 the form was found with high/medium confidence, else ``"needs_review"``.
+``text_source`` selects OCR-tolerant box-token matching on the 1099-B
+path when it starts with ``"ocr:"`` (O1a); the 1099-B lots field also
+carries a ``lot_count_mismatch`` reason when fewer lots extracted than
+the text signals (O1b).
 
 Money values are canonical Decimal-safe STRINGS (e.g. ``"52345.67"``) --
 never float, never Decimal (DocumentStore is JSONL; carryforward coerces
@@ -54,10 +58,13 @@ from .carryforward import tag_lot_gain_loss
 # "1" is the pre-medallion era (JSONL store, no artifact derivation).
 # "2" added medallion derivation. "3" adds R15 field provenance
 # (extraction-time char spans, verbatim transcript evidence, derived
-# transcript confidences). Bump on ANY extraction-logic change: a bump
-# rebuilds silver (I6) while preserving Operator decisions.
+# transcript confidences). "4" adds the OCR-accuracy arc: OCR-tolerant
+# box-token fallbacks (text_source=ocr:*) and the 1099-B lot-count
+# completeness check (lot_count_mismatch). Bump on ANY extraction-logic
+# change: a bump rebuilds silver (I6) while preserving Operator
+# decisions.
 # taxprep.silver.derivation_config() carries this into the config hash.
-EXTRACTOR_VERSION = "3"
+EXTRACTOR_VERSION = "4"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -583,7 +590,7 @@ def detect_tax_year(text: str) -> int | None:
 # Per-form extractors
 # ---------------------------------------------------------------------------
 
-def _extract_w2(text: str) -> dict:
+def _extract_w2(text: str, text_source: str | None = None) -> dict:
     money_boxes = [
         # (box_code, [labeled regexes with money as group 1])
         # NOTE (D3): every label gap is [^\n\d$]* -- digits are excluded so
@@ -690,40 +697,80 @@ def _extract_w2(text: str) -> dict:
 # lot-like content at all yields no lot.
 # ---------------------------------------------------------------------------
 
+# O1a: OCR-tolerant box tokens. Tesseract misreads box-number labels on
+# small print ("1e" -> "le"), so when text_source starts with "ocr:" the
+# box-token fallbacks tolerate the 1/l/I and 0/O confusions. The labeled
+# patterns ("Proceeds", "Cost or other basis", "Wash sale loss
+# disallowed", ...) stay primary and are byte-identical in both modes.
+def _ocr_tolerant_token(token: str) -> str:
+    """Box token with OCR confusions: 1 -> [1lI], 0 -> [0O]."""
+    return "".join(
+        "[1lI]" if c == "1" else "[0O]" if c == "0" else re.escape(c)
+        for c in token
+    )
+
+
+def _box_token(t: str, ocr_tolerant: bool) -> str:
+    """``\b<token>\b`` -- OCR-tolerant when requested, else the literal."""
+    if ocr_tolerant:
+        return r"\b" + _ocr_tolerant_token(t) + r"\b"
+    return r"\b" + t + r"\b"
+
+
+def _lot_money_patterns(
+    ocr_tolerant: bool,
+) -> dict[str, list[tuple[str, bool]]]:
+    """Per-lot money patterns: (lot key, [(regex, labeled_bool)]).
+
+    Money is group 1 everywhere; gaps are digit-free (D3). With
+    ocr_tolerant=True the box-token fallbacks accept 1/l/I and 0/O
+    confusions; the labeled patterns are unchanged. The native table
+    (ocr_tolerant=False) is byte-identical to the pre-O1a patterns.
+    """
+    bt = lambda t: _box_token(t, ocr_tolerant)  # noqa: E731
+    return {
+        "proceeds_1d": [
+            (r"Proceeds[^\n\d$]*" + _MONEY_RE, True),
+            (bt("1d") + r"[^\d\n$]*" + _MONEY_RE, False),
+        ],
+        "basis_1e": [
+            (r"Cost\s*(?:or\s+other)?\s*basis[^\n\d$]*" + _MONEY_RE, True),
+            (bt("1e") + r"[^\d\n$]*" + _MONEY_RE, False),
+        ],
+        # F3: box 1g, wash sale loss disallowed -- added BACK to the lot's
+        # gain/loss by carryforward (gain/loss = 1d - 1e + 1g).
+        "wash_1g": [
+            (r"Wash\s+sale\s+loss\s+disallowed[^\n\d$]*" + _MONEY_RE, True),
+            (bt("1g") + r"[^\d\n$]*" + _MONEY_RE, False),
+        ],
+        # Box 1f: ACCRUED MARKET DISCOUNT -- Schedule B interest income
+        # (Phase 4). Never part of gain/loss and never a withholding
+        # credit. (B1F: on Form 1099-B, box 1f is NOT federal income tax
+        # withheld -- that is box 4.)
+        "accrued_market_discount_1f": [
+            (r"Accrued\s+market\s+discount[^\n\d$]*" + _MONEY_RE, True),
+            (bt("1f") + r"[^\d\n$]*" + _MONEY_RE, False),
+        ],
+        # Box 4: federal income tax withheld -- a withholding credit,
+        # never part of gain/loss. No bare \b4\b: it would match any
+        # standalone 4 on the statement.
+        "fed_withheld_4": [
+            (r"Federal\s+income\s+tax\s+withheld[^\n\d$]*" + _MONEY_RE, True),
+            (r"Backup\s+withholding[^\n\d$]*" + _MONEY_RE, True),
+            (r"\bBox\s*4\b[^\d\n$]*" + _MONEY_RE, True),
+        ],
+    }
+
+
 # Per-lot money patterns: (lot key, [(regex, labeled_bool)]). Money is
 # group 1 everywhere; gaps are digit-free (D3).
-_LOT_MONEY_PATTERNS: dict[str, list[tuple[str, bool]]] = {
-    "proceeds_1d": [
-        (r"Proceeds[^\n\d$]*" + _MONEY_RE, True),
-        (r"\b1d\b[^\d\n$]*" + _MONEY_RE, False),
-    ],
-    "basis_1e": [
-        (r"Cost\s*(?:or\s+other)?\s*basis[^\n\d$]*" + _MONEY_RE, True),
-        (r"\b1e\b[^\d\n$]*" + _MONEY_RE, False),
-    ],
-    # F3: box 1g, wash sale loss disallowed -- added BACK to the lot's
-    # gain/loss by carryforward (gain/loss = 1d - 1e + 1g).
-    "wash_1g": [
-        (r"Wash\s+sale\s+loss\s+disallowed[^\n\d$]*" + _MONEY_RE, True),
-        (r"\b1g\b[^\d\n$]*" + _MONEY_RE, False),
-    ],
-    # Box 1f: ACCRUED MARKET DISCOUNT -- Schedule B interest income
-    # (Phase 4). Never part of gain/loss and never a withholding
-    # credit. (B1F: on Form 1099-B, box 1f is NOT federal income tax
-    # withheld -- that is box 4.)
-    "accrued_market_discount_1f": [
-        (r"Accrued\s+market\s+discount[^\n\d$]*" + _MONEY_RE, True),
-        (r"\b1f\b[^\d\n$]*" + _MONEY_RE, False),
-    ],
-    # Box 4: federal income tax withheld -- a withholding credit,
-    # never part of gain/loss. No bare \b4\b: it would match any
-    # standalone 4 on the statement.
-    "fed_withheld_4": [
-        (r"Federal\s+income\s+tax\s+withheld[^\n\d$]*" + _MONEY_RE, True),
-        (r"Backup\s+withholding[^\n\d$]*" + _MONEY_RE, True),
-        (r"\bBox\s*4\b[^\d\n$]*" + _MONEY_RE, True),
-    ],
-}
+_LOT_MONEY_PATTERNS: dict[str, list[tuple[str, bool]]] = _lot_money_patterns(
+    ocr_tolerant=False
+)
+# O1a: OCR-tolerant variant of the same table (box-token fallbacks only).
+_LOT_MONEY_PATTERNS_OCR: dict[str, list[tuple[str, bool]]] = (
+    _lot_money_patterns(ocr_tolerant=True)
+)
 
 _LOT_KEYS = ("description", "date_acquired", "date_sold", "proceeds_1d",
              "basis_1e", "wash_1g", "accrued_market_discount_1f",
@@ -848,16 +895,20 @@ _BOX2_TERM_RE = re.compile(
 )
 
 
-def _extract_one_lot(segment: str) -> tuple[dict, bool]:
+def _extract_one_lot(segment: str, ocr_tolerant: bool = False
+                    ) -> tuple[dict, bool]:
     """Extract one lot dict from a segment.
 
     Returns (lot, proceeds_labeled): ``proceeds_labeled`` is True when
     the lot's proceeds came from a labeled pattern (drives the lots
-    field's high/medium confidence).
+    field's high/medium confidence). ``ocr_tolerant`` selects the
+    OCR-tolerant box-token fallbacks (O1a); False is the native path.
     """
     lot: dict = {}
     proceeds_labeled = False
-    for key, pats in _LOT_MONEY_PATTERNS.items():
+    patterns = (_LOT_MONEY_PATTERNS_OCR if ocr_tolerant
+                else _LOT_MONEY_PATTERNS)
+    for key, pats in patterns.items():
         v, _raw, labeled, _span = _money_search(pats, segment)
         lot[key] = v
         if key == "proceeds_1d" and v is not None:
@@ -881,10 +932,49 @@ def _extract_one_lot(segment: str) -> tuple[dict, bool]:
 
 
 _LOT_MARKER_RE = re.compile(r"\bLots?\s*#?\s*\d+\b", re.IGNORECASE)
-_PROCEEDS_SPLIT_RE = re.compile(
-    r"Proceeds[^\n\d$]*" + _MONEY_RE + r"|\b1d\b[^\d\n$]*" + _MONEY_RE,
-    re.IGNORECASE,
+def _build_lot_split_res(
+    ocr_tolerant: bool,
+) -> tuple["re.Pattern", "re.Pattern", "re.Pattern"]:
+    """Segmentation regexes with optional OCR-tolerant box tokens.
+
+    Returns (proceeds_split, block_opener, basis_disqualifier). The
+    native triple (ocr_tolerant=False) is byte-identical to the
+    pre-O1a constants; the OCR triple tolerates 1/l/I and 0/O
+    confusions in the box-token fallbacks only.
+    """
+    def bt(t: str) -> str:
+        return _box_token(t, ocr_tolerant)
+
+    def bc(digit: str, rest: str) -> str:
+        tok = _ocr_tolerant_token(digit) if ocr_tolerant else re.escape(digit)
+        return r"\b" + tok + rest + r"\b"
+
+    proceeds = re.compile(
+        r"Proceeds[^\n\d$]*" + _MONEY_RE + r"|" + bt("1d") + r"[^\d\n$]*"
+        + _MONEY_RE,
+        re.IGNORECASE,
+    )
+    opener = re.compile(
+        r"Description\s*(?:of\s+(?:property|security))?\s*[:\-]?"
+        r"|Date\s+acquired"
+        r"|Date\s+sold\s*(?:or\s+disposed)?"
+        + r"|" + bc("1", "[abc]"),
+        re.IGNORECASE,
+    )
+    basis = re.compile(
+        r"Cost\s*(?:or\s+other)?\s*basis[^\n\d$]*" + _MONEY_RE
+        + r"|" + bt("1e") + r"[^\d\n$]*" + _MONEY_RE,
+        re.IGNORECASE,
+    )
+    return proceeds, opener, basis
+
+
+_PROCEEDS_SPLIT_RE, _BLOCK_OPENER_RE, _BASIS_DISQUALIFIER_RE = (
+    _build_lot_split_res(ocr_tolerant=False)
 )
+# O1a: OCR-tolerant segmentation triple (box-token fallbacks only).
+(_PROCEEDS_SPLIT_RE_OCR, _BLOCK_OPENER_RE_OCR,
+ _BASIS_DISQUALIFIER_RE_OCR) = _build_lot_split_res(ocr_tolerant=True)
 _TOTAL_LINE_RE = re.compile(r"\btotals?\b|\bsubtotals?\b", re.IGNORECASE)
 
 
@@ -894,18 +984,8 @@ _TOTAL_LINE_RE = re.compile(r"\btotals?\b|\bsubtotals?\b", re.IGNORECASE)
 # nearest such opener -- unless a basis amount intervenes between the
 # opener and the proceeds (then the opener belongs to the previous
 # block's tail, e.g. a description printed after its proceeds).
-_BLOCK_OPENER_RE = re.compile(
-    r"Description\s*(?:of\s+(?:property|security))?\s*[:\-]?"
-    r"|Date\s+acquired"
-    r"|Date\s+sold\s*(?:or\s+disposed)?"
-    r"|\b1[abc]\b",
-    re.IGNORECASE,
-)
-_BASIS_DISQUALIFIER_RE = re.compile(
-    r"Cost\s*(?:or\s+other)?\s*basis[^\n\d$]*" + _MONEY_RE
-    + r"|\b1e\b[^\d\n$]*" + _MONEY_RE,
-    re.IGNORECASE,
-)
+# (The _BLOCK_OPENER_RE / _BASIS_DISQUALIFIER_RE constants are built by
+# _build_lot_split_res above; the native triple is byte-identical.)
 
 
 def _total_line_spans(text: str) -> list[tuple[int, int]]:
@@ -917,7 +997,8 @@ def _total_line_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _split_lot_segments(text: str) -> list[tuple[str, int]]:
+def _split_lot_segments(text: str, ocr_tolerant: bool = False
+                      ) -> list[tuple[str, int]]:
     """Split statement text into per-lot (segment, start_offset) pairs.
 
     1. Explicit "Lot n" markers win: each marker starts a segment (the
@@ -929,8 +1010,14 @@ def _split_lot_segments(text: str) -> list[tuple[str, int]]:
     3. Zero or one proceeds label: the whole text is one lot.
 
     The start offset lets _extract_1099_b inherit term/covered from
-    the nearest preceding section heading (F1b).
+    the nearest preceding section heading (F1b). ``ocr_tolerant``
+    selects the OCR-tolerant segmentation regexes (O1a).
     """
+    proceeds_re, opener_re, basis_re = (
+        (_PROCEEDS_SPLIT_RE_OCR, _BLOCK_OPENER_RE_OCR,
+         _BASIS_DISQUALIFIER_RE_OCR) if ocr_tolerant
+        else (_PROCEEDS_SPLIT_RE, _BLOCK_OPENER_RE,
+              _BASIS_DISQUALIFIER_RE))
     markers = list(_LOT_MARKER_RE.finditer(text))
     if markers:
         segs = []
@@ -946,7 +1033,7 @@ def _split_lot_segments(text: str) -> list[tuple[str, int]]:
     def _on_total_line(pos: int) -> bool:
         return any(s <= pos < e for s, e in total_spans)
 
-    proc_matches = [m for m in _PROCEEDS_SPLIT_RE.finditer(text)
+    proc_matches = [m for m in proceeds_re.finditer(text)
                     if not _on_total_line(m.start())]
     if len(proc_matches) <= 1:
         return [(text, 0)]
@@ -954,7 +1041,7 @@ def _split_lot_segments(text: str) -> list[tuple[str, int]]:
     # description/date opener ahead of its proceeds label (see
     # _BLOCK_OPENER_RE); without an opener the block starts at the
     # proceeds label itself.
-    openers = list(_BLOCK_OPENER_RE.finditer(text))
+    openers = list(opener_re.finditer(text))
     bounds: list[int] = []
     prev_proc_end = 0
     for pm in proc_matches:
@@ -964,7 +1051,7 @@ def _split_lot_segments(text: str) -> list[tuple[str, int]]:
             # An opener with a basis amount between it and this lot's
             # proceeds belongs to the previous block's tail, not to
             # this block: keep looking.
-            if _BASIS_DISQUALIFIER_RE.search(text, om.end(), pm.start()):
+            if basis_re.search(text, om.end(), pm.start()):
                 continue
             block_start = om.start()
             break
@@ -1022,7 +1109,54 @@ def _extract_summary_totals(text: str) -> dict:
     return _field(totals, "high", "\n".join(raw_spans), span)
 
 
-def _extract_1099_b(text: str) -> dict:
+# O1b: lot-count completeness. A 50-lot scan extracting 14 lots was
+# still marked "transcribed" -- silent partial extraction. The expected
+# count is the "Lot N" marker count when markers are present, else the
+# count of row-shaped lines (a line carrying both a date and a money
+# amount, excluding total/subtotal and section-heading lines). None
+# when the text carries no signal: no completeness check.
+_DATE_TOKEN_RE = r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
+
+
+def _row_shaped_line_count(text: str) -> int:
+    """Lines carrying both a date and a money amount (a lot row).
+
+    Conservative: a labeled lot whose date and amount sit on different
+    lines is NOT a row (no check). Total/subtotal lines and section
+    headings are excluded.
+    """
+    n = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if _TOTAL_LINE_RE.search(line):
+            continue
+        if _is_section_heading_line(line):
+            continue
+        if (re.search(_DATE_TOKEN_RE, line)
+                and re.search(_MONEY_RE, line)):
+            n += 1
+    return n
+
+
+def _expected_lot_count(text: str) -> int | None:
+    """Expected lot count for the completeness check, or None.
+
+    "Lot N" markers are the primary signal (each marker opens a lot
+    segment); otherwise row-shaped lines are counted. Counts only --
+    PII-free.
+    """
+    markers = _LOT_MARKER_RE.findall(text)
+    if markers:
+        return len(markers)
+    rows = _row_shaped_line_count(text)
+    return rows if rows else None
+
+
+def _extract_1099_b(text: str, text_source: str | None = None) -> dict:
+    # O1a: OCR-tolerant box-token fallbacks when text_source names an
+    # OCR route ("ocr:<engine>/<mode>"); native path is byte-identical.
+    ocr_tolerant = (text_source or "").startswith("ocr:")
     fields = {}
 
     lots: list[dict] = []
@@ -1043,7 +1177,7 @@ def _extract_1099_b(text: str) -> dict:
         m = _BOX2_TERM_RE.search(text)
         if m:
             box2_term = m.group(1).lower()
-    for seg, start in _split_lot_segments(text):
+    for seg, start in _split_lot_segments(text, ocr_tolerant=ocr_tolerant):
         # A heading line inside a segment's span belongs to the
         # section, not to the lot: strip it before per-lot detection
         # so one section's heading cannot set the previous lot's term.
@@ -1052,7 +1186,7 @@ def _extract_1099_b(text: str) -> dict:
         # affects term/covered detection, never the stored offsets.
         seg_span = (start, start + len(seg))
         seg = _strip_heading_lines(seg)
-        lot, proceeds_labeled = _extract_one_lot(seg)
+        lot, proceeds_labeled = _extract_one_lot(seg, ocr_tolerant=ocr_tolerant)
         if lot["term"] is None or lot["covered"] is None:
             hterm = hcovered = None
             for hoff, ht, hc in headings:
@@ -1085,6 +1219,19 @@ def _extract_1099_b(text: str) -> dict:
     else:
         fields["lots"] = _missing_field()
 
+    # O1b: completeness -- never "transcribed" while rows are missing.
+    # A shortfall drops the lots field to "low" (so extract_fields
+    # returns "needs_review", "lots" being a key box) and records a
+    # counts-only reason (PII-free). The summary_reconciliation in
+    # verify stays the totals-level check.
+    expected = _expected_lot_count(text)
+    if expected is not None and len(lots) < expected:
+        entry = fields["lots"]
+        entry["confidence"] = "low"
+        entry["reason_code"] = "lot_count_mismatch"
+        entry["reason_detail"] = {"expected": expected,
+                                  "extracted": len(lots)}
+
     fields["summary_totals"] = _extract_summary_totals(text)
 
     v, raw, labeled, span = _str_search(
@@ -1108,7 +1255,7 @@ def _generic_money_extractor(defs):
     ``defs``: list of (box_code, label_regexes_list, is_key). Label regexes
     must capture the amount as group 1.
     """
-    def extractor(text):
+    def extractor(text, text_source=None):
         fields = {}
         for box, pats, _key in defs:
             fields[box] = _box_field(text, [(p, 1) for p in pats], box)
@@ -1147,7 +1294,7 @@ _extract_1099_misc = _generic_money_extractor([
 ])
 
 
-def _extract_1099_r(text: str) -> dict:
+def _extract_1099_r(text: str, text_source: str | None = None) -> dict:
     fields = {}
     fields["1"] = _box_field(
         text, [(r"Gross\s+distribution[^\n\d$]*" + _MONEY_RE, 1)], "1"
@@ -1187,18 +1334,25 @@ _FORM_REGISTRY = {
 }
 
 
-def extract_fields(form_type: str, text: str) -> tuple[dict, str]:
+def extract_fields(form_type: str, text: str,
+                   text_source: str | None = None) -> tuple[dict, str]:
     """Extract box-level fields from OCR text of a tax form.
 
     Returns (fields, status). ``status`` is "transcribed" when every KEY box
     of the form was found with high/medium confidence, otherwise
     "needs_review". Unknown ``form_type`` -> ({}, "needs_review").
+
+    ``text_source`` (O1a) is the ingest text_source vocabulary
+    (``ocr:<engine>/<mode>`` for OCR, ``native``/``form-field``/etc.
+    otherwise). When it starts with ``"ocr:"`` the 1099-B box-token
+    fallbacks tolerate 1/l/I and 0/O OCR confusions; None (the
+    default) is the native path -- byte-identical behavior.
     """
     entry = _FORM_REGISTRY.get(form_type)
     if entry is None:
         return {}, "needs_review"
     extractor, key_boxes = entry
-    fields = extractor(text)
+    fields = extractor(text, text_source=text_source)
     ok = all(
         fields.get(box, {}).get("confidence") in ("high", "medium")
         for box in key_boxes

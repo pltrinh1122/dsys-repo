@@ -790,13 +790,21 @@ def _page_range_str(section: extractors.FormSection) -> str:
 
 
 def _extract_for_type(
-    form_type: str, text: str, year: int | None
+    form_type: str, text: str, year: int | None,
+    text_source: str | None = None,
 ) -> tuple[dict, str]:
-    """Route section text to the right extractor (legacy routing)."""
+    """Route section text to the right extractor (legacy routing).
+
+    ``text_source`` is the bundle's text_source vocabulary
+    (``ocr:<engine>/<mode>`` for OCR, ``native``/``form-field``/etc.
+    otherwise); it reaches the box-form extractors (O1a OCR-tolerant
+    1099-B box tokens). Transcript extractors take no text_source.
+    """
     if form_type in TRANSCRIPT_FORMS:
         return _fields_from_transcript(form_type, text, year)
     if form_type in BOX_FORMS:
-        return extractors.extract_fields(form_type, text)
+        return extractors.extract_fields(form_type, text,
+                                         text_source=text_source)
     return {}, "needs_review"
 
 
@@ -1139,11 +1147,41 @@ def _flag_orphaned_decisions(store: DocumentStore, doc_id: str,
                            payload=new_payload)
 
 
+def _store_pages_for(bundle: PageBundle, text: str) -> list[str] | None:
+    """Per-page list for save_ocr's page markers, or None for legacy.
+
+    Only the OCR route stores page structure (form-feed separators):
+    native/form-field/sidecar text and section-text call sites keep the
+    legacy byte-identical stored text. The markers apply only when the
+    stored text IS the whole bundle join (``"\\n".join(bundle.pages)``)
+    -- the extraction text is always the ``"\\n"`` join, unchanged.
+    """
+    if bundle.route == "ocr" and text == "\n".join(bundle.pages):
+        return list(bundle.pages)
+    return None
+
+
+def _store_ocr_text(store: DocumentStore, doc_id: str, text: str,
+                    bundle: PageBundle) -> str:
+    """save_ocr plus the O2 OCR extras: page markers and word boxes.
+
+    Page markers (``\\f`` separators) go into the stored text only on
+    the whole-document OCR path (see _store_pages_for); the tesseract
+    TSV word boxes persist to the ``ocr/<doc_id>.words.json`` sidecar
+    so R15/R19 can resolve ``bbox_source="tesseract"`` after ingest,
+    not just from the in-memory bundle.
+    """
+    ref = store.save_ocr(doc_id, text, pages=_store_pages_for(bundle, text))
+    if bundle.ocr_words:
+        store.save_ocr_words(doc_id, bundle.ocr_words)
+    return ref
+
+
 def _derive_and_store(store: DocumentStore, doc: Document, text: str,
                       bundle: PageBundle, source_sha: str,
                       ctx: silver.DerivationContext) -> Document:
     """Fresh silver write: OCR text, provenance, silver_doc + artifacts."""
-    doc.ocr_text_ref = store.save_ocr(doc.doc_id, text)
+    doc.ocr_text_ref = _store_ocr_text(store, doc.doc_id, text, bundle)
     _apply_provenance(doc, bundle, source_sha)
     _persist_silver_doc(store, doc, ctx, source_sha)
     _persist_bronze_text(store, bundle, source_sha, ctx)
@@ -1237,7 +1275,7 @@ def _store_version_bump(store: DocumentStore, existing: Document,
         # flags them; kept as a fail-safe mirroring the old behavior.
         existing.re_review = True
         existing.status_reason = "extraction-disagrees"
-    existing.ocr_text_ref = store.save_ocr(existing.doc_id, text)
+    existing.ocr_text_ref = _store_ocr_text(store, existing.doc_id, text, bundle)
     _apply_provenance(existing, bundle, source_sha)
     _persist_silver_doc(store, existing, ctx, source_sha)
     _persist_bronze_text(store, bundle, source_sha, ctx)
@@ -1318,7 +1356,7 @@ def _store_idempotent(store: DocumentStore, doc: Document, text: str,
     validated_at = existing.validated_at
     existing.fields = doc.fields
     existing.re_review = False
-    existing.ocr_text_ref = store.save_ocr(existing.doc_id, text)
+    existing.ocr_text_ref = _store_ocr_text(store, existing.doc_id, text, bundle)
     _apply_provenance(existing, bundle, source_sha)
     existing.relevance = relevance
     existing.validated_at = validated_at
@@ -1348,7 +1386,9 @@ def _child_document(
     """
     assert section.form_type is not None
     year = _section_year(section, full_text)
-    fields, status = _extract_for_type(section.form_type, section.text, year)
+    fields, status = _extract_for_type(
+        section.form_type, section.text, year,
+        text_source=bundle.text_source if bundle is not None else None)
     # R15: extraction-time field provenance (char spans + geometry).
     fields = _attach_provenance(
         fields, section.page_spans, section.form_type, bundle,
@@ -1482,7 +1522,8 @@ def _transcript_document(path: Path, doc_id: str, form_type: str,
     D" headings are transcript content, handled by the transcript
     parsers, never child documents.
     """
-    fields, status = _extract_for_type(form_type, text, year)
+    fields, status = _extract_for_type(form_type, text, year,
+                                        text_source=bundle.text_source)
     # R15: extraction-time field provenance over the whole text (page
     # boundaries survive via the joined-text page map -- P4).
     fields = _attach_provenance(fields, page_spans_for_joined(bundle.pages),
@@ -1562,7 +1603,8 @@ def _build_documents(path: Path, doc_id: str, bundle: PageBundle,
     year = extractors.detect_tax_year(section_text)
     if year is None:
         year = extractors.detect_tax_year(text)
-    fields, status = _extract_for_type(form_type, section_text, year)
+    fields, status = _extract_for_type(form_type, section_text, year,
+                                        text_source=bundle.text_source)
     # R15: extraction-time field provenance. With no typed sections the
     # extraction text is "\n".join(pages) -- page boundaries survive via
     # the joined-text page map (P4: never lose page boundaries).

@@ -967,15 +967,84 @@ class MedallionStore:
                 "SELECT COUNT(*) FROM silver_doc").fetchone()[0]
 
     # -- OCR text ------------------------------------------------------------
-    def save_ocr(self, doc_id: str, text: str) -> str:
-        """Persist OCR text; returns the ocr_text_ref stored on the Document."""
+    def save_ocr(self, doc_id: str, text: str,
+                 pages: list[str] | None = None) -> str:
+        """Persist OCR text; returns the ocr_text_ref stored on the Document.
+
+        ``pages`` (O2): when given, the per-page texts are stored joined
+        by form-feed separators (``"\\f"``) so page structure survives
+        in the stored text -- R15/R19 can map pages on OCR'd docs. The
+        EXTRACTION text is always the ``"\\n"`` join and is unchanged.
+        Default None keeps the legacy behavior (``text`` stored
+        verbatim) for the section-text call sites.
+        """
         ref = f"ocr/{doc_id}.txt"
         self.ocr_dir.mkdir(parents=True, exist_ok=True)
-        (self.ocr_dir / f"{doc_id}.txt").write_text(text, encoding="utf-8")
+        stored = "\f".join(pages) if pages is not None else text
+        (self.ocr_dir / f"{doc_id}.txt").write_text(stored, encoding="utf-8")
         return ref
 
     def load_ocr(self, doc_id: str) -> str:
         return (self.ocr_dir / f"{doc_id}.txt").read_text(encoding="utf-8")
+
+    def _ensure_private_ocr_dir(self) -> None:
+        """The ocr/ dir at 0700 (PII-adjacent word boxes live here)."""
+        self.ocr_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # mkdir(mode=...) is a no-op for existing dirs; tighten when a
+        # permissive umask widened it.
+        try:
+            st = self.ocr_dir.stat()
+            if st.st_mode & 0o077:
+                os.chmod(self.ocr_dir, st.st_mode & ~0o077)
+        except OSError:
+            pass
+
+    def save_ocr_words(self, doc_id: str,
+                       words: dict[int, list[dict]] | None) -> str | None:
+        """Persist tesseract TSV word boxes as a JSON sidecar (O2/R15/R19).
+
+        ``words`` is ``{page_0based: [word, ...]}`` with each word
+        ``{"text", "bbox": [x0,y0,x1,y1] (PDF points, bottom-left),
+        "conf", "page"}`` -- the ``ocr._run_tesseract`` shape, and the
+        same shape ``provenance.GeometryResolver`` consumes in memory.
+        Written to ``ocr/<doc_id>.words.json`` (0700 dir), JSON with
+        sorted keys (deterministic). Returns the sidecar ref, or None
+        when ``words`` is empty/None (nothing stored).
+
+        Geometry is PII-adjacent (positions, not values): it is stripped
+        from every MCP/bus output, like all provenance (blind-orchestrator
+        contract).
+        """
+        if not words:
+            return None
+        ref = f"ocr/{doc_id}.words.json"
+        self._ensure_private_ocr_dir()
+        serial = {str(p): ws for p, ws in sorted(words.items())}
+        (self.ocr_dir / f"{doc_id}.words.json").write_text(
+            json.dumps(serial, sort_keys=True), encoding="utf-8")
+        return ref
+
+    def load_ocr_words(self, doc_id: str) -> dict[int, list[dict]] | None:
+        """Load the word-box sidecar; None when absent or unreadable.
+
+        Keys come back as ints (0-based pages); word dicts are the
+        stored ``{"text", "bbox", "conf", "page"}`` records.
+        """
+        try:
+            raw = (self.ocr_dir / f"{doc_id}.words.json").read_text(
+                encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        try:
+            return {int(p): ws for p, ws in data.items()}
+        except (TypeError, ValueError):
+            return None
 
 
 # Back-compat alias: taxprep.store re-exports this as DocumentStore.

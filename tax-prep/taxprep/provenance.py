@@ -244,6 +244,21 @@ class GeometryResolver:
         return None, None
 
 
+def geometry_resolver_from_store(store, doc_id: str) -> GeometryResolver:
+    """GeometryResolver fed by the persisted word-box sidecar (O2).
+
+    Lets R15/R19 resolve ``bbox_source="tesseract"`` after ingest, not
+    just from the in-memory bundle: the sidecar carries the same
+    ``{page_0: [word, ...]}`` shape the ingest-time resolver consumes.
+    ``store`` is duck-typed (needs ``load_ocr_words``). No layout
+    source (sidecar absent) -> a resolver that yields (None, None),
+    never a guess.
+    """
+    load = getattr(store, "load_ocr_words", None)
+    words = load(doc_id) if callable(load) else None
+    return GeometryResolver(ocr_words=words or {})
+
+
 # -- extraction-time attachment --------------------------------------------
 
 def _provenance_for_span(span, page_spans, extractor: str,

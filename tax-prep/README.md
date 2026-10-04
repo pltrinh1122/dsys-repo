@@ -79,7 +79,12 @@ on `sys.path`.
 `ingest` prints a summary table (counts by form × year) plus the list of
 documents flagged `needs_review`. OCR text is stored under
 `data/ocr/<doc_id>.txt`; records live in `data/documents.jsonl`
-(gitignored — never commit taxpayer material).
+(gitignored — never commit taxpayer material). On the OCR route the
+stored text keeps page structure (pages joined with form-feed `\f`
+separators), and tesseract word boxes persist to the
+`data/ocr/<doc_id>.words.json` sidecar (0700 dir) so R15/R19 geometry
+can resolve `bbox_source="tesseract"` after ingest. The extraction
+text itself is always the `"\n"` join — unchanged.
 
 ## End-to-end pipeline (canonical stages)
 
@@ -264,7 +269,15 @@ taxprep/
                  repeated transcript TC codes get ordinal-suffixed field
                  keys (X4): tc_806, tc_806_2, ... -- never silently
                  overwritten; one ordinal namespace spans both ROA sections
-  extractors.py  box-level field extractors (regex/positional heuristics)
+  extractors.py  box-level field extractors (regex/positional heuristics).
+                 OCR-accuracy: on `text_source=ocr:*` the 1099-B box-token
+                 fallbacks tolerate 1/l/I and 0/O confusions (labeled
+                 patterns stay primary; native text is byte-identical);
+                 the 1099-B lots field drops to `low` with reason
+                 `lot_count_mismatch` (+ counts-only expected/extracted)
+                 when fewer lots extract than the "Lot N" markers or
+                 row-shaped lines signal -- never `transcribed` while
+                 rows are missing
   transcript.py  IRS Tax Return Transcript + Wage & Income Transcript parsers
                  Record of Account: block model (X3b) -- anchor-event scan
                  over the whole text (return headers + account anchors, no
