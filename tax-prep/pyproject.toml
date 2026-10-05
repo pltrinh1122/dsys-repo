@@ -21,7 +21,7 @@ where = ["."]
 include = ["taxprep*"]
 
 [tool.setuptools.package-data]
-taxprep = ["*.sql"]
+taxprep = ["*.sql", "data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

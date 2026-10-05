@@ -25,6 +25,8 @@ FORM_TYPES = [
     "RETURN_TRANSCRIPT",
     "ACCOUNT_TRANSCRIPT",
     "RECORD_OF_ACCOUNT",
+    "OPERATOR_CSV",  # R23 addendum: Operator-adjusted transcript CSV as its
+                     # own source document (Bronze bytes + Silver fields)
     "UNKNOWN",
 ]
 

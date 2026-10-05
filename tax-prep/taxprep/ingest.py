@@ -77,7 +77,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import extractors, lifecycle, silver, transcript
+from . import extractors, lifecycle, silver, transcript, twocol
 from .models import Document
 from .provenance import (GeometryResolver, attach_field_provenance,
                          page_spans_for_joined)
@@ -716,7 +716,9 @@ def _transcript_line_fields(parsed: dict,
 
 
 def _fields_from_transcript(form_type: str, text: str,
-                            year: int | None) -> tuple[dict, str]:
+                            year: int | None,
+                            pdf_path: str | None = None
+                            ) -> tuple[dict, str]:
     """Adapt transcript parser output to the Document fields shape.
 
     R8: positional payer keys (payer1.box1); the payer name is stored as
@@ -732,6 +734,16 @@ def _fields_from_transcript(form_type: str, text: str,
     RECORD_OF_ACCOUNT merges both sections' fields with ONE ordinal
     namespace across sections; section provenance is carried by each
     field's char_span (R15), not by a synthesized tag prefix in raw_text.
+
+    R23 stream A: the positional two-column pair capture (twocol) is the
+    PRIMARY transcript capture when ``pdf_path`` names the source PDF.
+    Every pair becomes a field keyed by the NORMALIZED PRINTED LABEL
+    (bare key), purely positional -- no label -> canonical-key mappings
+    here. Collision rule: a normalized label already present as a field
+    key (set by the legacy parser below) is never overwritten; the pair
+    lands at ``pair:<label>`` (then ``pair:<label>_2`` ... on repeats).
+    The legacy parser fields are all kept -- they provide transactions
+    and canonical keys.
     """
     if form_type == "WAGE_INCOME_TRANSCRIPT":
         parsed = transcript.parse_wage_income_transcript(text, tax_year=year)
@@ -777,6 +789,44 @@ def _fields_from_transcript(form_type: str, text: str,
     else:
         parsed = transcript.parse_return_transcript(text, tax_year=year)
         fields, unparsed, unparsed_spans = _transcript_line_fields(parsed)
+    # R23 stream A: positional two-column pair capture (primary transcript
+    # capture). Runs only when the caller threads the source PDF path;
+    # legacy extraction above is untouched and never overwritten.
+    if pdf_path and str(pdf_path).lower().endswith(".pdf"):
+        try:
+            pairs = twocol.capture_pairs(pdf_path)
+        except Exception:
+            # Pair capture is additive: a PDF pdfplumber cannot read
+            # leaves the legacy fields standing; never fail the extract.
+            pairs = []
+        for label, value, bbox, page in pairs:
+            norm = twocol.normalize_label(label)
+            if not norm:
+                continue
+            # Collision rule: never overwrite an existing field key --
+            # the legacy parser's key wins the bare form.
+            key = norm
+            if key in fields:
+                key = f"pair:{norm}"
+            n = 1
+            while key in fields:
+                n += 1
+                key = f"pair:{norm}_{n}"
+            fields[key] = {
+                "value": value,
+                "confidence": "medium",
+                "raw_text": f"{label} {value}".strip(),
+                # Pre-set R15 provenance (page + pdfplumber bbox);
+                # attach_field_provenance preserves it (never overwrites
+                # an existing provenance dict with a span-derived one).
+                "provenance": {
+                    "page": page,
+                    "bbox_pdf": [float(v) for v in bbox],
+                    "bbox_source": "pdfplumber",
+                    "char_span": None,
+                    "extractor": twocol.TWOCOL_EXTRACTOR_ID,
+                },
+            }
     if unparsed:
         fields["_unparsed_lines"] = _unparsed_field(unparsed, unparsed_spans)
     status = "transcribed" if not unparsed else "needs_review"
@@ -792,6 +842,7 @@ def _page_range_str(section: extractors.FormSection) -> str:
 def _extract_for_type(
     form_type: str, text: str, year: int | None,
     text_source: str | None = None,
+    pdf_path: str | None = None,
 ) -> tuple[dict, str]:
     """Route section text to the right extractor (legacy routing).
 
@@ -799,9 +850,14 @@ def _extract_for_type(
     (``ocr:<engine>/<mode>`` for OCR, ``native``/``form-field``/etc.
     otherwise); it reaches the box-form extractors (O1a OCR-tolerant
     1099-B box tokens). Transcript extractors take no text_source.
+
+    ``pdf_path`` (optional) names the source PDF so the R23 positional
+    two-column capture in ``_fields_from_transcript`` can run; it is
+    ignored by the box-form branch.
     """
     if form_type in TRANSCRIPT_FORMS:
-        return _fields_from_transcript(form_type, text, year)
+        return _fields_from_transcript(form_type, text, year,
+                                       pdf_path=pdf_path)
     if form_type in BOX_FORMS:
         return extractors.extract_fields(form_type, text,
                                          text_source=text_source)
@@ -1409,7 +1465,8 @@ def _child_document(
     year = _section_year(section, full_text)
     fields, status = _extract_for_type(
         section.form_type, section.text, year,
-        text_source=bundle.text_source if bundle is not None else None)
+        text_source=bundle.text_source if bundle is not None else None,
+        pdf_path=str(path))
     # R15: extraction-time field provenance (char spans + geometry).
     fields = _attach_provenance(
         fields, section.page_spans, section.form_type, bundle,
@@ -1544,7 +1601,8 @@ def _transcript_document(path: Path, doc_id: str, form_type: str,
     parsers, never child documents.
     """
     fields, status = _extract_for_type(form_type, text, year,
-                                        text_source=bundle.text_source)
+                                        text_source=bundle.text_source,
+                                        pdf_path=str(path))
     # R15: extraction-time field provenance over the whole text (page
     # boundaries survive via the joined-text page map -- P4).
     fields = _attach_provenance(fields, page_spans_for_joined(bundle.pages),
@@ -1625,7 +1683,8 @@ def _build_documents(path: Path, doc_id: str, bundle: PageBundle,
     if year is None:
         year = extractors.detect_tax_year(text)
     fields, status = _extract_for_type(form_type, section_text, year,
-                                        text_source=bundle.text_source)
+                                        text_source=bundle.text_source,
+                                        pdf_path=str(path))
     # R15: extraction-time field provenance. With no typed sections the
     # extraction text is "\n".join(pages) -- page boundaries survive via
     # the joined-text page map (P4: never lose page boundaries).

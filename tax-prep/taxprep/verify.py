@@ -877,11 +877,30 @@ def _filename_hint(source_path: str | None) -> str | None:
 
 
 def verify_type_hint_mismatch(store, year: int) -> dict:
-    """An unambiguous source-filename hint differing from form_type.
+    """Filename hint vs form_type, plus content classification vs form_type.
 
-    Raised as needs_human (mismatched entries); NEVER auto-reclassifies
-    -- the Operator disposes classification. doc_ids and form labels
-    only, never filenames' content.
+    Two independent signals, both raised as needs_human (mismatched
+    entries); R18 NEVER auto-reclassifies -- the Operator disposes
+    classification. doc_ids and form labels only, never values.
+
+    Signal 1 (existing): an unambiguous source-filename hint differing
+    from form_type. Entries keep their exact historic shape
+    {"doc_id", "hint", "form_type"}.
+
+    Signal 2 (R23 stream E): the document's own content disagrees with
+    its form_type. A normalized label profile is built from the stored
+    fields (shapes only: canonical keys expand to their printed labels
+    via transcript.py's tables, tc_* to a transaction marker, payer*
+    to a payer-structure marker; R23 pair-capture keys are already
+    normalized printed labels), unioned with the OCR text's profile
+    (section anchors are structural lines the parsers consume without
+    emitting fields, so they only come from text) -- either side alone
+    suffices when the other is absent. The profile is scored against each transcript type's
+    characteristic label set; a decisive win for a type other than the
+    declared form_type appends {"doc_id", "hint", "form_type",
+    "content_type", "overlap"} (additive keys; "hint" is None when the
+    filename carries no unambiguous hint). Classification by content
+    wins: the mismatch is raised, never silently re-filed.
     """
     mismatched: list[dict] = []
     n_checked = 0
@@ -895,16 +914,215 @@ def verify_type_hint_mismatch(store, year: int) -> dict:
         hint = _filename_hint(d.source_path)
         if hint is None:
             n_no_hint += 1
-            continue
-        if hint != d.form_type:
+        elif hint != d.form_type:
             mismatched.append({"doc_id": d.doc_id, "hint": hint,
                                "form_type": d.form_type})
+        if d.form_type in _CONTENT_CHARACTERISTIC:
+            content_type, overlap = _content_type_for_doc(store, d)
+            if content_type is not None and content_type != d.form_type:
+                mismatched.append({"doc_id": d.doc_id, "hint": hint,
+                                   "form_type": d.form_type,
+                                   "content_type": content_type,
+                                   "overlap": round(overlap, 3)})
     return {
         "passed": not mismatched,
         "n_checked": n_checked,
         "n_no_hint": n_no_hint,
         "mismatched": mismatched,
     }
+
+
+# -- Content-vs-filename classification (R18 / R23 stream E) ---------------
+#
+# A document's label profile is the set of normalized label SHAPES it
+# carries -- printed label strings, structural markers, never values.
+# Characteristic label sets per transcript type are derived from
+# transcript.py's tables:
+#   * RETURN: _RETURN_LABEL_TABLE's printed labels + its section marker;
+#   * ACCOUNT: _ACCOUNT_LABEL_TABLE's printed labels + the TC-transaction
+#     marker (real account transcripts are dominated by TC lines) + its
+#     section marker;
+#   * ROA: union of return + account labels plus the section anchors
+#     (return/account/roa titles -- an ROA is literally both sections);
+#   * WAGE_INCOME: the form-type tokens ("1099-INT", "W-2", ...) +
+#     the payer-structure marker + its section marker.
+#
+# Score for type T = |profile cap characteristic_T| / |profile|: the
+# fraction of the doc's own labels T accounts for (a documented
+# equivalent of the spec's recall form, chosen because the account
+# vocabulary is a near-subset of the ROA vocabulary -- recall alone
+# saturates the small account set for every ROA). The best type wins
+# only when:
+#   * it explains at least _CONTENT_EXPLAINED_MIN labels, AND
+#   * its explained fraction beats the runner-up by at least
+#     _CONTENT_MARGIN_MIN -- the decisive gap. The real-world case was
+#     0.83-0.93 vs 0.07-0.09 (gap ~0.75); the synthetic floor is 0.20,
+#     conservative enough that genuinely ambiguous docs stay quiet: a
+#     return transcript's TC lines also score for ROA, and an account
+#     transcript saturates the small account set, so those margins are
+#     thin by design and raise nothing.
+# Ties with the declared form_type resolve to the declared type --
+# the check flags only decisive disagreement, never a coin flip.
+# Deterministic: profiles are sets of label strings, ranking sorts by
+# (-explained, type name); no iteration-order-dependent output.
+
+_CONTENT_TC_MARKER = "tc_transaction"
+_CONTENT_PAYER_MARKER = "payer_structure"
+_CONTENT_SECTION_MARKERS = {
+    "RETURN_TRANSCRIPT": "section:return",
+    "ACCOUNT_TRANSCRIPT": "section:account",
+    "RECORD_OF_ACCOUNT": "section:roa",
+    "WAGE_INCOME_TRANSCRIPT": "section:wage",
+}
+
+_CONTENT_RETURN_LABELS = frozenset(
+    label for label, _key in transcript._RETURN_LABEL_TABLE)
+_CONTENT_ACCOUNT_LABELS = frozenset(
+    label for label, _key in transcript._ACCOUNT_LABEL_TABLE)
+
+_CONTENT_CHARACTERISTIC = {
+    "RETURN_TRANSCRIPT":
+        _CONTENT_RETURN_LABELS | {"section:return"},
+    "ACCOUNT_TRANSCRIPT":
+        _CONTENT_ACCOUNT_LABELS | {_CONTENT_TC_MARKER, "section:account"},
+    "RECORD_OF_ACCOUNT":
+        _CONTENT_RETURN_LABELS | _CONTENT_ACCOUNT_LABELS
+        | {_CONTENT_TC_MARKER, "section:return", "section:account",
+           "section:roa"},
+    "WAGE_INCOME_TRANSCRIPT":
+        frozenset(transcript._FORM_TYPES)
+        | {_CONTENT_PAYER_MARKER, "section:wage"},
+}
+
+# Canonical field key -> the printed labels it was parsed from. tc_* and
+# payer* keys are structural (never canonical table keys); anything
+# else unrecognized is treated as an R23 pair-capture normalized label.
+_CONTENT_KEY_LABELS: dict[str, frozenset[str]] = {}
+for _table in (transcript._RETURN_LABEL_TABLE,
+               transcript._ACCOUNT_LABEL_TABLE):
+    for _label, _key in _table:
+        _CONTENT_KEY_LABELS.setdefault(_key, set()).add(_label)
+_CONTENT_KEY_LABELS = {k: frozenset(v)
+                       for k, v in _CONTENT_KEY_LABELS.items()}
+
+# Section-title patterns -> markers. Anchors are structural lines: the
+# parsers consume them without emitting fields, so the profile takes
+# them from text directly. The record-of-account and wage-and-income
+# titles reuse transcript.py's structural semantics (X2: title matches
+# anywhere in the line).
+_CONTENT_SECTION_RES = [
+    (transcript._RETURN_SECTION_HEADER_RE, "section:return"),
+    (transcript._ACCOUNT_SECTION_HEADER_RE, "section:account"),
+    (transcript._ACCOUNT_TITLE_ANCHOR_RE, "section:account"),
+    (re.compile(r"\brecord\s+of\s+account\b", re.IGNORECASE),
+     "section:roa"),
+    (re.compile(r"\bwage\s+and\s+income\s+transcript\b", re.IGNORECASE),
+     "section:wage"),
+]
+
+# Need at least this many distinct label shapes before the profile is
+# trusted; the winning type must explain at least this many; and the
+# win must be decisive by this margin of the profile.
+_CONTENT_PROFILE_MIN = 4
+_CONTENT_EXPLAINED_MIN = 3
+_CONTENT_MARGIN_MIN = 0.20
+
+
+def _content_profile_from_fields(fields: dict) -> set[str]:
+    """Normalized label profile from stored field keys (shapes only)."""
+    profile: set[str] = set()
+    for key in fields:
+        if key == "_unparsed_lines":
+            continue  # internal bookkeeping, not a label shape
+        labels = _CONTENT_KEY_LABELS.get(key)
+        if labels is not None:
+            profile |= labels
+        elif key.startswith("tc_"):
+            profile.add(_CONTENT_TC_MARKER)
+        elif key.startswith("payer"):
+            profile.add(_CONTENT_PAYER_MARKER)
+        else:
+            # R23 pair-capture: already a normalized printed label.
+            profile.add(transcript._normalize_line(str(key)))
+    return profile
+
+
+def _content_profile_from_text(text: str) -> set[str]:
+    """Normalized label profile from OCR text (shapes only, no values)."""
+    profile: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        for pat, marker in _CONTENT_SECTION_RES:
+            if pat.search(line):
+                profile.add(marker)
+        if transcript._is_structural(raw):
+            continue  # titles / tax-year lines: markers only, no labels
+        candidate = transcript._label_candidate(
+            transcript._normalize_line(raw))
+        for table in (transcript._RETURN_LABEL_TABLE,
+                      transcript._ACCOUNT_LABEL_TABLE):
+            _key, label, ambiguous = transcript._match_label(
+                candidate, table)
+            # Ambiguous matches are never guessed -- skipped, as in the
+            # parsers.
+            if label is not None and not ambiguous:
+                profile.add(label)
+        if transcript._TRANSACTION_CODE_RE.match(raw):
+            profile.add(_CONTENT_TC_MARKER)
+        m = transcript._FORM_TYPE_RE.search(line)
+        if m:
+            profile.add(m.group(1))
+        if (transcript._EIN_RE.search(line)
+                or any(p.match(line)
+                       for p in transcript._PAYER_HEADER_RES)):
+            profile.add(_CONTENT_PAYER_MARKER)
+    return profile
+
+
+def _content_classify(profile: set[str],
+                      declared: str) -> tuple[str | None, float]:
+    """Best transcript type for a label profile, or (None, 0.0).
+
+    Returns (type, explained_fraction) only on a decisive win for a
+    type other than the declared one; otherwise (None, 0.0).
+    """
+    scores = {t: len(profile & chars)
+              for t, chars in _CONTENT_CHARACTERISTIC.items()}
+    ranked = sorted(scores, key=lambda t: (-scores[t], t))
+    best = ranked[0]
+    e_best = scores[best]
+    if best == declared:
+        return None, 0.0
+    if e_best < _CONTENT_EXPLAINED_MIN:
+        return None, 0.0
+    if scores[declared] == e_best:
+        return None, 0.0  # tie with declared: declared wins, never a flag
+    e_second = scores[ranked[1]]
+    if (e_best - e_second) / len(profile) < _CONTENT_MARGIN_MIN:
+        return None, 0.0  # thin margin: no-mismatch, Operator sees nothing
+    return best, e_best / len(profile)
+
+
+def _content_type_for_doc(store, doc) -> tuple[str | None, float]:
+    """Content classification for one transcript doc (shapes only).
+
+    The profile unions the stored fields' label shapes with the OCR
+    text's (section anchors are structural -- consumed by the parsers
+    without emitting fields -- so they only come from text). Either
+    side alone suffices when the other is absent.
+    """
+    profile = _content_profile_from_fields(getattr(doc, "fields", None) or {})
+    try:
+        text = store.load_ocr(doc.doc_id)
+    except (FileNotFoundError, OSError):
+        text = None
+    if text:
+        profile |= _content_profile_from_text(text)
+    if len(profile) < _CONTENT_PROFILE_MIN:
+        return None, 0.0
+    return _content_classify(profile, doc.form_type)
 
 
 def _content_prefix(text: str, n: int = 400) -> str:

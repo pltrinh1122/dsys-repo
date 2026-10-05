@@ -142,7 +142,7 @@ def test_reingest_disagreement_keeps_validated_values_flags_rereview(
     # Disagreement is only reachable through a derivation change: same
     # bytes always re-derive identically (I2 no-op), so the disagreeing
     # extractor rides a version bump (I6).
-    def _disagree(form_type, text, year, text_source=None):
+    def _disagree(form_type, text, year, text_source=None, pdf_path=None):
         fields = {"1": {"value": "99999.99", "confidence": "high",
                         "raw_text": ""}}
         return fields, "transcribed"

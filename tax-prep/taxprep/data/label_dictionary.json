@@ -1,0 +1,371 @@
+{
+  "labels": {
+    "ACCOUNT BALANCE": {
+      "canonical_key": "account_balance",
+      "citation": "Document 6209, Section 8A (transaction codes)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "ACCRUED INTEREST": {
+      "canonical_key": "accrued_interest",
+      "citation": "Document 6209, Section 8A (transaction codes)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "ACCRUED PENALTY": {
+      "canonical_key": "accrued_penalty",
+      "citation": "Document 6209, Section 8A (transaction codes)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "ADJUSTED GROSS INCOME": {
+      "canonical_key": "agi",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {
+        "2023": "11",
+        "2024": "11",
+        "2025": "11"
+      },
+      "lines_1040x": {
+        "2023": "L1",
+        "2024": "L1",
+        "2025": "L1"
+      }
+    },
+    "ADJUSTED GROSS INCOME PER COMPUTER": {
+      "canonical_key": "agi",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {
+        "2023": "11",
+        "2024": "11",
+        "2025": "11"
+      },
+      "lines_1040x": {
+        "2023": "L1",
+        "2024": "L1",
+        "2025": "L1"
+      }
+    },
+    "AGI": {
+      "canonical_key": "agi",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {
+        "2023": "11",
+        "2024": "11",
+        "2025": "11"
+      },
+      "lines_1040x": {
+        "2023": "L1",
+        "2024": "L1",
+        "2025": "L1"
+      }
+    },
+    "AMOUNT DUE": {
+      "canonical_key": "amount_owed",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L20",
+        "2024": "L20",
+        "2025": "L20"
+      }
+    },
+    "AMOUNT OWED": {
+      "canonical_key": "amount_owed",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L20",
+        "2024": "L20",
+        "2025": "L20"
+      }
+    },
+    "AMOUNT YOU OWE": {
+      "canonical_key": "amount_owed",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L20",
+        "2024": "L20",
+        "2025": "L20"
+      }
+    },
+    "BALANCE DUE": {
+      "canonical_key": "amount_owed",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L20",
+        "2024": "L20",
+        "2025": "L20"
+      }
+    },
+    "CAPITAL GAIN OR (LOSS)": {
+      "canonical_key": "capital_gain_loss",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "CAPITAL GAIN OR LOSS": {
+      "canonical_key": "capital_gain_loss",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "CAPITAL LOSS CARRYOVER": {
+      "canonical_key": "capital_loss_carryover",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "ESTIMATED PAYMENTS": {
+      "canonical_key": "estimated_payments",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L13",
+        "2024": "L13",
+        "2025": "L13"
+      }
+    },
+    "ESTIMATED TAX PAYMENTS": {
+      "canonical_key": "estimated_payments",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L13",
+        "2024": "L13",
+        "2025": "L13"
+      }
+    },
+    "EXEMPTIONS": {
+      "canonical_key": "exemptions",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "FEDERAL INCOME TAX WITHHELD": {
+      "canonical_key": "withholding",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L12",
+        "2024": "L12",
+        "2025": "L12"
+      }
+    },
+    "FILING STATUS": {
+      "canonical_key": "filing_status",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "LONG-TERM CAPITAL GAIN OR (LOSS)": {
+      "canonical_key": "long_term_gain_loss",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "LONG-TERM CAPITAL LOSS CARRYOVER": {
+      "canonical_key": "long_term_carryover",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "NUMBER OF EXEMPTIONS": {
+      "canonical_key": "exemptions",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "ORDINARY DIVIDENDS": {
+      "canonical_key": "ordinary_dividends",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "OVERPAID": {
+      "canonical_key": "refund",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L18",
+        "2024": "L18",
+        "2025": "L18"
+      }
+    },
+    "OVERPAYMENT": {
+      "canonical_key": "refund",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L18",
+        "2024": "L18",
+        "2025": "L18"
+      }
+    },
+    "QUALIFIED DIVIDENDS": {
+      "canonical_key": "qualified_dividends",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "REFUND": {
+      "canonical_key": "refund",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L18",
+        "2024": "L18",
+        "2025": "L18"
+      }
+    },
+    "REFUND AMOUNT": {
+      "canonical_key": "refund",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L18",
+        "2024": "L18",
+        "2025": "L18"
+      }
+    },
+    "SHORT-TERM CAPITAL GAIN OR (LOSS)": {
+      "canonical_key": "short_term_gain_loss",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "SHORT-TERM CAPITAL LOSS CARRYOVER": {
+      "canonical_key": "short_term_carryover",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "SOCIAL SECURITY TAX WITHHELD": {
+      "canonical_key": "ss_tax_withheld",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "TAX": {
+      "canonical_key": "total_tax",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L11",
+        "2024": "L11",
+        "2025": "L11"
+      }
+    },
+    "TAX PER COMPUTER": {
+      "canonical_key": "total_tax",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L11",
+        "2024": "L11",
+        "2025": "L11"
+      }
+    },
+    "TAX-EXEMPT INTEREST": {
+      "canonical_key": "tax_exempt_interest",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "TAXABLE INCOME": {
+      "canonical_key": "taxable_income",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {
+        "2023": "15",
+        "2024": "15",
+        "2025": "15"
+      },
+      "lines_1040x": {
+        "2023": "L5",
+        "2024": "L5",
+        "2025": "L5"
+      }
+    },
+    "TAXABLE INTEREST": {
+      "canonical_key": "taxable_interest",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "TOTAL PAYMENTS": {
+      "canonical_key": "total_payments",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L17",
+        "2024": "L17",
+        "2025": "L17"
+      }
+    },
+    "TOTAL TAX": {
+      "canonical_key": "total_tax",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L11",
+        "2024": "L11",
+        "2025": "L11"
+      }
+    },
+    "TOTAL TAX LIABILITY": {
+      "canonical_key": "total_tax",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L11",
+        "2024": "L11",
+        "2025": "L11"
+      }
+    },
+    "TOTAL TAX PAYMENTS": {
+      "canonical_key": "total_payments",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L17",
+        "2024": "L17",
+        "2025": "L17"
+      }
+    },
+    "TOTAL TAX PER COMPUTER": {
+      "canonical_key": "total_tax",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L11",
+        "2024": "L11",
+        "2025": "L11"
+      }
+    },
+    "WAGES": {
+      "canonical_key": "wages",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "WAGES, SALARIES, TIPS, ETC.": {
+      "canonical_key": "wages",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {}
+    },
+    "WITHHOLDING": {
+      "canonical_key": "withholding",
+      "citation": "IRM 2.3.52 (return transcript line items)",
+      "lines_1040": {},
+      "lines_1040x": {
+        "2023": "L12",
+        "2024": "L12",
+        "2025": "L12"
+      }
+    }
+  },
+  "version": 1
+}

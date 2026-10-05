@@ -306,9 +306,16 @@ def attach_field_provenance(fields: dict, page_spans,
             continue
         span = entry.pop("_extract_span", None)
         lot_spans = entry.pop("_lot_spans", None)
-        entry["provenance"] = _provenance_for_span(
-            span, page_spans, extractor, geometry, page_texts,
-            entry.get("raw_text"))
+        if isinstance(entry.get("provenance"), dict):
+            # R23: pair-capture fields already carry their authoritative
+            # pdfplumber page+bbox provenance (no extraction-text span
+            # exists for them). Never overwrite it with a span-derived
+            # record; only fill in the extractor name when unset.
+            entry["provenance"].setdefault("extractor", extractor)
+        else:
+            entry["provenance"] = _provenance_for_span(
+                span, page_spans, extractor, geometry, page_texts,
+                entry.get("raw_text"))
         if lot_spans:
             entry["lot_provenance"] = [
                 _provenance_for_span(s, page_spans, extractor, geometry,
