@@ -466,6 +466,66 @@ def _key_values_differ(a: dict, b: dict, form_type: str) -> bool:
     return any(ka.get(k) != kb.get(k) for k in keys)
 
 
+def _payer_columns_present(conn) -> bool:
+    """True when silver_doc carries the B1 stored payer-identity columns.
+
+    Real MedallionStore databases always have them (schema DDL for fresh
+    DBs, _COLUMN_MIGRATIONS for legacy ones); minimal contract stores
+    (e.g. the W3 test FakeStore) may not, and take the legacy scan path.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(silver_doc)")}
+    return "payer_ein" in cols and "payer_name_norm" in cols
+
+
+def _backfill_payer_columns(conn, form_type: str, tax_year) -> int:
+    """Populate NULL payer-identity columns for one (form, year) slice.
+
+    Runs at most once per doc ever: after the UPDATE no row of the slice
+    still has NULL columns (unknown identity is stored as ''), so repeat
+    calls find nothing to do. Returns the number of rows backfilled.
+    """
+    if tax_year is None:
+        year_pred: str = "tax_year IS NULL"
+        params: tuple = ()
+    else:
+        year_pred = "tax_year = ?"
+        params = (tax_year,)
+    rows = conn.execute(
+        "SELECT doc_id, fields_json FROM silver_doc "
+        f"WHERE form_type = ? AND {year_pred} "
+        "AND (payer_ein IS NULL OR payer_name_norm IS NULL)",
+        (form_type, *params)).fetchall()
+    for doc_id, fields_json in rows:
+        ein, name = _payer_identity(json.loads(fields_json or "{}"))
+        conn.execute(
+            "UPDATE silver_doc SET payer_ein = ?, payer_name_norm = ? "
+            "WHERE doc_id = ?",
+            (ein, name, doc_id))
+    return len(rows)
+
+
+def _l4_same_payer_priors(conn, form_type: str, tax_year, payer, doc_id):
+    """Indexed same-payer candidate lookup (B1).
+
+    Requires the B1 payer-identity columns. Returns [(doc_id,
+    fields_json)] for prior docs of the same form, year, and payer
+    identity, served by idx_silver_doc_payer (no full form-type scan).
+    The year predicate is NULL-safe so the result set matches the legacy
+    Python-side filter exactly.
+    """
+    if tax_year is None:
+        year_pred = "tax_year IS NULL"
+        params: tuple = ()
+    else:
+        year_pred = "tax_year = ?"
+        params = (tax_year,)
+    return conn.execute(
+        "SELECT doc_id, fields_json FROM silver_doc "
+        f"WHERE form_type = ? AND {year_pred} AND payer_ein = ? "
+        "AND payer_name_norm = ? AND doc_id <> ? ORDER BY doc_id",
+        (form_type, *params, payer[0], payer[1], doc_id)).fetchall()
+
+
 def assess_new_bronze(store, bronze_hash: str) -> list[str]:
     """Assess a newly registered bronze: L2 groups + L4 supersedes pairs.
 
@@ -515,21 +575,38 @@ def assess_new_bronze(store, bronze_hash: str) -> list[str]:
             "FROM silver_doc WHERE bronze_hash = ? ORDER BY doc_id",
             (bronze_hash,)).fetchall()
         texts = _bronze_texts(conn, bronze_hash)
+        # B1: on stores with the payer-identity columns the candidate set
+        # comes from idx_silver_doc_payer (O(same-payer) per doc); on
+        # minimal contract stores the legacy form-type scan applies.
+        payer_indexed = _payer_columns_present(conn)
+        backfilled: set = set()
         for doc_id, form_type, tax_year, fields_json in docs:
             fields = json.loads(fields_json or "{}")
             payer = _payer_identity(fields)
             if payer == ("", ""):
                 continue  # cannot attribute same-payer without identity
             marker = _has_corrected_marker(texts, fields)
-            priors = conn.execute(
-                "SELECT doc_id, tax_year, fields_json FROM silver_doc "
-                "WHERE form_type = ? AND doc_id <> ? ORDER BY doc_id",
-                (form_type, doc_id)).fetchall()
-            for p_id, p_year, p_fields_json in priors:
-                if p_year != tax_year:
-                    continue
+            if payer_indexed:
+                bkey = (form_type, tax_year)
+                if bkey not in backfilled:
+                    _backfill_payer_columns(conn, form_type, tax_year)
+                    backfilled.add(bkey)
+                priors = _l4_same_payer_priors(
+                    conn, form_type, tax_year, payer, doc_id)
+            else:
+                priors = conn.execute(
+                    "SELECT doc_id, tax_year, fields_json FROM silver_doc "
+                    "WHERE form_type = ? AND doc_id <> ? ORDER BY doc_id",
+                    (form_type, doc_id)).fetchall()
+            for prior in priors:
+                if payer_indexed:
+                    p_id, p_fields_json = prior
+                else:
+                    p_id, p_year, p_fields_json = prior
+                    if p_year != tax_year:
+                        continue
                 p_fields = json.loads(p_fields_json or "{}")
-                if _payer_identity(p_fields) != payer:
+                if not payer_indexed and _payer_identity(p_fields) != payer:
                     continue
                 # Bidirectional: the CORRECTED marker may sit on the prior
                 # doc (ingested first) or on the new one; differing values

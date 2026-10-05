@@ -28,6 +28,12 @@ Contract:
     render the blocked state instead (the console never catches pane
     exceptions as control flow, but a pane that 500s the page breaks
     the Queue & Review view).
+  - Optional extension (B3): `pane_html(store, doc, *, lot_page=0)` —
+    pages the per-lot lineage sub-rows (100-lot window, plain
+    `?lot_page=N` links; lot numbering stays document-wide). The
+    console passes `lot_page` from the page query string only when the
+    pane's signature accepts it; panes declaring the base contract keep
+    working.
 - Detection: `taxprep.console.evidence_pane_html(store, doc)` returns
   `None` when the module (or `pane_html`) is absent; the console then
   shows a "pane pending" note linking to the legacy `/doc/<id>` page

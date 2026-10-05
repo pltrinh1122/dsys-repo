@@ -47,6 +47,9 @@ tr.field-row{cursor:default}
 tr.selrow{background:#e3f2fd}
 table.evtable{border-collapse:collapse;font-size:13px}
 table.evtable td,table.evtable th{border:1px solid #ccc;padding:4px 8px;vertical-align:top}
+tr.lotnav td{background:#f4f8ff;font-size:12px;color:#333}
+tr.lotnav a{margin:0 6px}
+span.lotnavdis{color:#aaa;margin:0 6px}
 </style>
 """
 
@@ -97,8 +100,15 @@ document.querySelectorAll("#evidence-pane button.vorig").forEach(btn=>{
 """
 
 
+# B3: the lot table is paginated -- a 2000-lot document renders a 100-lot
+# window, not 2000 sub-rows. Lot numbers stay document-wide (stable
+# across windows); the lots FIELD row itself is never paginated.
+_LOT_WINDOW = 100
+
+
 def _lot_gain_loss_rows(store, doc, lots_field: dict,
-                        base: str, images_mode: bool) -> list[str]:
+                        base: str, images_mode: bool, *,
+                        lot_page: int = 0) -> list[str]:
     """Per-lot gain_loss sub-rows under the lots field (LINEAGE-1).
 
     Each lot's tagged gain_loss is a computed field: it renders the
@@ -106,12 +116,21 @@ def _lot_gain_loss_rows(store, doc, lots_field: dict,
     evidence" state. The inputs are the lot's own proceeds/basis/wash
     cells, which live in the parent lots row -- so every input link
     anchors there.
+
+    B3: only the ``lot_page`` window (``_LOT_WINDOW`` lots) renders.
+    ``lot_page`` is clamped to >= 0; the pane clamps it to the last
+    window. Lot numbering (``lots.lot{n}.gain_loss``) is document-wide
+    so row ids are stable across windows.
     """
     v = lots_field.get("value") if isinstance(lots_field, dict) else None
     if not isinstance(v, list):
         return []
+    start = max(0, lot_page) * _LOT_WINDOW
+    end = start + _LOT_WINDOW
     rows = []
     for n, lot in enumerate(v, start=1):
+        if n <= start or n > end:
+            continue
         if not isinstance(lot, dict):
             continue
         gl = lot.get("gain_loss")
@@ -136,13 +155,31 @@ def _lot_gain_loss_rows(store, doc, lots_field: dict,
     return rows
 
 
-def pane_html(store, doc) -> str:
+def _lot_nav_row(lot_page: int, n_pages: int, n_lots: int) -> str:
+    """Server-rendered lot-table pager (plain links, no JS framework)."""
+    lo = lot_page * _LOT_WINDOW + 1
+    hi = min(n_lots, (lot_page + 1) * _LOT_WINDOW)
+    prev = (f'<a href="?lot_page={lot_page - 1}">&larr; prev {_LOT_WINDOW}</a>'
+            if lot_page > 0 else '<span class="lotnavdis">&larr; prev</span>')
+    nxt = (f'<a href="?lot_page={lot_page + 1}">next {_LOT_WINDOW} &rarr;</a>'
+           if lot_page < n_pages - 1
+           else '<span class="lotnavdis">next &rarr;</span>')
+    return (f'<tr class="lotnav"><td colspan="4">'
+            f"lots {lo}&ndash;{hi} of {n_lots} &nbsp;{prev} &nbsp;{nxt}"
+            f"</td></tr>")
+
+
+def pane_html(store, doc, *, lot_page: int = 0) -> str:
     """Evidence section HTML for one document (console mount point).
 
     Returns the left page viewer (rendered pages + bbox overlays, or the
     degraded evidence path) plus a field table with per-field evidence
     cells. Never raises for missing geometry -- fields without a
     locatable source render the explicit "no visual evidence" state.
+
+    B3: the per-lot lineage sub-rows render one ``_LOT_WINDOW`` window
+    (``lot_page``, 0-based); the pager is plain ``?lot_page=N`` links.
+    The lots field row itself always renders in full.
     """
     base = ""  # relative URLs: console and review share one loopback origin
     images_mode = _review.evidence_status(store, doc)["mode"] == "images"
@@ -173,7 +210,14 @@ def pane_html(store, doc) -> str:
             "</tr>"
         )
         if code == "lots":
-            rows.extend(_lot_gain_loss_rows(store, doc, f, base, images_mode))
+            v = f.get("value") if isinstance(f, dict) else None
+            n_lots = len(v) if isinstance(v, list) else 0
+            n_pages = max(1, -(-n_lots // _LOT_WINDOW))
+            page = min(max(0, lot_page), n_pages - 1)
+            rows.extend(_lot_gain_loss_rows(store, doc, f, base,
+                                            images_mode, lot_page=page))
+            if n_pages > 1:
+                rows.append(_lot_nav_row(page, n_pages, n_lots))
     table = (
         '<table class="evtable"><tr><th>field</th><th>value</th>'
         "<th>evidence</th><th>confirm</th></tr>"

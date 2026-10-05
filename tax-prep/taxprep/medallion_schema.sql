@@ -83,8 +83,18 @@ CREATE TABLE silver_doc (             -- mirrors the current Document record
     derivation_digest TEXT NOT NULL,
     fields_json TEXT NOT NULL DEFAULT '{}',  -- operational field store (compat)
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    -- B1: stored payer identity for the L4 same-payer indexed lookup.
+    -- NULL = never populated (legacy row, backfilled once on read);
+    -- '' = populated, unknown.
+    payer_ein TEXT,
+    payer_name_norm TEXT
 );
+-- B1: L4 candidate lookup (form, year, payer identity).
+CREATE INDEX idx_silver_doc_payer ON silver_doc
+    (form_type, tax_year, payer_ein, payer_name_norm);
+-- B1: per-file _docs_for_bronze lookup (ingest hot path).
+CREATE INDEX idx_silver_doc_bronze ON silver_doc (bronze_hash);
 CREATE TABLE silver_artifact (
     artifact_id TEXT PRIMARY KEY,     -- sha256(bronze_hash:page:type:anchor)[:32]
     doc_id TEXT NOT NULL REFERENCES silver_doc(doc_id),

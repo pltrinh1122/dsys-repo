@@ -968,7 +968,14 @@ def _fire_reextract(store: DocumentStore, doc: Document,
 # -- Medallion silver write (I6/I7/R4; W2) -----------------------------------
 
 def _docs_for_bronze(store: DocumentStore, sha: str) -> list[Document]:
-    """Silver documents derived from one bronze object."""
+    """Silver documents derived from one bronze object.
+
+    B1: indexed store query (was list()-then-filter-in-Python, which
+    decoded every row once per ingested file).
+    """
+    docs_for_bronze = getattr(store, "docs_for_bronze", None)
+    if docs_for_bronze is not None:
+        return docs_for_bronze(sha)
     return [d for d in store.list()
             if getattr(d, "source_sha256", None) == sha]
 
@@ -1207,18 +1214,27 @@ def _persist_bronze_text(store: DocumentStore, bundle: PageBundle,
     Keyed by (bronze hash, page, derivation version, config): re-writing
     the same derivation is a no-op; a version bump adds rows. Feeds the
     L2 text fingerprint (duplicates.compute_and_store_text_fingerprint).
+
+    B2: the full per-page row list is built in memory and written in one
+    batched write_bronze_texts call (one transaction, one executemany),
+    not one store write per page.
     """
-    for i, page_text in enumerate(bundle.pages, start=1):
-        store.write_bronze_text(
-            source_sha, i,
-            text_source=bundle.text_source,
-            engine=bundle.ocr_engine,
-            engine_version=bundle.engine_version,
-            ocr_mode=bundle.ocr_mode,
-            derivation_version=ctx.derivation_version,
-            config_hash=ctx.config_hash,
-            text=page_text,
-        )
+    store.write_bronze_texts(
+        source_sha,
+        [
+            {
+                "page": i,
+                "text_source": bundle.text_source,
+                "engine": bundle.ocr_engine,
+                "engine_version": bundle.engine_version,
+                "ocr_mode": bundle.ocr_mode,
+                "derivation_version": ctx.derivation_version,
+                "config_hash": ctx.config_hash,
+                "text": page_text,
+            }
+            for i, page_text in enumerate(bundle.pages, start=1)
+        ],
+    )
 
 
 def _store_blocked_reingest(store: DocumentStore, existing: Document,
@@ -1982,63 +1998,69 @@ def ingest_dir(input_dir: str | Path, store: DocumentStore) -> IngestReport:
 
     report = IngestReport()
     files, _claimed = _candidate_files(root, store)
-    for path in files:
-        report.files_seen += 1
-        report.seen_paths.append(str(path))
-        try:
+    # B1: one outer transaction for the whole batch. Per-file txn()
+    # calls nest as SAVEPOINTs, so per-file error isolation is
+    # preserved: _SkipFile and the error-doc path roll back at most
+    # their own savepoint, while a single COMMIT replaces the former
+    # per-file fsync fan-out.
+    with store.txn():
+        for path in files:
+            report.files_seen += 1
+            report.seen_paths.append(str(path))
             try:
-                source_bytes = path.read_bytes()
-            except OSError:
-                raise _SkipFile(RC_READ_FAILED)
-            notes: list[dict] = []
-            docs = _ingest_file_medallion(path, source_bytes,
-                                          path.suffix.lower(), store,
-                                          hook_notes=notes,
-                                          source_root=root)
-            for n in notes:
-                report.hook_notes.append({"file": _rel(root, path), **n})
-        except _SkipFile as skip:
-            report.skipped.append({"file": _rel(root, path),
-                                   "reason_code": skip.reason_code})
-            continue
-        except Exception:
-            # Reason code, never exception text (R6). The failure is
-            # still recorded as a document so nothing is silent. The
-            # error document is derived in one txn (I7); its bronze row
-            # is registered first so the silver_doc FK always holds.
-            reason = RC_EXTRACT_FAILED
-            report.errored.append({"file": _rel(root, path),
-                                   "reason_code": reason})
-            try:
-                source_bytes = path.read_bytes()
-            except OSError:
-                source_bytes = None
-            if source_bytes is not None:
-                source_sha = hashlib.sha256(source_bytes).hexdigest()
-                doc_id = source_doc_id(source_bytes)
                 try:
-                    source_mtime = int(path.stat().st_mtime)
+                    source_bytes = path.read_bytes()
                 except OSError:
-                    source_mtime = None
-                _register_bronze(store, source_sha, source_bytes,
-                                 str(path), encryption=None,
-                                 source_root=str(root),
-                                 source_relpath=_relpath(root, path),
-                                 source_mtime=source_mtime)
-            else:
-                doc_id = source_doc_id(
-                    f"unreadable:{path}".encode("utf-8"))
-                source_sha = hashlib.sha256(
-                    f"unreadable:{path}".encode("utf-8")).hexdigest()
-                store.register_bronze(source_sha, 0)
-                store.add_alias(source_sha, str(path))
-            bundle = PageBundle([], "error", TS_ERROR,
-                                 reason_code=reason)
-            with store.txn():
-                docs = [_blocked_document(path, doc_id, bundle, source_sha,
-                                          store)]
-        report.ingested += 1
-        report.docs.extend(docs)
+                    raise _SkipFile(RC_READ_FAILED)
+                notes: list[dict] = []
+                docs = _ingest_file_medallion(path, source_bytes,
+                                              path.suffix.lower(), store,
+                                              hook_notes=notes,
+                                              source_root=root)
+                for n in notes:
+                    report.hook_notes.append({"file": _rel(root, path), **n})
+            except _SkipFile as skip:
+                report.skipped.append({"file": _rel(root, path),
+                                       "reason_code": skip.reason_code})
+                continue
+            except Exception:
+                # Reason code, never exception text (R6). The failure is
+                # still recorded as a document so nothing is silent. The
+                # error document is derived in one txn (I7); its bronze row
+                # is registered first so the silver_doc FK always holds.
+                reason = RC_EXTRACT_FAILED
+                report.errored.append({"file": _rel(root, path),
+                                       "reason_code": reason})
+                try:
+                    source_bytes = path.read_bytes()
+                except OSError:
+                    source_bytes = None
+                if source_bytes is not None:
+                    source_sha = hashlib.sha256(source_bytes).hexdigest()
+                    doc_id = source_doc_id(source_bytes)
+                    try:
+                        source_mtime = int(path.stat().st_mtime)
+                    except OSError:
+                        source_mtime = None
+                    _register_bronze(store, source_sha, source_bytes,
+                                     str(path), encryption=None,
+                                     source_root=str(root),
+                                     source_relpath=_relpath(root, path),
+                                     source_mtime=source_mtime)
+                else:
+                    doc_id = source_doc_id(
+                        f"unreadable:{path}".encode("utf-8"))
+                    source_sha = hashlib.sha256(
+                        f"unreadable:{path}".encode("utf-8")).hexdigest()
+                    store.register_bronze(source_sha, 0)
+                    store.add_alias(source_sha, str(path))
+                bundle = PageBundle([], "error", TS_ERROR,
+                                     reason_code=reason)
+                with store.txn():
+                    docs = [_blocked_document(path, doc_id, bundle, source_sha,
+                                              store)]
+            report.ingested += 1
+            report.docs.extend(docs)
     return report
 
 

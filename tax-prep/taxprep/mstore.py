@@ -259,6 +259,7 @@ class MedallionStore:
         self._conn.row_factory = sqlite3.Row
         self._apply_pragmas()
         self._migrate_columns()
+        self._migrate_indexes()
 
     # Additive, idempotent column migrations for databases created by an
     # older DDL. Each ALTER is guarded by PRAGMA table_info, so opening
@@ -276,7 +277,28 @@ class MedallionStore:
         # Operator; never mechanically split).
         ("silver_artifact", "owner_person_id", "TEXT"),
         ("silver_artifact", "owner_suggestion", "TEXT"),
+        # B1: stored payer identity for the L4 same-payer indexed lookup
+        # (duplicates.assess_new_bronze). NULL = never populated
+        # (legacy row, backfilled once on read); '' = populated, unknown.
+        ("silver_doc", "payer_ein", "TEXT"),
+        ("silver_doc", "payer_name_norm", "TEXT"),
     )
+
+    # Additive, idempotent index migrations for databases created by an
+    # older DDL. CREATE INDEX IF NOT EXISTS is a no-op on up-to-date
+    # databases. Fresh databases get the index from medallion_schema.sql.
+    _INDEX_MIGRATIONS: tuple[str, ...] = (
+        "CREATE INDEX IF NOT EXISTS idx_silver_doc_payer ON silver_doc "
+        "(form_type, tax_year, payer_ein, payer_name_norm)",
+        # B1: _docs_for_bronze per-file lookup (ingest hot path).
+        "CREATE INDEX IF NOT EXISTS idx_silver_doc_bronze ON silver_doc "
+        "(bronze_hash)",
+    )
+
+    def _migrate_indexes(self) -> None:
+        with self._op_lock:
+            for ddl in self._INDEX_MIGRATIONS:
+                self._conn.execute(ddl)
 
     def _migrate_columns(self) -> None:
         with self._op_lock:
@@ -308,6 +330,7 @@ class MedallionStore:
             # migration's writes go through upsert_silver_doc /
             # replace_artifacts, which reference the migrated columns.
             self._migrate_columns()
+            self._migrate_indexes()
             self._migrate_jsonl()
         finally:
             self._conn.close()
@@ -489,9 +512,38 @@ class MedallionStore:
 
         PRIMARY KEY (hash, page, derivation_version, config_hash): writing
         the same derivation twice is a no-op; a version bump adds rows.
+
+        Delegates to write_bronze_texts (single-row batch); kept for
+        callers that write one page.
+        """
+        self.write_bronze_texts(
+            sha,
+            [
+                {
+                    "page": page,
+                    "text_source": text_source,
+                    "engine": engine,
+                    "engine_version": engine_version,
+                    "ocr_mode": ocr_mode,
+                    "derivation_version": derivation_version,
+                    "config_hash": config_hash,
+                    "text": text,
+                }
+            ],
+        )
+
+    def write_bronze_texts(self, sha: str, rows: list[dict]) -> None:
+        """Write many bronze-derived per-page text rows in ONE batch.
+
+        B2: a 105-page transcript called write_bronze_text once per page
+        (one transaction + one INSERT each). This writes the whole set
+        in a single transaction with a single executemany. Row semantics
+        are identical to write_bronze_text (same upsert-on-conflict);
+        each row dict carries page/text_source/engine/engine_version/
+        ocr_mode/derivation_version/config_hash/text. Empty list = no-op.
         """
         with self.txn():
-            self._conn.execute(
+            self._conn.executemany(
                 "INSERT INTO bronze_text "
                 "(hash, page, text_source, engine, engine_version, ocr_mode, "
                 " derivation_version, config_hash, text) "
@@ -501,10 +553,20 @@ class MedallionStore:
                 "engine = excluded.engine, "
                 "engine_version = excluded.engine_version, "
                 "ocr_mode = excluded.ocr_mode, text = excluded.text",
-                (
-                    sha, page, text_source, engine, engine_version, ocr_mode,
-                    derivation_version, config_hash, text,
-                ),
+                [
+                    (
+                        sha,
+                        r["page"],
+                        r["text_source"],
+                        r.get("engine"),
+                        r.get("engine_version"),
+                        r.get("ocr_mode"),
+                        r["derivation_version"],
+                        r["config_hash"],
+                        r["text"],
+                    )
+                    for r in rows
+                ],
             )
 
     def read_bronze_text(
@@ -607,6 +669,17 @@ class MedallionStore:
                           config_hash: str, derivation_digest: str) -> None:
         """Insert or replace one silver_doc row (full-row upsert)."""
         now = _utcnow()
+        # B1: stored payer identity feeds the L4 same-payer indexed
+        # lookup (duplicates.assess_new_bronze). Every write populates
+        # the columns, so only legacy rows ever need the read backfill.
+        # Lazy import: importing taxprep.duplicates at mstore top level
+        # (i.e. before taxprep.mstore finishes importing) makes forked
+        # child processes crash under concurrency
+        # (test_concurrent_process_writers_no_lost_records); importing it
+        # here, after mstore is fully loaded, is safe. Matches the lazy
+        # duplicates imports already used in ingest.py.
+        from . import duplicates as _duplicates
+        payer_ein, payer_name_norm = _duplicates._payer_identity(doc.fields)
         with self.txn():
             self._conn.execute(
                 "INSERT INTO silver_doc "
@@ -614,9 +687,10 @@ class MedallionStore:
                 " status_reason, page_range, parent_doc_id, relevance, "
                 " validated_at, re_review, derivation_version, config_hash, "
                 " derivation_digest, fields_json, created_at, updated_at, "
-                " owner_person_id, owner_suggestion, owner_suggestion_basis) "
+                " owner_person_id, owner_suggestion, owner_suggestion_basis, "
+                " payer_ein, payer_name_norm) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                " ?, ?, ?) "
+                " ?, ?, ?, ?, ?) "
                 "ON CONFLICT(doc_id) DO UPDATE SET "
                 "bronze_hash = excluded.bronze_hash, "
                 "form_type = excluded.form_type, "
@@ -635,6 +709,8 @@ class MedallionStore:
                 "owner_person_id = excluded.owner_person_id, "
                 "owner_suggestion = excluded.owner_suggestion, "
                 "owner_suggestion_basis = excluded.owner_suggestion_basis, "
+                "payer_ein = excluded.payer_ein, "
+                "payer_name_norm = excluded.payer_name_norm, "
                 "updated_at = excluded.updated_at",
                 (
                     doc.doc_id,
@@ -657,6 +733,8 @@ class MedallionStore:
                     doc.owner_person_id,
                     doc.owner_suggestion,
                     doc.owner_suggestion_basis,
+                    payer_ein,
+                    payer_name_norm,
                 ),
             )
             # Doc-level text provenance (R5; W1's doc_provenance table).
@@ -700,6 +778,10 @@ class MedallionStore:
         preserved across the replace: an artifact_id that survives the
         re-derivation keeps its owner_person_id/owner_suggestion;
         incoming dicts may also carry them explicitly (explicit wins).
+
+        B2: the per-row INSERT loop is a single executemany (one
+        timestamp for the whole batch); inserted rows are byte-identical
+        to the old per-row writes.
         """
         now = _utcnow()
         with self.txn():
@@ -722,34 +804,34 @@ class MedallionStore:
                 "DELETE FROM silver_artifact WHERE doc_id = ?",
                 (doc_id,),
             )
+            batch = []
             for a in artifacts:
                 old_pid, old_sug = carried.get(a["artifact_id"], (None, None))
-                owner_person_id = a.get("owner_person_id", old_pid)
-                owner_suggestion = a.get("owner_suggestion", old_sug)
-                self._conn.execute(
-                    "INSERT INTO silver_artifact "
-                    "(artifact_id, doc_id, bronze_hash, page, artifact_type, "
-                    " anchor, value_json, offsets_json, derivation_version, "
-                    " config_hash, created_at, updated_at, "
-                    " owner_person_id, owner_suggestion) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        a["artifact_id"],
-                        doc_id,
-                        bronze_hash,
-                        a["page"],
-                        a["artifact_type"],
-                        a["anchor"],
-                        a["value_json"],
-                        a.get("offsets_json"),
-                        a["derivation_version"],
-                        a["config_hash"],
-                        now,
-                        now,
-                        owner_person_id,
-                        owner_suggestion,
-                    ),
-                )
+                batch.append((
+                    a["artifact_id"],
+                    doc_id,
+                    bronze_hash,
+                    a["page"],
+                    a["artifact_type"],
+                    a["anchor"],
+                    a["value_json"],
+                    a.get("offsets_json"),
+                    a["derivation_version"],
+                    a["config_hash"],
+                    now,
+                    now,
+                    a.get("owner_person_id", old_pid),
+                    a.get("owner_suggestion", old_sug),
+                ))
+            self._conn.executemany(
+                "INSERT INTO silver_artifact "
+                "(artifact_id, doc_id, bronze_hash, page, artifact_type, "
+                " anchor, value_json, offsets_json, derivation_version, "
+                " config_hash, created_at, updated_at, "
+                " owner_person_id, owner_suggestion) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                batch,
+            )
 
     def get_artifacts(self, doc_id: str,
                       artifact_type: str | None = None) -> list[dict]:
@@ -1045,15 +1127,49 @@ class MedallionStore:
             )
             return [self._row_to_doc(r) for r in cur]
 
+    def docs_for_bronze(self, bronze_hash: str) -> list[Document]:
+        """Docs derived from one bronze object (indexed filter).
+
+        B1: replaces the ingest hot path's list()-then-filter-in-Python
+        (which decoded every row once per ingested file). The tombstone
+        predicate reproduces _row_to_doc's source_sha256 mapping exactly,
+        so the result matches the old filter bit-for-bit.
+        """
+        with self._op_lock:
+            cur = self._conn.execute(
+                f"{self._DOC_SELECT} WHERE s.bronze_hash = ? "
+                f"AND COALESCE(b.blocked_reason, '') <> ? "
+                f"ORDER BY COALESCE(s.tax_year, 0), s.form_type, s.doc_id",
+                (bronze_hash, _TOMBSTONE_BLOCKED_REASON),
+            )
+            return [self._row_to_doc(r) for r in cur]
+
     def counts(self) -> dict[tuple[int | None, str], int]:
-        out: dict[tuple[int | None, str], int] = {}
-        for d in self.list():
-            key = (d.tax_year, d.form_type)
-            out[key] = out.get(key, 0) + 1
-        return out
+        """(tax_year, form_type) -> doc count.
+
+        B1: single GROUP BY query; never materializes Document rows
+        (the old implementation decoded every row via list()).
+        """
+        with self._op_lock:
+            cur = self._conn.execute(
+                "SELECT tax_year, form_type, COUNT(*) AS n FROM silver_doc "
+                "GROUP BY tax_year, form_type")
+            return {(r["tax_year"], r["form_type"]): r["n"] for r in cur}
 
     def needs_review(self) -> list[Document]:
-        return [d for d in self.list() if d.status == "needs_review"]
+        """Docs with status 'needs_review'.
+
+        B1: the status predicate is pushed into SQL so only matching
+        rows are decoded (the old implementation decoded every row via
+        list() and filtered in Python).
+        """
+        with self._op_lock:
+            cur = self._conn.execute(
+                f"{self._DOC_SELECT} WHERE s.status = ? "
+                f"ORDER BY COALESCE(s.tax_year, 0), s.form_type, s.doc_id",
+                ("needs_review",),
+            )
+            return [self._row_to_doc(r) for r in cur]
 
     def refresh(self) -> None:
         """Kept for compatibility. Reads now hit SQLite directly, so the

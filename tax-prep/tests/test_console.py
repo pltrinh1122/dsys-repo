@@ -636,3 +636,168 @@ def test_doc_page_pane_pending_without_sibling(server, monkeypatch):
     code, body = _get(base + f"/console/doc/{docs[0].doc_id}")
     assert code == 200
     assert "pane pending" in body.lower()
+
+
+# -- cross-links (Operator decision) + B3/R10 ---------------------------------
+#
+# Source selection stays a SEPARATE /console/sources endpoint -- it is
+# never embedded in the queue. The queue links OUT to it instead, and
+# source rows link back to the documents they produced.
+
+
+def _ingest_via_console(base, store, tmp_path, name="a.txt", text=None):
+    """Register a root, scan, and ingest one file through the console API.
+
+    Returns (root_id, file_id, doc_id).
+    """
+    root = tmp_path / "src"
+    root.mkdir(exist_ok=True)
+    _write(root, name, text if text is not None else TXT_A)
+    code, resp = _post(base + "/console/api/sources/roots/register",
+                       {"path": str(root)})
+    assert code == 200
+    root_id = resp["root"]["root_id"]
+    scans = sources.scan_roots(store)
+    fid = scans[0]["files"][0]["file_id"]
+    code, resp = _post(base + "/console/api/sources/ingest",
+                       {"file_ids": [fid]})
+    assert code == 200
+    return root_id, fid, resp
+
+
+def test_queue_source_column_links_to_sources(server, tmp_path):
+    base, store = server
+    root_id, _fid, _resp = _ingest_via_console(base, store, tmp_path)
+    code, body = _get(base + "/console/queue")
+    assert code == 200
+    # Source column: the file's basename, linking to /console/sources
+    # anchored to the doc's source root.
+    assert "a.txt" in body
+    assert f"/console/sources#root-{root_id}" in body
+
+
+def test_queue_empty_text_and_rescan_banner(server):
+    base, _ = server
+    code, body = _get(base + "/console/queue")
+    assert code == 200
+    assert "No documents — select sources." in body
+    assert "all validated" not in body  # never claimed
+    assert "Re-scan sources" in body
+    assert 'href="/console/sources"' in body
+
+
+def test_sources_rows_link_docs_and_lifecycle(server, tmp_path):
+    base, store = server
+    _rid, _fid, resp = _ingest_via_console(base, store, tmp_path)
+    doc_id = resp["files"][0]["docs"][0]
+    code, body = _get(base + "/console/sources")
+    assert code == 200
+    # The scan row links to the produced document...
+    assert f"/console/doc/{doc_id}" in body
+    # ...with its pipeline (lifecycle) state.
+    assert "needs_review" in body
+    # Ingested files carry the "uncheck" (exclude) control.
+    assert "data-exclude-file" in body
+
+
+def test_sources_root_sections_have_anchors(server, tmp_path):
+    base, store = server
+    root_id, _fid, _resp = _ingest_via_console(base, store, tmp_path)
+    code, body = _get(base + "/console/sources")
+    assert code == 200
+    assert f'id="root-{root_id}"' in body
+
+
+def test_hub_documents_by_status_funnel(server, tmp_path):
+    base, store = server
+    _rid, _fid, _resp = _ingest_via_console(base, store, tmp_path)
+    code, body = _get(base + "/console")
+    assert code == 200
+    assert "Documents by status" in body
+    # The indexed aggregate counts the ingested doc exactly once.
+    assert "needs_review</td><td>1</td>" in body
+
+
+def test_console_ingest_records_gold_run(server, tmp_path):
+    base, store = server
+    _rid, _fid, resp = _ingest_via_console(base, store, tmp_path)
+    run_id = resp.get("gold_run_id")
+    assert run_id, "console ingest must record a gold_run"
+    with store.txn() as conn:
+        row = conn.execute(
+            "SELECT kind FROM gold_run WHERE run_id = ?", (run_id,)).fetchone()
+    assert row is not None and row[0] == "source_ingest"
+    # ...and it shows up on the Runs view.
+    code, body = _get(base + "/console/runs")
+    assert code == 200 and "source_ingest" in body
+
+
+def test_console_exclude_unchecks_source(server, tmp_path):
+    base, store = server
+    _rid, fid, resp = _ingest_via_console(base, store, tmp_path)
+    doc_id = resp["files"][0]["docs"][0]
+    code, resp = _post(base + "/console/api/sources/exclude",
+                       {"file_ids": [fid]})
+    assert code == 200 and resp["ok"] is True
+    f = resp["files"][0]
+    assert f["excluded"] == [doc_id]
+    assert f["errors"] == []
+    # The R13 exclude event fired with the STANDING reason
+    # "operator-excluded" (the decision note's "operator-unselected" is
+    # reconciled to the existing taxonomy -- no duplicate reason).
+    doc = store.get(doc_id)
+    assert doc.status == "excluded"
+    assert doc.status_reason == "operator-excluded"
+    # Excluded docs leave the review queue.
+    code, body = _get(base + "/console/queue")
+    assert code == 200 and doc_id not in body
+    # The exclusion is in the decision log.
+    with store.txn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM decision_log WHERE kind = 'exclude' "
+            "AND doc_id = ?", (doc_id,)).fetchone()
+    assert row[0] >= 1
+
+
+def test_console_exclude_unknown_file_id(server, tmp_path):
+    base, _ = server
+    code, resp = _post(base + "/console/api/sources/exclude",
+                       {"file_ids": ["nope-nope-nope-nope"]})
+    assert code == 200 and resp["ok"] is True
+    assert resp["files"][0]["excluded"] == []
+    assert resp["files"][0]["errors"]  # loud, never silent
+
+
+def test_console_exclude_rejects_bad_payload(server):
+    base, _ = server
+    code, resp = _post(base + "/console/api/sources/exclude",
+                       {"file_ids": "not-a-list"})
+    assert code == 400 and resp["ok"] is False
+
+
+# -- R10 on the console POST surface ------------------------------------
+#
+# The review surface (/api/validate) already pins token rejection in
+# test_review.py. Both surfaces route through review._Handler.do_POST,
+# which applies the token prefix check BEFORE any route logic.
+
+
+def test_console_token_mode_post_without_token_404(token_server):
+    base, _ = token_server
+    code, _resp = _post(base + "/console/api/sources/roots/register",
+                        {"path": "/no/such/dir"})
+    assert code == 404  # missing /t/<token> prefix: indistinguishable from 404
+
+
+def test_console_token_mode_post_wrong_token_404(token_server):
+    base, _ = token_server
+    code, _resp = _post(base + "/t/wrong/console/api/sources/roots/register",
+                        {"path": "/no/such/dir"})
+    assert code == 404
+
+
+def test_console_token_mode_exclude_without_token_404(token_server):
+    base, _ = token_server
+    code, _resp = _post(base + "/console/api/sources/exclude",
+                        {"file_ids": ["x"]})
+    assert code == 404

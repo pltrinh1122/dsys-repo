@@ -226,6 +226,37 @@ any other bind address is refused):
 Typical loop: `ingest` → `review` in the browser → validated.
 Validated documents leave the queue; nothing is deleted.
 
+## Operator console (`/console`)
+
+The same localhost server hosts the Operator console (R12), served
+through the R10-hardened review server — Host allowlist, JSON-only
+POST, same-origin, and the optional per-run `/t/<token>` prefix apply
+to every console endpoint. Views:
+
+- `/console` — hub: Sources/Queue/Decisions/Run cards plus a
+  **documents-by-status funnel** (indexed aggregate query, never
+  list-all).
+- `/console/sources` — source discovery (R11 rev2): register roots,
+  metadata scan, checked-file ingest. Source selection lives **only**
+  here — it is never embedded in the queue. Scan rows link to the
+  documents each file produced (bronze SHA → docs) with per-doc
+  lifecycle state. Every console ingest records a `gold_run` row
+  (`kind=source_ingest`). The per-row **exclude** control on an
+  ingested file is the Operator's "uncheck": its documents fire the
+  R13 `exclude` event with the standing reason `operator-excluded`.
+- `/console/queue` — review queue; each row carries a **source**
+  column linking back to `/console/sources` (anchored to the doc's
+  source root when known). The empty state reads "No documents —
+  select sources." — never "all validated" — with a re-scan banner
+  pointing at Sources.
+- `/console/doc/<doc_id>` — Queue & Review document page hosting the
+  evidence pane. The pane's per-lot lineage table is **paginated**:
+  a 2000-lot document renders a 100-lot window with plain
+  `?lot_page=N` prev/next links (the lots field row itself always
+  renders; lot numbering stays document-wide). The page viewer never
+  pre-renders: only the first page's render is invoked per request,
+  every other page is a lazy `<img>` the browser fetches on scroll.
+
 ## Blind-orchestrator contract
 
 The workstation agent (Claude Code) operates this system **blind**: it
@@ -377,6 +408,29 @@ savepoint), `register_bronze`/`add_alias`/`store_bronze_bytes`/
 `log_decision`/`decisions_for`, `db_digest`/`table_counts`.
 Concurrency: SQLite serializes writers; a contended write waits for the
 busy timeout then fails loudly (`OperationalError`) — never silently.
+Write batching (B2): homogeneous row sets land in one `executemany` per
+set — `replace_artifacts` inserts all N artifacts in a single
+executemany (R21a owner-carry semantics unchanged), and
+`write_bronze_texts` writes all pages of a bronze object in one
+transaction (`write_bronze_text` delegates to it). No schema or
+content changes; inserted rows are byte-identical to the old per-row
+writes.
+Ingest scaling (B1): `ingest_dir` wraps the whole file loop in one outer
+`txn()` (per-file `txn()` calls nest as SAVEPOINTs, so per-file error
+isolation is preserved — `_SkipFile` skips and the error-doc path still
+records failures); a batch commits once instead of once per file.
+`silver_doc` carries stored payer identity (`payer_ein`,
+`payer_name_norm`; additive nullable columns, `NULL` = never populated)
+plus `idx_silver_doc_payer` on `(form_type, tax_year, payer_ein,
+payer_name_norm)`, so `assess_new_bronze`'s L4 candidate lookup is an
+indexed same-payer query instead of a full form-type scan (legacy rows
+are backfilled once on read; `''` = populated-but-unknown). Fresh
+databases get the columns/index from `medallion_schema.sql`; older ones
+via `_COLUMN_MIGRATIONS`/`_INDEX_MIGRATIONS` on open. `counts()` is a
+single `GROUP BY` query, `needs_review()` pushes `WHERE status` into SQL,
+and the new `docs_for_bronze(sha)` (indexed on `bronze_hash`) replaces
+the ingest hot path's per-file full-`list()` scan. Public signatures and
+group/gate semantics are unchanged.
 
 First open migrates a legacy `documents.jsonl` inside one transaction
 (bronze rows, aliases, silver docs, mirror artifacts, synthesized

@@ -32,8 +32,32 @@ POST (JSON, same-origin, under /console/api):
   /console/api/sources/roots/register    {path}
   /console/api/sources/roots/unregister   {root_id}
   /console/api/sources/ingest             {file_ids: [...]}
+  /console/api/sources/exclude            {file_ids: [...]}
   /console/api/decisions/rule_group       {group_id, ruling, primary?, reason?}
   /console/api/decisions/choose_conflict  {conflict_id, choice, reason?}
+
+Every POST above is served through the R10-hardened review server
+(taxprep/review.py _Handler.do_POST): Host allowlist, JSON-only POST,
+same-origin, and the per-run /t/<token> prefix apply to every console
+endpoint without exception. The doc page also accepts ?lot_page=N to
+page the evidence pane's lot table (B3).
+
+Cross-links (Operator decision, source selection stays a separate
+/console/sources endpoint -- never embedded in the queue):
+
+* queue rows carry a source column linking to /console/sources
+  (anchored to the doc's source root when the bronze linkage is known);
+* source scan rows link to the documents they produced (bronze SHA ->
+  docs) with per-doc lifecycle state;
+* the hub shows a documents-by-status funnel (indexed aggregate query,
+  never list-all);
+* the queue's empty state says "No documents — select sources." (never
+  "all validated") with a re-scan banner pointing at Sources;
+* unchecking an ingested source (the per-row "exclude" control) fires
+  the R13 exclude event on its documents with the standing reason
+  "operator-excluded" (the decision note's "operator-unselected" is the
+  same intent; the codebase taxonomy keeps "operator-excluded");
+* every console ingest records a gold_run row (kind=source_ingest).
 
 Values plane: the console is OPERATOR-ONLY (loopback). Agent surfaces
 (MCP tools, bus payloads) stay metadata-only; the Bus view renders
@@ -56,7 +80,9 @@ Sibling contracts (see doc/console-contracts.md):
 from __future__ import annotations
 
 import html
+import inspect
 import json
+from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 from . import bus as _bus
@@ -87,6 +113,7 @@ nav.cons a.here{font-weight:bold;color:#000}
 .side{display:flex;gap:12px}.side>div{flex:1;border:1px solid #ddd;padding:8px;min-width:0}
 button{font-size:14px;padding:6px 14px;margin:2px}
 input[type=text]{font-size:14px;padding:6px;width:420px;max-width:90%}
+.banner{background:#fdecea;border:2px solid #c62828;padding:12px;margin-bottom:12px;font-size:14px}
 pre{white-space:pre-wrap;background:#fafafa;border:1px solid #ddd;padding:10px;font-size:12px}
 h2{margin-top:28px}
 """
@@ -132,7 +159,7 @@ def _ok_badge(ok: bool, true_label: str = "ok", false_label: str = "fail") -> st
 
 # -- evidence pane adapter (sibling: R19/R19a) ------------------------------
 
-def evidence_pane_html(store, doc) -> str | None:
+def evidence_pane_html(store, doc, lot_page: int = 0) -> str | None:
     """Sibling evidence pane HTML, or None when not installed.
 
     Contract: taxprep/evidence_pane.py defines
@@ -140,6 +167,11 @@ def evidence_pane_html(store, doc) -> str | None:
     source-evidence pane (rendered pages + bbox overlays + per-field-set
     snapshots). The console mounts it verbatim inside
     ``<section id="evidence-pane" data-doc-id="...">``.
+
+    B3: ``lot_page`` pages the pane's lot table. It is an OPTIONAL
+    extension of the sibling contract -- siblings that still declare
+    ``pane_html(store, doc)`` get the unpaged call, so older panes keep
+    working (and the pane-stub contract test keeps its meaning).
     """
     try:
         from . import evidence_pane as _ep
@@ -148,6 +180,12 @@ def evidence_pane_html(store, doc) -> str | None:
     render = getattr(_ep, "pane_html", None)
     if not callable(render):
         return None
+    try:
+        params = inspect.signature(render).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "lot_page" in params:
+        return render(store, doc, lot_page=lot_page)
     return render(store, doc)
 
 
@@ -248,6 +286,203 @@ def _decision_counts(store) -> list[tuple[str, int]]:
     return [(str(k), int(n)) for k, n in rows]
 
 
+# -- cross-link helpers (Operator decision) -------------------------------
+
+def _docs_for_bronze(store, sha: str) -> list[str]:
+    """Doc ids produced from one bronze SHA (indexed, never list-all).
+
+    [] when the store has no silver_doc table (non-medallion).
+    """
+    try:
+        with store.txn() as conn:
+            rows = conn.execute(
+                "SELECT doc_id FROM silver_doc WHERE bronze_hash = ? "
+                "ORDER BY doc_id", (sha,)).fetchall()
+    except Exception:
+        return []
+    return [str(r[0]) for r in rows]
+
+
+def _bronze_source_root(store, doc) -> str | None:
+    """The source-root registry id for a doc, or None.
+
+    Primary: ``bronze.source_root`` for the doc's bronze. Fallback: the
+    registered root whose path is the longest prefix of the doc's
+    source path. The fallback exists because ``register_bronze`` is
+    INSERT OR IGNORE -- a bronze row first created by ``ingest_file``
+    keeps ``source_root`` NULL when the console's later
+    ``ingest_checked`` re-registers it (pre-existing ingest behavior,
+    not something the console changes).
+
+    Metadata only (root id + path basename) -- never values.
+    """
+    sha = getattr(doc, "source_sha256", None)
+    if sha:
+        try:
+            with store.txn() as conn:
+                row = conn.execute(
+                    "SELECT source_root FROM bronze WHERE hash = ?",
+                    (sha,)).fetchone()
+        except Exception:
+            row = None
+        if row and row[0]:
+            return row[0]
+    src = getattr(doc, "source_path", "") or ""
+    if not src:
+        return None
+    try:
+        roots = _sources.load_roots()
+    except Exception:
+        return None
+    best: tuple[str, str | None] | None = None
+    for r in roots:
+        rp = r.get("path", "")
+        if rp and (src == rp or src.startswith(rp.rstrip("/") + "/")):
+            if best is None or len(rp) > len(best[0]):
+                best = (rp, r.get("root_id"))
+    return best[1] if best else None
+
+
+def _status_counts(store) -> list[tuple[str, int]]:
+    """Documents per status via one indexed aggregate -- never list-all.
+
+    [] when the store has no silver_doc table (non-medallion).
+    """
+    try:
+        with store.txn() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) FROM silver_doc "
+                "GROUP BY status ORDER BY status").fetchall()
+    except Exception:
+        return []
+    return [(str(s), int(n)) for s, n in rows]
+
+
+def _record_gold_run(store, kind: str, params: dict,
+                     output: dict) -> str | None:
+    """Persist one gold_run row (best-effort, metadata only).
+
+    Same row shape as gold.gated_carryforward: canonical-JSON params
+    and output with sha256 digests. Returns the run_id, or None when
+    the store has no gold_run table -- the caller's operation still
+    succeeds; the run simply is not recorded.
+    """
+    import hashlib
+    from datetime import datetime, timezone
+
+    params_c = json.dumps(params, sort_keys=True)
+    output_c = json.dumps(output, sort_keys=True)
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    run_id = hashlib.sha256(
+        f"{kind}:{ts}:{params_c}".encode()).hexdigest()[:32]
+    try:
+        with store.txn() as conn:
+            conn.execute(
+                "INSERT INTO gold_run (run_id, ts, kind, params_json, "
+                "input_digest, output_json, output_digest) VALUES "
+                "(?, ?, ?, ?, ?, ?, ?)",
+                (run_id, ts, kind, params_c,
+                 hashlib.sha256(params_c.encode()).hexdigest(),
+                 output_c,
+                 hashlib.sha256(output_c.encode()).hexdigest()))
+    except Exception:
+        return None
+    return run_id
+
+
+def _queue_source_cell(store, doc, base: str) -> str:
+    """Source cell for a queue row.
+
+    The source file's basename links to /console/sources, anchored to
+    the doc's source root when the bronze linkage is known. Ids/paths
+    only -- never values (blind-orchestrator contract).
+    """
+    label = (Path(doc.source_path).name if getattr(doc, "source_path", "")
+             else "—")
+    root_id = _bronze_source_root(store, doc)
+    anchor = f"#root-{root_id}" if root_id else ""
+    title = html.escape(getattr(doc, "source_path", "") or "", quote=True)
+    return (f'<td><a href="{base}/console/sources{anchor}" '
+            f'title="{title}">{html.escape(label)}</a></td>')
+
+
+def _file_sha_map(store) -> dict[str, str]:
+    """file_id -> sha256 for the current scan (public scan_roots only)."""
+    mapping: dict[str, str] = {}
+    for root in _sources.scan_roots(store):
+        for f in root["files"]:
+            mapping[f["file_id"]] = f["sha256"]
+    return mapping
+
+
+def _exclude_checked(store, file_ids: list[str]) -> list[dict]:
+    """Exclude every document produced from the given scan file_ids.
+
+    The Operator's "uncheck": each produced doc goes through the R13
+    ``exclude`` event (actor=operator) with the STANDING reason
+    ``operator-excluded`` -- the decision note's "operator-unselected"
+    is the same intent, but the codebase taxonomy keeps the existing
+    "operator-excluded" code rather than minting a duplicate reason.
+    Mirrors cmd_exclude: exclusion sidecar + lifecycle transition +
+    silver persist + decision-log entry, per doc.
+    """
+    from . import exclusions as _excl
+    from . import lifecycle as _lc
+    from . import silver as _silver
+
+    sha_map = _file_sha_map(store)
+    out: list[dict] = []
+    for fid in file_ids:
+        sha = sha_map.get(fid)
+        if sha is None:
+            out.append({"file_id": fid, "ok": False, "docs": [],
+                        "excluded": [],
+                        "errors": ["unknown file_id (re-scan and retry)"]})
+            continue
+        doc_ids = _docs_for_bronze(store, sha)
+        excluded: list[str] = []
+        errors: list[dict] = []
+        for doc_id in doc_ids:
+            doc = store.get(doc_id)
+            if doc is None:
+                errors.append({"doc_id": doc_id, "error": "not found"})
+                continue
+            try:
+                _excl.record_exclusion(store.data_dir, doc_id,
+                                       "operator-excluded")
+            except ValueError as exc:
+                errors.append({"doc_id": doc_id, "error": str(exc)})
+                continue
+            with store.txn():
+                res = _lc.transition(
+                    doc, _lc.EXCLUDE, actor=_lc.OPERATOR,
+                    event_input=_lc.ExcludeInput(reason="operator-excluded"),
+                    store=store)
+                if not res.ok:
+                    errors.append({"doc_id": doc_id,
+                                   "error": res.reason_code
+                                   or "exclude_refused"})
+                    continue
+                bronze_hash = _silver.bronze_hash_for_doc(store, doc)
+                if bronze_hash is None:
+                    store.upsert(doc)
+                else:
+                    _silver.persist_silver_doc(
+                        store, doc,
+                        _silver.derivation_for_doc(store, doc.doc_id),
+                        bronze_hash)
+                logd = getattr(store, "log_decision", None)
+                if callable(logd):
+                    logd(actor="operator", kind="exclude", doc_id=doc_id,
+                         payload={"doc_id": doc_id,
+                                  "reason": "operator-excluded",
+                                  "via": "console-uncheck"})
+            excluded.append(doc_id)
+        out.append({"file_id": fid, "ok": not errors, "docs": doc_ids,
+                    "excluded": excluded, "errors": errors})
+    return out
+
+
 # -- hub ---------------------------------------------------------------------
 
 def hub_html(store, token: str | None = None) -> str:
@@ -271,11 +506,18 @@ def hub_html(store, token: str | None = None) -> str:
         f'<div>{html.escape(label)}</div>'
         f'<div><a href="{base}/console/{slug}">{html.escape(title)}</a></div></div>'
         for title, n, label, slug in cards)
+    funnel_rows = "".join(
+        f"<tr><td class=\"mono\">{html.escape(status)}</td><td>{n}</td></tr>"
+        for status, n in _status_counts(store)
+    ) or '<tr><td colspan="2"><i>no documents</i></td></tr>'
     return _page("Operator console", token, "",
                  f'<p>Loopback Operator console. Every view below is served '
                  f'by the R10-hardened review server (Host allowlist, '
                  f'JSON-only POST, same-origin, per-run token).</p>'
-                 f'<div class="cards">{cards_html}</div>')
+                 f'<div class="cards">{cards_html}</div>'
+                 f'<h2>Documents by status</h2>'
+                 f'<table><tr><th>status</th><th>count</th></tr>'
+                 f'{funnel_rows}</table>')
 
 
 # -- Sources (R11 rev2) --------------------------------------------------------
@@ -314,6 +556,25 @@ def sources_html(store, token: str | None = None) -> str:
                              f'{html.escape(hint["bronze_hash"][:8])}…</span>')
             ing = ('<span class="badge b-ok">ingested</span>' if f["ingested"]
                    else '<span class="badge b-warn">new</span>')
+            if f["ingested"]:
+                # The Operator's "uncheck": excluding an ingested source
+                # fires the R13 exclude event on its documents (standing
+                # reason "operator-excluded").
+                ing += (f' <button data-exclude-file="'
+                        f'{html.escape(f["file_id"])}">exclude</button>')
+            # Cross-link: the documents this file produced (bronze SHA ->
+            # docs) plus each doc's pipeline state. Ids/statuses only.
+            doc_ids = _docs_for_bronze(store, f["sha256"])
+            if doc_ids:
+                docs_html = "<br>".join(
+                    f'<a href="{base}/console/doc/{quote(did)}">'
+                    f'{html.escape(did)}</a>' for did in doc_ids)
+                lc_html = "<br>".join(
+                    html.escape(_sources.lifecycle_state(store, did) or "—")
+                    for did in doc_ids)
+            else:
+                docs_html = "—"
+                lc_html = "—"
             frows.append(
                 f"<tr>"
                 f'<td><input type="checkbox" class="fchk" value="{html.escape(f["file_id"])}"'
@@ -323,12 +584,16 @@ def sources_html(store, token: str | None = None) -> str:
                 f"<td>{f['size_bytes']:,}</td>"
                 f"<td class=\"mono\">{html.escape(f['route'])}</td>"
                 f"<td>{hint_html}</td>"
-                f"<td>{ing}</td></tr>")
+                f"<td>{ing}</td>"
+                f"<td>{docs_html}</td>"
+                f"<td>{lc_html}</td></tr>")
         scan_sections.append(
-            f"<h3 class=\"mono\">{html.escape(scan['path'])}</h3>"
+            f"<h3 class=\"mono\" id=\"root-{html.escape(scan['root_id'])}\">"
+            f"{html.escape(scan['path'])}</h3>"
             f"<p>{len(files)} files, {total:,} bytes, {n_ing} already ingested</p>"
             f"<table><tr><th></th><th>file</th><th>type</th><th>size</th>"
-            f"<th>predicted route</th><th>duplicate hint</th><th>status</th></tr>"
+            f"<th>predicted route</th><th>duplicate hint</th><th>status</th>"
+            f"<th>documents</th><th>lifecycle</th></tr>"
             + "\n".join(frows) + "</table>")
     scans_html = "\n".join(scan_sections) or "<p><i>No roots to scan.</i></p>"
 
@@ -385,6 +650,19 @@ document.getElementById("ingestBtn").addEventListener("click", async () => {{
     setTimeout(() => location.reload(), 800);
   }} catch (e) {{ msg.textContent = "refused: " + e.message; }}
 }});
+document.querySelectorAll("[data-exclude-file]").forEach(b =>
+  b.addEventListener("click", async () => {{
+    if (!confirm("Exclude every document produced from this file? "
+      + "They leave the review queue with reason operator-excluded.")) return;
+    try {{
+      const j = await post("/console/api/sources/exclude",
+        {{file_ids: [b.dataset.excludeFile]}});
+      const f = j.files[0] || {{excluded: [], errors: []}};
+      alert("excluded " + f.excluded.length + " document(s)"
+        + (f.errors.length ? "; " + f.errors.length + " refused" : ""));
+      location.reload();
+    }} catch (e) {{ alert("refused: " + e.message); }}
+  }}));
 </script>""")
 
 
@@ -428,23 +706,41 @@ def queue_html(store, token: str | None = None) -> str:
             f"<td>{html.escape(d.status)}</td>"
             f"<td>{html.escape(state or '—')}</td>"
             f"<td>{html.escape(d.relevance)}</td>"
+            f"{_queue_source_cell(store, d, base)}"
             "</tr>")
-    body = "\n".join(rows) or '<tr><td colspan="6"><i>Queue empty — all validated.</i></td></tr>'
+    if rows:
+        banner = ""
+        body = "\n".join(rows)
+    else:
+        # F5 empty-queue wording: the queue never claims "all validated" --
+        # a non-closed run may still be holding the (principal, scope)
+        # slot unseen. The re-scan banner points at Sources.
+        banner = (f'<div class="banner">No documents in the review queue. '
+                  f'<a href="{base}/console/sources">Re-scan sources →</a>'
+                  f'</div>')
+        body = ('<tr><td colspan="7"><i>No documents — select sources.</i>'
+                '</td></tr>')
     return _page("Queue & Review", token, "queue", f"""
 <p>Per-document pages host the evidence pane (sibling workstream) and the
 R13 lifecycle state with its event history. Validation itself still goes
 through the <span class="mono">/doc/&lt;id&gt;</span> flow
 (<span class="mono">POST /api/validate</span>).</p>
+{banner}
 <table><tr><th>doc_id</th><th>year</th><th>form</th><th>status</th>
-<th>lifecycle</th><th>relevance</th></tr>{body}</table>""")
+<th>lifecycle</th><th>relevance</th><th>source</th></tr>{body}</table>""")
 
 
-def doc_review_html(store, doc, token: str | None = None) -> str | None:
-    """Queue & Review document page. None when the doc does not exist."""
+def doc_review_html(store, doc, token: str | None = None,
+                    lot_page: int = 0) -> str | None:
+    """Queue & Review document page. None when the doc does not exist.
+
+    ``lot_page`` pages the evidence pane's lot table (B3); it travels
+    as ``?lot_page=N`` on the page URL.
+    """
     if doc is None:
         return None
     base = _token_url_base(token)
-    pane = evidence_pane_html(store, doc)
+    pane = evidence_pane_html(store, doc, lot_page=lot_page)
     if pane is None:
         pane_html = (
             '<div class="pend">Evidence pane pending — the R19/R19a sibling '
@@ -753,7 +1049,13 @@ def dispatch_get(store, parsed, token: str | None = None, **kwargs):
     if path.startswith("/console/doc/"):
         from urllib.parse import unquote
         doc_id = unquote(path[len("/console/doc/"):])
-        page = doc_review_html(store, store.get(doc_id), token)
+        qs = parse_qs(parsed.query)
+        try:
+            lot_page = max(0, int(qs.get("lot_page", ["0"])[0]))
+        except (TypeError, ValueError):
+            lot_page = 0
+        page = doc_review_html(store, store.get(doc_id), token,
+                               lot_page=lot_page)
         return page  # None -> caller 404s
     if path == "/console/checks":
         qs = parse_qs(parsed.query)
@@ -825,7 +1127,23 @@ def dispatch_post(store, path: str, payload: dict) -> tuple[int, dict]:
         except Exception as exc:
             return _err(500, f"ingest failed: {type(exc).__name__}")
         result["ok"] = True
+        # Source ingests appear as Runs: one gold_run row per console
+        # ingest (best-effort -- a missing table never fails the ingest).
+        doc_ids = sorted({d for f in result["files"] for d in f["docs"]})
+        result["gold_run_id"] = _record_gold_run(
+            store, "source_ingest",
+            {"file_ids": sorted(fids)},
+            {"summary": result["summary"], "doc_ids": doc_ids})
         return 200, result
+
+    if path == "/console/api/sources/exclude":
+        fids = payload.get("file_ids")
+        if not isinstance(fids, list) or not all(isinstance(x, str) for x in fids):
+            return _err(400, "file_ids must be a list of strings")
+        if len(fids) > 500:
+            return _err(422, "too many files in one request (max 500)")
+        files = _exclude_checked(store, fids)
+        return 200, {"ok": True, "files": files}
 
     if path == "/console/api/decisions/rule_group":
         gid = payload.get("group_id", "")
