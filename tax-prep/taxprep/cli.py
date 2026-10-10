@@ -830,6 +830,35 @@ def cmd_ingest_csv(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ingest_manual_w2(args: argparse.Namespace) -> int:
+    from .manual_w2 import ingest_manual_w2
+
+    store = _store(args.data_dir)
+    try:
+        csv_text = Path(args.file).read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"error: cannot read {args.file}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        res = ingest_manual_w2(store, csv_text, args.file)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if res.get("duplicate_import"):
+        print(f"already ingested (identical bytes): {res['doc_id']}")
+        return 0
+    doc = store.get(res["doc_id"])
+    codes = sorted(doc.fields)
+    print(f"ingested manual W-2 {res['doc_id']} "
+          f"[{doc.form_type} {doc.tax_year}] {len(codes)} fields: "
+          f"{','.join(codes)}")
+    if res["superseded"]:
+        print(f"superseded: {', '.join(res['superseded'])}")
+    print("status needs_review: validate with `taxprep review` before "
+          "gold; box 2 flows to total withholding through the normal path")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="taxprep", description="Transcribe tax documents into structured digital form (local-only).")
     p.add_argument("--data-dir", default=None,
@@ -1010,6 +1039,13 @@ def build_parser() -> argparse.ArgumentParser:
     pcs.add_argument("--file", required=True, help="CSV file to ingest")
     pcs.add_argument("--year", type=int, required=True, help="tax year")
     pcs.set_defaults(func=cmd_ingest_csv)
+
+    pmw = sub.add_parser("ingest-manual-w2",
+                         help="ingest an Operator-keyed manual W-2 CSV "
+                              "(doc/manual-w2-format.md)")
+    pmw.add_argument("--file", required=True,
+                     help="manual W-2 CSV file to ingest")
+    pmw.set_defaults(func=cmd_ingest_manual_w2)
 
     # -- R21a: per-person scoping ---------------------------------------
 
