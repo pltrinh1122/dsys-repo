@@ -1,0 +1,38 @@
+label,value
+# W-2 manual record — RENAME this file to w2-manual-YYYY-slug.csv first
+# HOW TO USE — fill one value per row then ingest with:
+# taxprep ingest-manual-w2 --file w2-manual-YYYY-slug.csv
+# PLACEHOLDERS are deliberate: money EIN year box-12 rows FAIL LOUD
+# at ingest if left as placeholders so an unfinished file cannot pass
+# FREE TEXT rows (employer box 14 state) cannot fail loud so they are
+# marked with <<< >>> — you must replace them yourself
+# RULES — money is 12345.67 digits and two decimals only no $ no commas
+# omit = box is blank on the paper; 0.00 = the paper prints a zero
+# comment rows like this one must NOT contain commas or they break
+tax_year,YYYY
+employer_name,<<< EMPLOYER NAME >>>
+employer_ein,NN-NNNNNNN
+1 Wages tips other compensation,___.__
+2 Federal income tax withheld,___.__
+3 Social security wages,___.__
+4 Social security tax withheld,___.__
+5 Medicare wages and tips,___.__
+6 Medicare tax withheld,___.__
+# BOX 12 — copy the CODE printed on the paper then the amount. Put X is
+# not used here. DELETE the rows for letters your W-2 does not use.
+# Letters follow the paper top to bottom 12a then 12b then 12c then 12d.
+12a,CODE 0.00
+12b,CODE 0.00
+12c,CODE 0.00
+12d,CODE 0.00
+# BOX 13 — put X only if the paper checks the box. DELETE the rows that
+# are unchecked. Leaving "omit" here fails loud so you must decide.
+13 Statutory employee,omit
+13 Retirement plan,omit
+13 Third-party sick pay,omit
+# BOX 14 — one row per printed item. DELETE rows you do not need.
+14,<<< BOX 14 ITEM (for example CA SDI 612.34) or delete this row >>>
+# BOXES 15-17 — state section. DELETE if the W-2 has no state wages.
+15 State,<<< ST (for example CA) or delete this row >>>
+16 State wages,___.__
+17 State income tax,___.__
