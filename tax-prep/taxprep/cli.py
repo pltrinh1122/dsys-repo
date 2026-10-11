@@ -868,6 +868,13 @@ def cmd_chain(args: argparse.Namespace) -> int:
                prior_st=args.prior_st, prior_lt=args.prior_lt)
 
 
+def cmd_packet(args: argparse.Namespace) -> int:
+    from .packet import run as run_packet
+
+    return run_packet(packets_dir=args.packets_dir, csv_dir=args.csv_dir,
+                      out=args.out, identity_file=args.identity_file)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="taxprep", description="Transcribe tax documents into structured digital form (local-only).")
     p.add_argument("--data-dir", default=None,
@@ -1122,6 +1129,26 @@ def build_parser() -> argparse.ArgumentParser:
     pss.add_argument("--template", action="store_true",
                      help="write an empty seed-sheet.csv template to stdout")
     pss.set_defaults(func=cmd_stmt_summary)
+
+    # -- R24(c): per-year 1040-X entry packets ----------------------------
+
+    ppc = sub.add_parser("packet",
+                         help="R24(c): per-year 1040-X entry packets from "
+                              "the (a)+(b) packets tree (blind-safe)")
+    ppc.add_argument("--packets-dir", required=True,
+                     help="packets/ tree from `taxprep chain` / "
+                          "`taxprep stmt-summary`")
+    ppc.add_argument("--csv-dir", default=None,
+                     help="transcript CSVs for the column-A sheet (same dir "
+                          "as `taxprep chain`); without it the column-A "
+                          "sheet is marked unavailable")
+    ppc.add_argument("--out", default=None,
+                     help="output directory (default: packets-dir; "
+                          "files 0600)")
+    ppc.add_argument("--identity-file", default=None,
+                     help="private list of identity strings; matching "
+                          "transcript sections are skipped (never printed)")
+    ppc.set_defaults(func=cmd_packet)
 
     # -- R21a: per-person scoping ---------------------------------------
 
