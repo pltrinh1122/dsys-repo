@@ -1084,6 +1084,45 @@ def build_parser() -> argparse.ArgumentParser:
                      help="LT carryover into 2022 (decimal string)")
     pch.set_defaults(func=cmd_chain)
 
+    # -- R24(b): broker consolidated-1099 summary extractor --------------
+
+    def cmd_stmt_summary(args: argparse.Namespace) -> int:
+        from .stmt_summary import run as run_stmt_summary
+
+        pdfs: list[str] = list(args.pdfs or [])
+        if args.pdf_dir:
+            pdfs.extend(str(p) for p in sorted(Path(args.pdf_dir).glob("*.pdf")))
+        return run_stmt_summary(
+            pdfs=pdfs, labels=args.labels, persons_file=args.persons_file,
+            identity_file=args.identity_file, csv_dir=args.csv_dir,
+            out=args.out, template=args.template)
+
+    pss = sub.add_parser("stmt-summary",
+                         help="R24(b): broker consolidated-1099 summary "
+                              "extractor -> seed sheet (blind-safe)")
+    pss.add_argument("--pdf-dir", default=None,
+                     help="directory of consolidated-1099 PDFs")
+    pss.add_argument("--pdfs", nargs="*", default=None,
+                     help="individual PDF paths")
+    pss.add_argument("--labels", default=None,
+                     help="JSON vocabulary file (extends the built-in "
+                          "census labels)")
+    pss.add_argument("--persons-file", default=None,
+                     help="private JSON {name substring: person-N} "
+                          "(never printed)")
+    pss.add_argument("--identity-file", default=None,
+                     help="private list of identity strings; echoed labels "
+                          "containing them are redacted")
+    pss.add_argument("--csv-dir", default=None,
+                     help="optional transcript CSVs for Schedule-D and W&I "
+                          "reconciliation (same dir as `taxprep chain`)")
+    pss.add_argument("--out", default=None,
+                     help="output directory (packets/; created 0700, "
+                          "files 0600)")
+    pss.add_argument("--template", action="store_true",
+                     help="write an empty seed-sheet.csv template to stdout")
+    pss.set_defaults(func=cmd_stmt_summary)
+
     # -- R21a: per-person scoping ---------------------------------------
 
     pper = sub.add_parser("person", help="R21a: person registry (opaque ids)")
