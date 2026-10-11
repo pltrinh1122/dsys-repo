@@ -859,6 +859,15 @@ def cmd_ingest_manual_w2(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_chain(args: argparse.Namespace) -> int:
+    from .chain import run
+
+    return run(csv_dir=args.csv_dir, seed_sheet=args.seed_sheet,
+               out=args.out, identity_file=args.identity_file,
+               filing_status=args.filing_status,
+               prior_st=args.prior_st, prior_lt=args.prior_lt)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="taxprep", description="Transcribe tax documents into structured digital form (local-only).")
     p.add_argument("--data-dir", default=None,
@@ -1046,6 +1055,34 @@ def build_parser() -> argparse.ArgumentParser:
     pmw.add_argument("--file", required=True,
                      help="manual W-2 CSV file to ingest")
     pmw.set_defaults(func=cmd_ingest_manual_w2)
+
+    # -- R24(a): carryover chain + diagnostic ----------------------------
+
+    pch = sub.add_parser("chain",
+                         help="R24(a): carryover chain + diagnostic over "
+                              "the Operator's transcript CSVs (blind-safe)")
+    pch.add_argument("--csv-dir", required=True,
+                     help="directory of format-v2 transcript CSVs "
+                          "(Return 2022-2025, Account/ROA, W&I 2022-2024)")
+    pch.add_argument("--seed-sheet", default=None,
+                     help="optional 2022 seed sheet CSV "
+                          "(year,payer_ein,acct_id,person,box,proceeds,"
+                          "cost_basis,wash_sale_disallowed,net,term,"
+                          "source_sha16,corrected)")
+    pch.add_argument("--out", required=True,
+                     help="output directory (packets/; created 0700, "
+                          "files 0600)")
+    pch.add_argument("--identity-file", default=None,
+                     help="private list of identity strings; matching "
+                          "transcript sections are skipped (never printed)")
+    pch.add_argument("--filing-status", default=None,
+                     help="filing status for all years (else read from the "
+                          "transcript CSVs)")
+    pch.add_argument("--prior-st", default="0",
+                     help="ST carryover into 2022 (decimal string)")
+    pch.add_argument("--prior-lt", default="0",
+                     help="LT carryover into 2022 (decimal string)")
+    pch.set_defaults(func=cmd_chain)
 
     # -- R21a: per-person scoping ---------------------------------------
 

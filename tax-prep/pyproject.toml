@@ -2,12 +2,20 @@
 name = "taxprep"
 version = "0.1.0"
 description = "Phase 1: local-only CLI to transcribe tax documents (PDF + OCR) into structured digital form for amended-return preparation."
-requires-python = ">=3.11"
-dependencies = ["pypdf", "cryptography", "mcp<2", "pdf2image", "pdfplumber"]
+requires-python = ">=3.12"
+dependencies = ["pypdf", "cryptography", "mcp<2"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
+]
 
 [project.optional-dependencies]
 dev = ["pytest", "reportlab"]
 ocr = ["ocrmypdf"]
+# Heavy PDF/geometry deps: optional so the R24(a)/(c) chain+packet path
+# runs on stdlib. (b) stmt-summary may use the pdf extra.
+pdf = ["pdfplumber", "pdf2image"]
 
 [project.scripts]
 taxprep = "taxprep.cli:main"
