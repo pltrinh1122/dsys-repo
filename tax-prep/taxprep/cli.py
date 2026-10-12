@@ -1067,10 +1067,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     pch = sub.add_parser("chain",
                          help="R24(a): carryover chain + diagnostic over "
-                              "the Operator's transcript CSVs (blind-safe)")
+                              "the Operator's transcript CSVs (blind-safe)",
+                         epilog="--csv-dir must contain ONLY tax-year "
+                                "2022-2025 transcript CSVs: one Return "
+                                "Transcript per year 2022-2025 (required), "
+                                "plus optional Account / Record of Account "
+                                "and W&I transcripts for those years. Any "
+                                "file for another tax year (or a year the "
+                                "tool cannot determine) fails the run loud.")
     pch.add_argument("--csv-dir", required=True,
-                     help="directory of format-v2 transcript CSVs "
-                          "(Return 2022-2025, Account/ROA, W&I 2022-2024)")
+                     help="directory of format-v2 transcript CSVs; must "
+                          "contain only 2022-2025 files (Return 2022-2025 "
+                          "required; Account/ROA and W&I 2022-2024 optional). "
+                          "Files for any other tax year fail the run.")
     pch.add_argument("--seed-sheet", default=None,
                      help="optional 2022 seed sheet CSV "
                           "(year,payer_ein,acct_id,person,box,proceeds,"
@@ -1098,7 +1107,8 @@ def build_parser() -> argparse.ArgumentParser:
 
         pdfs: list[str] = list(args.pdfs or [])
         if args.pdf_dir:
-            pdfs.extend(str(p) for p in sorted(Path(args.pdf_dir).glob("*.pdf")))
+            pdfs.extend(str(p) for p in sorted(Path(args.pdf_dir).iterdir())
+                        if p.is_file() and p.suffix.lower() == ".pdf")
         return run_stmt_summary(
             pdfs=pdfs, labels=args.labels, persons_file=args.persons_file,
             identity_file=args.identity_file, csv_dir=args.csv_dir,
@@ -1108,7 +1118,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="R24(b): broker consolidated-1099 summary "
                               "extractor -> seed sheet (blind-safe)")
     pss.add_argument("--pdf-dir", default=None,
-                     help="directory of consolidated-1099 PDFs")
+                     help="directory of PDFs; a whole tax-year folder is "
+                          "fine (W-2, 1098, 5498, receipts ... are reported "
+                          "not_applicable, not failed)")
     pss.add_argument("--pdfs", nargs="*", default=None,
                      help="individual PDF paths")
     pss.add_argument("--labels", default=None,

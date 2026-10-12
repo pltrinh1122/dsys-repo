@@ -21,14 +21,31 @@ never floats.
 
 Layout 1 (Fidelity, 18 statements): 'Summary of ...' page; rows
 'Short-/Long-term transactions for which basis is (not) reported to the
-IRS'; columns Proceeds | Cost Basis | Market Discount |
-Wash Sales Disallowed | Gain/Loss | Income Tax Withheld (headers wrap
-over two text lines).
-Layout 2 (second payer): 'REALIZED GAIN / LOSS SUMMARY' /
-'FORM 1099-B TOTALS SUMMARY'; rows 'Box <A-F> <Short|Long>-Term
-Realized Gain/Loss', 'Box B or Box E (basis not reported to IRS)',
-'Noncovered Short-Term Gains or Losses on Gross Proceeds',
+IRS' and 'Transactions for which basis is not reported to the IRS and
+Term is Unknown'; columns Proceeds | Cost Basis | Market Discount |
+Wash Sales Disallowed | Gain/Loss | Income Tax Withheld (the header
+wraps over two text lines: 'Proceeds Cost Basis Market Wash Gain/Loss
+Income Tax' then 'Discount Sales Withheld').
+Layout 2 (Robinhood): 'REALIZED GAIN / LOSS SUMMARY' /
+'FORM 1099-B TOTALS SUMMARY'; rows 'Box A Short-Term Realized Gain',
+'Box A Short-Term Realized Loss', 'Box D Long-Term Realized Gain/Loss',
+'Box B (basis not reported to IRS)', 'Box E (basis not reported to
+IRS)', 'Noncovered Short-Term Gains or Losses on Gross Proceeds',
 'Total Short-Term / Long-Term / Unknown Term'.
+
+R24 rev1 header parse (observed on real broker PDFs, digits masked):
+tax year from page-1 forms '<YEAR> TAX REPORTING STATEMENT',
+'Form 1099-DIV* <YEAR> ...', 'Form 1099-INT* <YEAR> ...',
+'Form 1099 <YEAR>', a bare '<YEAR>' line (pdfplumber may split 'Form'
+as 'F orm'), else the most frequent 20YY on pages 1-2; the rule that
+matched is reported by name. Payer EIN is anchored on the payer label
+("Payer's Fed ID Number:" / "Federal Identification Number:"), never
+the first hyphenated number (the same line can start with "Recipient ID
+No. ***-**-NNNN"); absent -> payer_ein 'unknown' + flag. --pdf-dir may
+be a whole tax-year folder: files with no 1099-B / 1099-DIV / 1099-INT
+section are counted not_applicable, not failed. Original/corrected
+pairs ('ORIGINAL: MM/DD/YYYY', 'CORRECTED MM/DD/YYYY') keep the latest
+corrected per (payer EIN, account id, year).
 """
 
 from __future__ import annotations
@@ -57,6 +74,11 @@ SEED_COLUMNS = ("year", "payer_ein", "acct_id", "person", "box",
 
 class _SummaryError(Exception):
     """Loud, blind-safe failure (message carries labels/rows, never values)."""
+
+
+class _NotApplicable(Exception):
+    """PDF carries no 1099-B / 1099-DIV / 1099-INT section (e.g. a W-2,
+    1098, 5498 or receipt in the same tax-year folder). Not a failure."""
 
 
 def _fail(msg: str) -> NoReturn:
@@ -125,6 +147,9 @@ _LAYOUT1_ROW_BOX: dict[str, str] = {
     "SHORT-TERM TRANSACTIONS FOR WHICH BASIS IS NOT REPORTED TO THE IRS": "B",
     "LONG-TERM TRANSACTIONS FOR WHICH BASIS IS REPORTED TO THE IRS": "D",
     "LONG-TERM TRANSACTIONS FOR WHICH BASIS IS NOT REPORTED TO THE IRS": "E",
+    # Unknown term: recorded under rec['unknown_term'], never seeded.
+    "TRANSACTIONS FOR WHICH BASIS IS NOT REPORTED TO THE IRS AND TERM IS "
+    "UNKNOWN": "U",
 }
 
 # Layout 1 summary-table columns, in left-to-right order, with the
@@ -142,9 +167,15 @@ _HEADER_TOKENS: set[str] = set()
 for _name, _toks in _LAYOUT1_COLUMNS:
     _HEADER_TOKENS.update(_toks)
 
-# Layout 2: 'Box <A-F> <Short|Long>-Term Realized Gain|Loss'.
+# Layout 2: 'Box <A-F> <Short|Long>-Term Realized Gain|Loss|Gain/Loss'.
 _LAYOUT2_ROW_RE = re.compile(
-    r"BOX ([A-F])\b.{0,40}(SHORT-TERM|LONG-TERM).{0,40}REALIZED (GAIN|LOSS)"
+    r"BOX ([A-F])\b.{0,40}(SHORT-TERM|LONG-TERM).{0,40}"
+    r"REALIZED (GAIN/LOSS|GAIN|LOSS)"
+)
+# 'Box B (basis not reported to IRS)' / 'Box E (basis not reported to
+# IRS)': the amount is the box's realized gain/loss; term from the box.
+_LAYOUT2_NOBASIS_RE = re.compile(
+    r"BOX ([A-F])\s*\(BASIS NOT REPORTED TO (?:THE )?IRS\)"
 )
 _LAYOUT2_NONCOVERED_RE = re.compile(
     r"NONCOVERED SHORT-TERM.*GROSS PROCEEDS"
@@ -152,9 +183,8 @@ _LAYOUT2_NONCOVERED_RE = re.compile(
 _LAYOUT2_AMBIGUOUS_RES = [
     re.compile(r"BOX [A-F] OR BOX [A-F]"),  # e.g. 'Box B or Box E' -- no term
 ]
-_LAYOUT2_TOTAL_RES = [
-    re.compile(r"TOTAL (SHORT-TERM|LONG-TERM|UNKNOWN TERM)"),
-]
+_LAYOUT2_TOTAL_RE = re.compile(r"^TOTAL (SHORT-TERM|LONG-TERM|UNKNOWN TERM)\b")
+_LAYOUT2_TOTAL_RES = [_LAYOUT2_TOTAL_RE]
 
 # Section anchors (normalized) -> section kind.
 _SECTION_ANCHORS: list[tuple[str, str]] = [
@@ -170,10 +200,50 @@ _SECTION_ANCHORS: list[tuple[str, str]] = [
 _DIV_BOXES = ("1A", "1B", "2A", "2B", "2C", "2D", "2E", "2F", "3", "5", "7")
 _INT_BOXES = ("1", "3", "8")
 
-_EIN_RE = re.compile(r"\b(\d{2}-\d{7})\b")
-_YEAR_CAL_RE = re.compile(r"FOR CALENDAR YEAR (20\d\d)")
-_YEAR_TAX_RE = re.compile(r"TAX YEAR (20\d\d)")
+# pdfplumber often splits 'Form' as 'F orm' (first glyph kerned apart).
+_FORM_SPLIT_RE = re.compile(r"\bF\s?O\s?R\s?M\b")
+
+
+def _fix_form(norm_text: str) -> str:
+    return _FORM_SPLIT_RE.sub("FORM", norm_text)
+
+
+# Tax-year rules, in priority order, applied to normalized page-1 text
+# (name, pattern). The matching rule's NAME is reported (blind-safe).
+_YEAR_RULES: list[tuple[str, re.Pattern]] = [
+    ("calendar_year", re.compile(r"FOR CALENDAR YEAR (20\d\d)")),
+    ("tax_year", re.compile(r"\bTAX YEAR[: ]+(20\d\d)")),
+    ("tax_reporting_statement",
+     re.compile(r"\b(20\d\d) TAX REPORTING STATEMENT")),
+    ("form_1099_div", re.compile(r"FORM 1099-DIV\*? (20\d\d)\b")),
+    ("form_1099_int", re.compile(r"FORM 1099-INT\*? (20\d\d)\b")),
+    ("form_1099_b", re.compile(r"FORM 1099-B\*? (20\d\d)\b")),
+    ("form_1099", re.compile(r"FORM 1099\*? (20\d\d)\b")),
+]
+_YEAR_BARE_LINE_RULE = "bare_year_line"
+_YEAR_FALLBACK_RULE = "most_frequent_year_p1_2"
 _YEAR_ANY_RE = re.compile(r"\b(20\d\d)\b")
+
+# Payer EIN: anchored on the PAYER label, never the first NN-NNNNNNN.
+# Accepts "Payer's Fed ID Number:", "Payer's Federal Identification
+# Number:", "Federal Identification Number:", "Payer's TIN/EIN".
+_PAYER_EIN_RE = re.compile(
+    r"(?:PAYER'?S?\s+(?:FED(?:ERAL)?\.?\s+)?(?:ID(?:ENTIFICATION)?\.?\s+)?"
+    r"(?:NUMBER|NO\b\.?|TIN|EIN)"
+    r"|FEDERAL\s+IDENTIFICATION\s+(?:NUMBER|NO\b\.?))"
+    r"\s*[:#]?\s*(\d{2}-\d{7})\b"
+)
+_PAYER_EIN_UNKNOWN = "unknown"
+
+# Dated statement status: 'ORIGINAL: MM/DD/YYYY' / 'CORRECTED MM/DD/YYYY'.
+_DATED_STATUS_RE = re.compile(
+    r"\b(ORIGINAL|CORRECTED)\b\s*:?\s*(\d{1,2})/(\d{1,2})/(20\d\d)\b"
+)
+# Bare 'CORRECTED' (legacy), but not the pre-printed checkbox caption.
+_BARE_CORRECTED_RE = re.compile(r"\bCORRECTED\b(?!\s*\(IF CHECKED\))")
+
+# Applicability: which 1099 forms the PDF carries at all.
+_FORM_MENTION_RE = re.compile(r"\b1099-(B|DIV|INT)\b")
 _ACCOUNT_RE = re.compile(
     r"ACCOUNT(?:\s+NUMBER|\s+NO\.?)?\s*[:#]?\s*([\dXx][\dXx\- ]{3,})",
     re.IGNORECASE,
@@ -448,17 +518,32 @@ def _parse_layout1_table(pages: list[dict], vocab: dict,
 # ---------------------------------------------------------------------------
 
 def _parse_layout2_rows(pages: list[dict],
-                        rep_unmatched: list[str]) -> dict[str, dict]:
+                        rep_unmatched: list[str],
+                        flags: list[str] | None = None) -> dict[str, dict]:
     """Box -> {proceeds, cost_basis, wash, net, withheld} from gain/loss rows.
 
     Layout 2 prints realized gain and loss per box, not proceeds/cost, so
-    proceeds/cost/wash stay None and net = gain - loss.
+    proceeds/cost/wash stay None and net = gain - loss (a combined
+    'Realized Gain/Loss' row is the signed net). 'Box B / Box E (basis
+    not reported to IRS)' rows carry that box's net; the term comes from
+    the box letter. 'Total Short-Term / Long-Term' rows cross-check the
+    box sums (flag total_mismatch:<term>); 'Total Unknown Term' lands in
+    box 'U' (never seeded).
     """
+    flags = flags if flags is not None else []
     acc: dict[tuple[str, str], dict[str, Decimal]] = {}
+    totals: dict[str, Decimal] = {}
     for _pi, line in _all_lines(pages):
         text = _line_text(line)
         n = normalize_label(text)
-        if any(rx.search(n) for rx in _LAYOUT2_TOTAL_RES):
+        tm = _LAYOUT2_TOTAL_RE.search(n)
+        if tm:
+            cells = _money_cells(line)
+            if cells:
+                term_key = {"SHORT-TERM": "st", "LONG-TERM": "lt",
+                            "UNKNOWN TERM": "unknown"}[tm.group(1)]
+                totals[term_key] = totals.get(term_key, Decimal("0")) \
+                    + cells[-1][0]
             continue
         if any(rx.search(n) for rx in _LAYOUT2_AMBIGUOUS_RES):
             rep_unmatched.append(text[:80] + " [ambiguous box]")
@@ -474,7 +559,22 @@ def _parse_layout2_rows(pages: list[dict],
             amt = cells[-1][0]
             key = (box, term)
             acc.setdefault(key, {"gain": Decimal("0"), "loss": Decimal("0")})
-            acc[key]["gain" if gl == "GAIN" else "loss"] += amt
+            if gl == "GAIN/LOSS":
+                acc[key]["gain"] += amt  # signed net, printed as one row
+            else:
+                acc[key]["gain" if gl == "GAIN" else "loss"] += amt
+            continue
+        nb = _LAYOUT2_NOBASIS_RE.search(n)
+        if nb:
+            box = nb.group(1)
+            term = _BOX_TERM.get(box)
+            cells = _money_cells(line)
+            if term is None or not cells:
+                rep_unmatched.append(text[:80] + " [no amount]")
+                continue
+            key = (box, term)
+            acc.setdefault(key, {"gain": Decimal("0"), "loss": Decimal("0")})
+            acc[key]["gain"] += cells[-1][0]  # signed net
             continue
         if _LAYOUT2_NONCOVERED_RE.search(n):
             cells = _money_cells(line)
@@ -493,6 +593,19 @@ def _parse_layout2_rows(pages: list[dict],
             boxes[box] = {"proceeds": None, "cost_basis": None, "wash": None,
                           "net": v["gain"] - v["loss"], "withheld": None,
                           "market_discount": None}
+    # Printed totals vs box sums (flag only; the boxes stay authoritative).
+    for term_key, letters in (("st", "ABC"), ("lt", "DEF")):
+        if term_key not in totals:
+            continue
+        nets = [boxes[b]["net"] for b in letters
+                if b in boxes and boxes[b].get("net") is not None]
+        if nets and abs(sum(nets, Decimal("0")) - totals[term_key]) \
+                > Decimal("0.01"):
+            flags.append(f"total_mismatch:{term_key}")
+    if "unknown" in totals and boxes:
+        boxes["U"] = {"proceeds": None, "cost_basis": None, "wash": None,
+                      "net": totals["unknown"], "withheld": None,
+                      "market_discount": None}
     return boxes
 
 # ---------------------------------------------------------------------------
@@ -572,27 +685,87 @@ def _section_withholding(lines: list[tuple[int, list[dict]]]) -> Decimal:
 # File-level metadata (blind-safe: values never reach stdout).
 # ---------------------------------------------------------------------------
 
+def _norm_lines(pages: list[dict], upto: int | None = None) -> list[str]:
+    """Normalized ('F orm'-repaired, curly-apostrophe-free) text lines."""
+    out = []
+    for pi, page in enumerate(pages):
+        if upto is not None and pi >= upto:
+            break
+        for line in group_into_lines(page["words"]):
+            t = normalize_label(_line_text(line)).replace("\u2019", "'")
+            out.append(_fix_form(t))
+    return out
+
+
+def _detect_year(pages: list[dict]) -> tuple[int | None, str | None]:
+    """(year, rule_name). Page-1 named rules first, then a bare '20YY'
+    line on page 1, then the most frequent 20YY on pages 1-2."""
+    p1_lines = _norm_lines(pages, upto=1)
+    p1 = "\n".join(p1_lines)
+    for name, rx in _YEAR_RULES:
+        m = rx.search(p1)
+        if m:
+            return int(m.group(1)), name
+    for ln in p1_lines:
+        if re.fullmatch(r"20\d\d", ln):
+            return int(ln), _YEAR_BARE_LINE_RULE
+    counts: dict[int, int] = {}
+    for ln in _norm_lines(pages, upto=2):
+        for m in _YEAR_ANY_RE.finditer(ln):
+            y = int(m.group(1))
+            counts[y] = counts.get(y, 0) + 1
+    if counts:
+        best = max(sorted(counts), key=lambda y: counts[y])
+        return best, _YEAR_FALLBACK_RULE
+    return None, None
+
+
+def _detect_payer_ein(pages: list[dict]) -> str | None:
+    """Payer EIN anchored on the payer label, searched on ALL pages."""
+    text = "\n".join(_norm_lines(pages))
+    m = _PAYER_EIN_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _detect_status(pages: list[dict]) -> tuple[bool, str | None]:
+    """(corrected, statement_date 'YYYY-MM-DD' | None).
+
+    Dated 'CORRECTED MM/DD/YYYY' wins (latest date); else dated
+    'ORIGINAL: MM/DD/YYYY'; else a bare CORRECTED word (legacy), never
+    the pre-printed 'CORRECTED (if checked)' caption.
+    """
+    head = "\n".join(_norm_lines(pages, upto=3))
+    corrected_dates: list[str] = []
+    original_dates: list[str] = []
+    for m in _DATED_STATUS_RE.finditer(head):
+        iso = f"{m.group(4)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        (corrected_dates if m.group(1) == "CORRECTED"
+         else original_dates).append(iso)
+    if corrected_dates:
+        return True, max(corrected_dates)
+    if original_dates:
+        return False, max(original_dates)
+    return bool(_BARE_CORRECTED_RE.search(head)), None
+
+
 def _file_metadata(pages: list[dict], raw: bytes, persons: dict,
                    rep_flags: list[str]) -> dict:
-    head = _page_text(pages, upto=3)
     p1 = _page_text(pages, upto=1)
-    head_n = normalize_label(head)
 
-    m = _EIN_RE.search(head)
-    if not m:
-        _fail("payer EIN not found (expected NN-NNNNNNN on first pages)")
-    ein = m.group(1)
+    ein = _detect_payer_ein(pages)
+    if ein is None:
+        ein = _PAYER_EIN_UNKNOWN
+        rep_flags.append("payer_ein_unknown")
 
-    year = None
-    for rx in (_YEAR_CAL_RE, _YEAR_TAX_RE):
-        mm = rx.search(head_n)
-        if mm:
-            year = int(mm.group(1))
-            break
+    year, year_rule = _detect_year(pages)
     if year is None:
-        _fail("tax year not found (expected 'For calendar year YYYY')")
+        _fail("tax year not found (no page-1 year form; no 20YY on "
+              "pages 1-2)")
     if year not in SUPPORTED_YEARS:
-        _fail(f"tax year {year} outside supported range")
+        _fail(f"tax year {year} outside supported range "
+              f"(rule {year_rule})")
+    if year_rule == _YEAR_FALLBACK_RULE:
+        rep_flags.append("year_fallback")
 
     am = _ACCOUNT_RE.search(p1)
     if am:
@@ -606,7 +779,7 @@ def _file_metadata(pages: list[dict], raw: bytes, persons: dict,
         acct_id = hashlib.sha256((ein + fid).encode()).hexdigest()[:8]
         rep_flags.append("no_account_number")
 
-    corrected = bool(re.search(r"\bCORRECTED\b", head, re.IGNORECASE))
+    corrected, statement_date = _detect_status(pages)
 
     person = "UNMAPPED"
     p1n = normalize_label(p1)
@@ -618,7 +791,20 @@ def _file_metadata(pages: list[dict], raw: bytes, persons: dict,
         rep_flags.append("person_unmapped")
 
     return {"payer_ein": ein, "acct_id": acct_id, "year": year,
-            "person": person, "corrected": corrected}
+            "year_rule": year_rule, "person": person,
+            "corrected": corrected, "statement_date": statement_date}
+
+
+def _forms_present(pages: list[dict]) -> set[str]:
+    """{'B', 'DIV', 'INT'} mentioned anywhere (text or section anchors)."""
+    found: set[str] = set()
+    for ln in _norm_lines(pages):
+        for m in _FORM_MENTION_RE.finditer(ln):
+            found.add(m.group(1))
+        for anchor, kind in _SECTION_ANCHORS:
+            if anchor in ln:
+                found.add({"div": "DIV", "int": "INT", "b1099": "B"}[kind])
+    return found
 
 # ---------------------------------------------------------------------------
 # Per-file parse -> record.
@@ -626,6 +812,11 @@ def _file_metadata(pages: list[dict], raw: bytes, persons: dict,
 
 _BOX_TERM = {"A": "st", "B": "st", "C": "st",
              "D": "lt", "E": "lt", "F": "lt"}
+_UNKNOWN_TERM_BOX = "U"  # unknown-term rows: recorded, never seeded
+
+
+def _is_zero_box(b: dict) -> bool:
+    return all(not v for v in b.values() if isinstance(v, Decimal))
 
 
 def _totals(boxes: dict[str, dict], box_letters: str) -> dict[str, Decimal | None]:
@@ -651,16 +842,27 @@ def parse_statement_pdf(pdf_path: str, vocab: dict, persons: dict,
     pages = _extract_pages(pdf_path)
     flags: list[str] = []
     unmatched: list[str] = []
+
+    forms = _forms_present(pages)
+    if not forms:
+        raise _NotApplicable("no 1099-B / 1099-DIV / 1099-INT section")
+
     meta = _file_metadata(pages, raw, persons, flags)
 
     boxes = _parse_layout1_table(pages, vocab, unmatched, flags)
     layout = "layout_1" if boxes else None
     if not boxes:
-        boxes = _parse_layout2_rows(pages, unmatched)
+        boxes = _parse_layout2_rows(pages, unmatched, flags)
         layout = "layout_2" if boxes else None
-    if not boxes:
-        _fail("no 1099-B summary found (layout_1 headers and "
+    if not boxes and "B" in forms:
+        # A 1099-B is present but neither layout parsed it: stay loud.
+        _fail("1099-B present but no summary found (layout_1 headers and "
               "layout_2 rows both absent)")
+    if not boxes:
+        flags.append("no_1099b_section")  # DIV/INT-only statement
+    unknown_term = boxes.pop(_UNKNOWN_TERM_BOX, None)
+    if unknown_term is not None and not _is_zero_box(unknown_term):
+        flags.append("unknown_term_present")
     if any(b.get("proceeds_only") for b in boxes.values()):
         flags.append("proceeds_only_box")
 
@@ -692,8 +894,11 @@ def parse_statement_pdf(pdf_path: str, vocab: dict, persons: dict,
         "payer_ein": meta["payer_ein"],
         "acct_id": meta["acct_id"],
         "year": meta["year"],
+        "year_rule": meta["year_rule"],
         "person": meta["person"],
         "corrected": meta["corrected"],
+        "statement_date": meta["statement_date"],
+        "forms_present": sorted(forms),
         "layout": layout,
         "boxes": {b: {k: _fmt(v.get(k)) for k in
                        ("proceeds", "cost_basis", "wash", "net",
@@ -707,6 +912,10 @@ def parse_statement_pdf(pdf_path: str, vocab: dict, persons: dict,
         "div": {b: _fmt(d) for b, d in sorted(div.items())},
         "int": {b: _fmt(d) for b, d in sorted(intb.items())},
         "withholding_total": _fmt(withheld_total),
+        "unknown_term": ({k: _fmt(unknown_term.get(k)) for k in
+                          ("proceeds", "cost_basis", "wash", "net",
+                           "withheld", "market_discount")}
+                         if unknown_term is not None else None),
         "unmatched_labels": sorted(set(unmatched)),
         "flags": sorted(set(flags)),
     }
@@ -745,16 +954,22 @@ def dedupe(records: list[dict]) -> tuple[list[dict], list[dict]]:
             return sum(1 for b in r["boxes"].values()
                        if any(b.get(k) for k in ("proceeds", "net")))
 
-        ordered = sorted(rs, key=lambda r: (r["corrected"], richness(r)),
+        # Corrected beats original; among corrected the LATEST statement
+        # date wins; then the richest; sorted() is stable so remaining
+        # ties resolve to first-seen order.
+        ordered = sorted(rs, key=lambda r: (r["corrected"],
+                                            r.get("statement_date") or "",
+                                            richness(r)),
                          reverse=True)
-        # sorted() is stable: ties resolve to first-seen order.
         best = ordered[0]
         kept.append(best)
+        n_corrected = sum(1 for r in rs if r["corrected"])
         pairs.append({
             "key": {"payer_ein": key[0], "acct_id": key[1], "year": key[2]},
             "kept": best["file_id"],
             "dropped": [r["file_id"] for r in rs if r["file_id"] != best["file_id"]],
-            "reason": ("corrected" if best["corrected"]
+            "reason": ("latest_corrected" if n_corrected > 1
+                       else "corrected" if best["corrected"]
                        else "richest" if richness(best) > min(
                            richness(r) for r in rs) else "first_seen"),
         })
@@ -911,6 +1126,8 @@ def reconcile_year(year: int, records: list[dict], pairs: list[dict],
         as_filed = _as_filed_by_category(scans[year])
         diffs = []
         for box in sorted(sums):
+            if box not in _BOX_CAT:
+                continue  # never seeded (unknown term)
             term, cat = _BOX_CAT[box]
             af = as_filed[(term, cat)]
             mine = sums[box]
@@ -994,9 +1211,19 @@ def run(*, pdfs: list[str], labels: str | None = None,
 
     records: list[dict] = []
     failures: list[dict] = []
+    not_applicable: list[dict] = []
     for pdf in sorted(set(pdfs)):
         try:
             rec = parse_statement_pdf(pdf, vocab, persons)
+        except _NotApplicable as exc:
+            try:
+                fid = hashlib.sha256(Path(pdf).read_bytes()).hexdigest()[:16]
+            except OSError:
+                fid = Path(pdf).name
+            not_applicable.append({"file_id": fid, "filename": Path(pdf).name,
+                                   "reason": str(exc)})
+            rep.line(f"file {fid}: not_applicable ({exc})")
+            continue
         except _SummaryError as exc:
             try:
                 fid = hashlib.sha256(Path(pdf).read_bytes()).hexdigest()[:16]
@@ -1015,7 +1242,8 @@ def run(*, pdfs: list[str], labels: str | None = None,
         n_boxes = len(rec["boxes"])
         flag_txt = f", flags: {','.join(rec['flags'])}" if rec["flags"] else ""
         rep.line(f"file {rec['file_id']}: {n_boxes} box(es), "
-                 f"{rec['layout']}, year {rec['year']}, "
+                 f"{rec['layout']}, year {rec['year']} "
+                 f"(year_rule={rec['year_rule']}), "
                  f"{'corrected' if rec['corrected'] else 'original'}"
                  f"{flag_txt}")
         if rec["unmatched_labels"]:
@@ -1058,10 +1286,22 @@ def run(*, pdfs: list[str], labels: str | None = None,
                 recon["wi"]["status"] == "fail":
             ok = False
 
+    _ensure_out(out_path)
+    _write_file(out_path / "run-summary.json", json.dumps({
+        "n_parsed": len(records),
+        "n_not_applicable": len(not_applicable),
+        "n_failed": len(failures),
+        "not_applicable": not_applicable,
+        "failed": failures,
+    }, indent=2) + "\n")
     if failures:
-        rep.check("file_parse", "fail", f"{len(failures)} file(s) failed")
+        rep.check("file_parse", "fail",
+                  f"{len(failures)} file(s) failed, {len(records)} parsed, "
+                  f"{len(not_applicable)} not_applicable")
         ok = False
     else:
-        rep.check("file_parse", "pass", f"{len(records)} file(s) parsed")
+        rep.check("file_parse", "pass",
+                  f"{len(records)} file(s) parsed, "
+                  f"{len(not_applicable)} not_applicable")
     rep.emit()
     return 0 if ok else 1

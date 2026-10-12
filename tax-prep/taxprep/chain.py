@@ -137,6 +137,34 @@ _FORM_WORD_PATTERNS: list[tuple[str, str]] = [
     ("SCH E", "sch_e"),
 ]
 
+# Transcript spellings of the filing status -> carryforward engine alias.
+# The engine is FROZEN; the mapping lives here. Prefix match, lowercase.
+_STATUS_PREFIXES: list[tuple[str, str]] = [
+    ("single", "single"),
+    ("married filing joint", "mfj"),
+    ("married filing separate", "mfs"),
+    ("head of household", "hoh"),
+    ("qualifying widow", "qw"),
+    ("qualifying surviving spouse", "qw"),
+]
+
+
+def _status_from_transcript(raw: str) -> str | None:
+    """Engine status code for a transcript 'Filing status' value, or None."""
+    key = " ".join(str(raw or "").strip().lower()
+                   .replace("_", " ").replace("-", " ").split())
+    if not key:
+        return None
+    try:
+        return carryforward._normalize_status(key)
+    except ValueError:
+        pass
+    for prefix, code in _STATUS_PREFIXES:
+        if key.startswith(prefix):
+            return code
+    return None
+
+
 # Transaction codes of interest (spec item 5): code -> check stem.
 _TC_WATCH = ("420", "460", "922", "971", "976", "977")
 
@@ -339,27 +367,62 @@ class _YearScan:
         self.file_ids.setdefault(kind, []).append(fid)
 
 
+_SCHED_D_HEAD_RE = re.compile(r"^SCHEDULE D\b")
+_FORM_1040_HEAD_RE = re.compile(r"^FORM 1040\b")
+
+
 def _section_of(heading_text: str) -> str:
+    """Section opened by a LEVEL-1 heading (R24 rev1).
+
+    Real format-v2 Return Transcripts carry the 1040 as a run of level-1
+    sections ('Income', 'Adjustments to Income', 'Tax and Credits',
+    'Other Taxes', 'Payments', 'Refund or Amount Owed', 'Third Party
+    Designee'), then one level-1 heading per attached schedule/form
+    whose level-2 headings ('Income', 'Expenses' under Schedule C;
+    'SHORT TERM ...', 'LONG TERM ...', 'TAX COMPUTATION ...' under
+    Schedule D) only subdivide their parent. Hence:
+
+      level-1 'SCHEDULE D ...'      -> sched_d
+      level-1 'SCHEDULE ...'        -> other   (scanned for form flags only)
+      level-1 'FORM 1040 ...'       -> form1040 (the 1040 itself)
+      level-1 'FORM ...'            -> other
+      any other level-1 heading     -> form1040
+      level-2 heading               -> inherits (never consulted)
+    """
     n = _norm(heading_text)
-    if "SCHEDULE D" in n:
+    if _SCHED_D_HEAD_RE.match(n):
         return "sched_d"
-    if "1040" in n:
-        return "form1040"
-    return "other"
+    if n.startswith("SCHEDULE"):
+        return "other"
+    if n.startswith("FORM"):
+        return "form1040" if _FORM_1040_HEAD_RE.match(n) else "other"
+    return "form1040"
+
+
+# Transcript kinds whose Schedule D / 1040 money rows feed the math.
+# Account Transcripts and Records of Account repeat AGI / taxable income
+# (and an ROA repeats the whole return); scanning them would double the
+# sums, so they contribute only filing status, transactions and flags.
+_MONEY_KINDS = ("return",)
 
 
 def _scan_file(scan: _YearScan, frec: dict, identity: list[str]) -> None:
     parsed = frec["parsed"]
     fid = frec["file_id"]
-    scan.add_file(frec["kind"], fid)
-    head_rows = sorted((h["csv_row"], _norm(h["text"]))
-                       for h in parsed.get("headings", []))
+    kind = frec["kind"]
+    scan.add_file(kind, fid)
+    headings = parsed.get("headings", [])
+    head_rows = sorted((h["csv_row"], _norm(h["text"])) for h in headings)
+    # Section tracking follows LEVEL-1 headings only; level-2 inherit.
+    level1_rows = sorted((h["csv_row"], _norm(h["text"]))
+                         for h in headings if h.get("level", 1) == 1)
     for _, ht in head_rows:
         _scan_forms(scan, ht)
+    money_rows = kind in _MONEY_KINDS
     for row in parsed.get("data_rows", []):
         r = row["csv_row"]
         cur = "unsectioned"
-        for hr, ht in head_rows:
+        for hr, ht in level1_rows:
             if hr < r:
                 cur = _section_of(ht)
             else:
@@ -375,13 +438,24 @@ def _scan_file(scan: _YearScan, frec: dict, identity: list[str]) -> None:
         if skip:
             continue
         _scan_forms(scan, row["normalized"])
-        scan.raw_rows.append({"kind": frec["kind"], "row": row, "fid": fid})
+        scan.raw_rows.append({"kind": kind, "row": row, "fid": fid})
+        if not money_rows:
+            # Account / ROA / W&I: the 'Filing status' row only.
+            base, _variant = _strip_variant(row["normalized"])
+            if _1040_EXACT.get(base) == "filing_status":
+                _set_filing_status(scan, row)
+            continue
         if cur == "sched_d":
             _scan_sched_d_row(scan, row, fid)
         elif cur in ("form1040", "unsectioned"):
             _scan_1040_row(scan, row, fid)
     for t in parsed.get("transaction_rows", []):
         scan.transactions.append({**t, "file_id": fid})
+
+
+def _set_filing_status(scan: _YearScan, row: dict) -> None:
+    if scan.filing_status_raw is None:
+        scan.filing_status_raw = (row["value"] or "").strip()
 
 
 def _scan_forms(scan: _YearScan, norm_text: str) -> None:
@@ -399,6 +473,9 @@ def _scan_sched_d_row(scan: _YearScan, row: dict, fid: str) -> None:
     hit = _SCHED_D_MAP.get(base)
     if hit is None and base.endswith(" AMOUNT"):
         hit = _SCHED_D_MAP.get(base[: -len(" AMOUNT")].rstrip())
+    if hit is None and variant == "per_computer":
+        # Tax-computer rows are keyed WITH their 'per computer' suffix.
+        hit = _SCHED_D_MAP.get(row["normalized"])
     if hit is None:
         if label_text not in scan.unmatched_sched_d:
             scan.unmatched_sched_d.append(label_text)
@@ -430,8 +507,7 @@ def _scan_1040_row(scan: _YearScan, row: dict, fid: str) -> None:
             scan.unmatched_1040.append(label_text)
         return
     if key == "filing_status":
-        if scan.filing_status_raw is None:
-            scan.filing_status_raw = (row["value"] or "").strip()
+        _set_filing_status(scan, row)
         return
     val = parse_money(label_text, row["csv_row"], row["value"])
     scan.form1040.setdefault((key, variant), []).append(
@@ -652,20 +728,30 @@ def _run_inner(rep: _Reporter, *, csv_dir: str, seed_sheet: str | None,
     years = sorted(y for y in scans if y in SUPPORTED_YEARS)
     rep.line(f"years: {','.join(str(y) for y in years)}")
 
-    # Filing status: flag wins, else the CSV label, else loud.
+    # Filing status: flag wins, else the CSV 'Filing status' row, else loud.
     status = filing_status
+    status_source = "flag"
     if status is None:
         raws = {scans[y].filing_status_raw for y in years
                 if scans[y].filing_status_raw}
-        if len(raws) == 1:
-            status = next(iter(raws))
+        codes = {_status_from_transcript(r) for r in raws}
+        if None in codes:
+            _fail("transcript 'Filing status' value not recognized "
+                  "(pass --filing-status)")
+        if len(codes) > 1:
+            _fail("transcript 'Filing status' differs across tax years "
+                  "(pass --filing-status)")
+        if codes:
+            status = next(iter(codes))
+            status_source = "csv"
     if status is None:
         _fail("filing status not given (--filing-status) and not found "
               "in the transcript CSVs")
     try:
-        carryforward._normalize_status(status)
+        status = carryforward._normalize_status(status)
     except ValueError as exc:
         _fail(str(exc))
+    rep.line(f"filing_status_source: {status_source}")
 
     seed = _parse_seed_sheet(seed_sheet) if seed_sheet else None
 
@@ -763,6 +849,8 @@ def _run_inner(rep: _Reporter, *, csv_dir: str, seed_sheet: str | None,
     if chain_result is not None:
         _write_json(out_dir / "chain.json", _jsonable({
             "years": years,
+            "filing_status": status,
+            "filing_status_source": status_source,
             "carry_into_2026": chain_result["carryforward_into_2026"],
             "per_year": {
                 y: {
